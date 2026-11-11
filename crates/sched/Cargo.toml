@@ -1,0 +1,10 @@
+[package]
+name = "sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Persistent pinned worker pool, sense-reversing spin barrier, LPT balancer"
+
+[dependencies]
+libc.workspace = true

@@ -1,0 +1,10 @@
+snapdragon-engine (oxe)
+Copyright (c) 2026 Oscar Nordström (n0rpan)
+
+Our own code is licensed under the MIT License (see LICENSE).
+
+Vendored code keeps the licence of its source, with its licence text in its
+own directory. THIRD_PARTY_NOTICES lists each vendored component.
+
+No model weights, no prebuilt binaries and no Qualcomm SDK, firmware or
+runtime files are part of this repository.

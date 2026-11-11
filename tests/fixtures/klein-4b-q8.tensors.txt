@@ -1,0 +1,150 @@
+# flux-2-klein-4b-Q8_0.gguf tensor table: name, type, gguf dims [in, out], data offset (relative), bytes
+double_blocks.0.img_attn.norm.key_norm.scale	BF16	[128]	0	256
+double_blocks.0.img_attn.norm.query_norm.scale	BF16	[128]	256	256
+double_blocks.0.img_attn.proj.weight	Q8_0	[3072, 3072]	512	10027008
+double_blocks.0.img_mlp.0.weight	Q8_0	[3072, 18432]	10027520	60162048
+double_blocks.0.img_mlp.2.weight	Q8_0	[9216, 3072]	70189568	30081024
+double_blocks.0.img_attn.qkv.weight	Q8_0	[3072, 9216]	100270592	30081024
+double_blocks.0.txt_attn.norm.key_norm.scale	BF16	[128]	130351616	256
+double_blocks.0.txt_attn.norm.query_norm.scale	BF16	[128]	130351872	256
+double_blocks.0.txt_attn.qkv.weight	Q8_0	[3072, 9216]	130352128	30081024
+double_blocks.0.txt_attn.proj.weight	Q8_0	[3072, 3072]	160433152	10027008
+double_blocks.0.txt_mlp.0.weight	Q8_0	[3072, 18432]	170460160	60162048
+double_blocks.0.txt_mlp.2.weight	Q8_0	[9216, 3072]	230622208	30081024
+double_blocks.1.img_attn.norm.key_norm.scale	BF16	[128]	260703232	256
+double_blocks.1.img_attn.norm.query_norm.scale	BF16	[128]	260703488	256
+double_blocks.1.img_attn.proj.weight	Q8_0	[3072, 3072]	260703744	10027008
+double_blocks.1.img_attn.qkv.weight	Q8_0	[3072, 9216]	270730752	30081024
+double_blocks.1.img_mlp.0.weight	Q8_0	[3072, 18432]	300811776	60162048
+double_blocks.1.img_mlp.2.weight	Q8_0	[9216, 3072]	360973824	30081024
+double_blocks.1.txt_attn.norm.key_norm.scale	BF16	[128]	391054848	256
+double_blocks.1.txt_attn.norm.query_norm.scale	BF16	[128]	391055104	256
+double_blocks.1.txt_attn.proj.weight	Q8_0	[3072, 3072]	391055360	10027008
+double_blocks.1.txt_attn.qkv.weight	Q8_0	[3072, 9216]	401082368	30081024
+double_blocks.1.txt_mlp.0.weight	Q8_0	[3072, 18432]	431163392	60162048
+double_blocks.1.txt_mlp.2.weight	Q8_0	[9216, 3072]	491325440	30081024
+double_blocks.2.img_attn.norm.key_norm.scale	BF16	[128]	521406464	256
+double_blocks.2.img_attn.norm.query_norm.scale	BF16	[128]	521406720	256
+double_blocks.2.img_attn.proj.weight	Q8_0	[3072, 3072]	521406976	10027008
+double_blocks.2.img_attn.qkv.weight	Q8_0	[3072, 9216]	531433984	30081024
+double_blocks.2.img_mlp.0.weight	Q8_0	[3072, 18432]	561515008	60162048
+double_blocks.2.img_mlp.2.weight	Q8_0	[9216, 3072]	621677056	30081024
+double_blocks.2.txt_attn.norm.key_norm.scale	BF16	[128]	651758080	256
+double_blocks.2.txt_attn.norm.query_norm.scale	BF16	[128]	651758336	256
+double_blocks.2.txt_attn.proj.weight	Q8_0	[3072, 3072]	651758592	10027008
+double_blocks.2.txt_attn.qkv.weight	Q8_0	[3072, 9216]	661785600	30081024
+double_blocks.2.txt_mlp.0.weight	Q8_0	[3072, 18432]	691866624	60162048
+double_blocks.2.txt_mlp.2.weight	Q8_0	[9216, 3072]	752028672	30081024
+double_blocks.3.img_attn.norm.key_norm.scale	BF16	[128]	782109696	256
+double_blocks.3.img_attn.norm.query_norm.scale	BF16	[128]	782109952	256
+double_blocks.3.img_attn.proj.weight	Q8_0	[3072, 3072]	782110208	10027008
+double_blocks.3.img_attn.qkv.weight	Q8_0	[3072, 9216]	792137216	30081024
+double_blocks.3.img_mlp.0.weight	Q8_0	[3072, 18432]	822218240	60162048
+double_blocks.3.img_mlp.2.weight	Q8_0	[9216, 3072]	882380288	30081024
+double_blocks.3.txt_attn.norm.key_norm.scale	BF16	[128]	912461312	256
+double_blocks.3.txt_attn.norm.query_norm.scale	BF16	[128]	912461568	256
+double_blocks.3.txt_attn.proj.weight	Q8_0	[3072, 3072]	912461824	10027008
+double_blocks.3.txt_attn.qkv.weight	Q8_0	[3072, 9216]	922488832	30081024
+double_blocks.3.txt_mlp.0.weight	Q8_0	[3072, 18432]	952569856	60162048
+double_blocks.3.txt_mlp.2.weight	Q8_0	[9216, 3072]	1012731904	30081024
+double_blocks.4.img_attn.norm.key_norm.scale	BF16	[128]	1042812928	256
+double_blocks.4.img_attn.norm.query_norm.scale	BF16	[128]	1042813184	256
+double_blocks.4.img_attn.proj.weight	Q8_0	[3072, 3072]	1042813440	10027008
+double_blocks.4.img_attn.qkv.weight	Q8_0	[3072, 9216]	1052840448	30081024
+double_blocks.4.img_mlp.0.weight	Q8_0	[3072, 18432]	1082921472	60162048
+double_blocks.4.img_mlp.2.weight	Q8_0	[9216, 3072]	1143083520	30081024
+double_blocks.4.txt_attn.norm.key_norm.scale	BF16	[128]	1173164544	256
+double_blocks.4.txt_attn.norm.query_norm.scale	BF16	[128]	1173164800	256
+double_blocks.4.txt_attn.proj.weight	Q8_0	[3072, 3072]	1173165056	10027008
+double_blocks.4.txt_attn.qkv.weight	Q8_0	[3072, 9216]	1183192064	30081024
+double_blocks.4.txt_mlp.0.weight	Q8_0	[3072, 18432]	1213273088	60162048
+double_blocks.4.txt_mlp.2.weight	Q8_0	[9216, 3072]	1273435136	30081024
+double_stream_modulation_img.lin.weight	BF16	[3072, 18432]	1303516160	113246208
+double_stream_modulation_txt.lin.weight	BF16	[3072, 18432]	1416762368	113246208
+final_layer.adaLN_modulation.1.weight	BF16	[3072, 6144]	1530008576	37748736
+final_layer.linear.weight	BF16	[3072, 128]	1567757312	786432
+img_in.weight	BF16	[128, 3072]	1568543744	786432
+single_blocks.0.linear1.weight	Q8_0	[3072, 27648]	1569330176	90243072
+single_blocks.0.linear2.weight	Q8_0	[12288, 3072]	1659573248	40108032
+single_blocks.0.norm.key_norm.scale	BF16	[128]	1699681280	256
+single_blocks.0.norm.query_norm.scale	BF16	[128]	1699681536	256
+single_blocks.1.linear1.weight	Q8_0	[3072, 27648]	1699681792	90243072
+single_blocks.1.linear2.weight	Q8_0	[12288, 3072]	1789924864	40108032
+single_blocks.1.norm.key_norm.scale	BF16	[128]	1830032896	256
+single_blocks.1.norm.query_norm.scale	BF16	[128]	1830033152	256
+single_blocks.10.linear1.weight	Q8_0	[3072, 27648]	1830033408	90243072
+single_blocks.10.linear2.weight	Q8_0	[12288, 3072]	1920276480	40108032
+single_blocks.10.norm.key_norm.scale	BF16	[128]	1960384512	256
+single_blocks.10.norm.query_norm.scale	BF16	[128]	1960384768	256
+single_blocks.11.linear1.weight	Q8_0	[3072, 27648]	1960385024	90243072
+single_blocks.11.linear2.weight	Q8_0	[12288, 3072]	2050628096	40108032
+single_blocks.11.norm.key_norm.scale	BF16	[128]	2090736128	256
+single_blocks.11.norm.query_norm.scale	BF16	[128]	2090736384	256
+single_blocks.12.linear1.weight	Q8_0	[3072, 27648]	2090736640	90243072
+single_blocks.12.linear2.weight	Q8_0	[12288, 3072]	2180979712	40108032
+single_blocks.12.norm.key_norm.scale	BF16	[128]	2221087744	256
+single_blocks.12.norm.query_norm.scale	BF16	[128]	2221088000	256
+single_blocks.13.linear1.weight	Q8_0	[3072, 27648]	2221088256	90243072
+single_blocks.13.linear2.weight	Q8_0	[12288, 3072]	2311331328	40108032
+single_blocks.13.norm.key_norm.scale	BF16	[128]	2351439360	256
+single_blocks.13.norm.query_norm.scale	BF16	[128]	2351439616	256
+single_blocks.14.linear1.weight	Q8_0	[3072, 27648]	2351439872	90243072
+single_blocks.14.linear2.weight	Q8_0	[12288, 3072]	2441682944	40108032
+single_blocks.14.norm.key_norm.scale	BF16	[128]	2481790976	256
+single_blocks.14.norm.query_norm.scale	BF16	[128]	2481791232	256
+single_blocks.15.linear1.weight	Q8_0	[3072, 27648]	2481791488	90243072
+single_blocks.15.linear2.weight	Q8_0	[12288, 3072]	2572034560	40108032
+single_blocks.15.norm.key_norm.scale	BF16	[128]	2612142592	256
+single_blocks.15.norm.query_norm.scale	BF16	[128]	2612142848	256
+single_blocks.16.linear1.weight	Q8_0	[3072, 27648]	2612143104	90243072
+single_blocks.16.linear2.weight	Q8_0	[12288, 3072]	2702386176	40108032
+single_blocks.16.norm.key_norm.scale	BF16	[128]	2742494208	256
+single_blocks.16.norm.query_norm.scale	BF16	[128]	2742494464	256
+single_blocks.17.linear1.weight	Q8_0	[3072, 27648]	2742494720	90243072
+single_blocks.17.linear2.weight	Q8_0	[12288, 3072]	2832737792	40108032
+single_blocks.17.norm.key_norm.scale	BF16	[128]	2872845824	256
+single_blocks.17.norm.query_norm.scale	BF16	[128]	2872846080	256
+single_blocks.18.linear1.weight	Q8_0	[3072, 27648]	2872846336	90243072
+single_blocks.18.linear2.weight	Q8_0	[12288, 3072]	2963089408	40108032
+single_blocks.18.norm.key_norm.scale	BF16	[128]	3003197440	256
+single_blocks.18.norm.query_norm.scale	BF16	[128]	3003197696	256
+single_blocks.19.linear1.weight	Q8_0	[3072, 27648]	3003197952	90243072
+single_blocks.19.linear2.weight	Q8_0	[12288, 3072]	3093441024	40108032
+single_blocks.19.norm.key_norm.scale	BF16	[128]	3133549056	256
+single_blocks.19.norm.query_norm.scale	BF16	[128]	3133549312	256
+single_blocks.2.linear1.weight	Q8_0	[3072, 27648]	3133549568	90243072
+single_blocks.2.linear2.weight	Q8_0	[12288, 3072]	3223792640	40108032
+single_blocks.2.norm.key_norm.scale	BF16	[128]	3263900672	256
+single_blocks.2.norm.query_norm.scale	BF16	[128]	3263900928	256
+single_blocks.3.linear1.weight	Q8_0	[3072, 27648]	3263901184	90243072
+single_blocks.3.linear2.weight	Q8_0	[12288, 3072]	3354144256	40108032
+single_blocks.3.norm.key_norm.scale	BF16	[128]	3394252288	256
+single_blocks.3.norm.query_norm.scale	BF16	[128]	3394252544	256
+single_blocks.4.linear1.weight	Q8_0	[3072, 27648]	3394252800	90243072
+single_blocks.4.linear2.weight	Q8_0	[12288, 3072]	3484495872	40108032
+single_blocks.4.norm.key_norm.scale	BF16	[128]	3524603904	256
+single_blocks.4.norm.query_norm.scale	BF16	[128]	3524604160	256
+single_blocks.5.linear1.weight	Q8_0	[3072, 27648]	3524604416	90243072
+single_blocks.5.linear2.weight	Q8_0	[12288, 3072]	3614847488	40108032
+single_blocks.5.norm.key_norm.scale	BF16	[128]	3654955520	256
+single_blocks.5.norm.query_norm.scale	BF16	[128]	3654955776	256
+single_blocks.6.linear1.weight	Q8_0	[3072, 27648]	3654956032	90243072
+single_blocks.6.linear2.weight	Q8_0	[12288, 3072]	3745199104	40108032
+single_blocks.6.norm.key_norm.scale	BF16	[128]	3785307136	256
+single_blocks.6.norm.query_norm.scale	BF16	[128]	3785307392	256
+single_blocks.7.linear1.weight	Q8_0	[3072, 27648]	3785307648	90243072
+single_blocks.7.linear2.weight	Q8_0	[12288, 3072]	3875550720	40108032
+single_blocks.7.norm.key_norm.scale	BF16	[128]	3915658752	256
+single_blocks.7.norm.query_norm.scale	BF16	[128]	3915659008	256
+single_blocks.8.linear1.weight	Q8_0	[3072, 27648]	3915659264	90243072
+single_blocks.8.linear2.weight	Q8_0	[12288, 3072]	4005902336	40108032
+single_blocks.8.norm.key_norm.scale	BF16	[128]	4046010368	256
+single_blocks.8.norm.query_norm.scale	BF16	[128]	4046010624	256
+single_blocks.9.linear1.weight	Q8_0	[3072, 27648]	4046010880	90243072
+single_blocks.9.linear2.weight	Q8_0	[12288, 3072]	4136253952	40108032
+single_blocks.9.norm.key_norm.scale	BF16	[128]	4176361984	256
+single_blocks.9.norm.query_norm.scale	BF16	[128]	4176362240	256
+single_stream_modulation.lin.weight	BF16	[3072, 9216]	4176362496	56623104
+time_in.in_layer.weight	BF16	[256, 3072]	4232985600	1572864
+time_in.out_layer.weight	BF16	[3072, 3072]	4234558464	18874368
+txt_in.weight	BF16	[7680, 3072]	4253432832	47185920

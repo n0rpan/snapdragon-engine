@@ -1,0 +1,13 @@
+[package]
+name = "gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Narrow GGUF reader (mmap, header, metadata, tensor table); port of tools/model_inspect.py's parser"
+
+[dependencies]
+memmap2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "qwen35moe descriptor, load-time repack, static per-token plan and the M0 timing executor"
+
+[dependencies]
+gguf = { path = "../gguf" }
+kernels-sys = { path = "../kernels-sys" }
+sched = { path = "../sched" }
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Chat template rendering (minijinja, llama.cpp-compatible) and Qwen3-Coder tool-call parsing"
+
+[dependencies]
+libc.workspace = true
+minijinja = { version = "3.1.0", features = ["preserve_order", "loop_controls", "json", "serde"] }
+minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+tokenizer = { path = "../tokenizer" }

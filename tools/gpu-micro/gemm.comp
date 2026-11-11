@@ -1,0 +1,82 @@
+#version 450
+// moe-prefill GPU feasibility micro benchmark (see the GPU prefill study in the private lab notes). One file, MODE selects the kernel.
+//   0  int8 register-only peak: dotPacked4x8 (mixed signedness, the accelerated form on Turnip), no memory
+//   1  fp16 register-only peak: vec4 fma on float16, no memory
+//   2  int8 GEMM   out[t][r] = sum_k W[r][k] * X[t][k]   (W, X int8 packed 4 per uint; 1 output per invocation)
+//   3  int8 GEMM, 4 tokens per invocation (each weight word loaded once for 4 tokens)
+//   4  fp16 GEMM   W, X float16 (vec4 loads), f32 accumulate; 1 output per invocation
+//   5  fp16 GEMM, 4 tokens per invocation
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P { uint R; uint K; uint T; uint iters; } p;
+#if MODE == 4 || MODE == 5
+layout(binding = 0) readonly buffer WB { f16vec4 w[]; };   // [R][K/4]
+layout(binding = 1) readonly buffer XB { f16vec4 x[]; };   // [T][K/4]
+layout(binding = 2) writeonly buffer OB { float o[]; };    // [T][R]
+#else
+layout(binding = 0) readonly buffer WB { uint w[]; };      // [R][K/4], int8 x4
+layout(binding = 1) readonly buffer XB { uint x[]; };      // [T][K/4], int8 x4
+layout(binding = 2) writeonly buffer OB { int o[]; };      // [T][R]
+#endif
+// signed x signed through the accelerated mixed form: (w ^ 0x80) is w + 128 as unsigned
+int sdot(uint a, uint b) { return dotPacked4x8EXT(a ^ 0x80808080u, int(b)) - dotPacked4x8EXT(0x80808080u, int(b)); }
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+#if MODE == 0
+    if (id >= p.R * p.T) return;
+    uint a = w[id % (p.R * p.K / 4u)], b = x[id % (p.T * p.K / 4u)];
+    int s = 0;
+    for (uint j = 0u; j < p.iters; j++) { s += dotPacked4x8EXT(a, int(b)); a = a * 1664525u + 1013904223u; }
+    o[id] = s;
+#elif MODE == 1
+    if (id >= p.R * p.T) return;
+    f16vec4 a = f16vec4(float16_t(float(id & 7u) * 0.125), float16_t(0.5), float16_t(0.25), float16_t(0.75));
+    f16vec4 b = f16vec4(float16_t(0.999)), acc = f16vec4(float16_t(0.0));
+    for (uint j = 0u; j < p.iters; j++) { acc = fma(a, b, acc); a = a * float16_t(0.9995) + float16_t(0.0003); }
+    o[id] = int(float(acc.x + acc.y + acc.z + acc.w) * 16.0);
+#elif MODE == 2
+    uint r = id % p.R, t = id / p.R;
+    if (t >= p.T) return;
+    uint kw = p.K / 4u, wo = r * kw, xo = t * kw;
+    int s = 0;
+    for (uint k = 0u; k < kw; k++) s += sdot(w[wo + k], x[xo + k]);
+    o[t * p.R + r] = s;
+#elif MODE == 3
+    uint r = id % p.R, t4 = id / p.R;
+    if (t4 * 4u >= p.T) return;
+    uint kw = p.K / 4u, wo = r * kw, xo = t4 * 4u * kw;
+    ivec4 s = ivec4(0);
+    for (uint k = 0u; k < kw; k++) {
+        uint a = w[wo + k] ^ 0x80808080u;
+        ivec4 b = ivec4(int(x[xo + k]), int(x[xo + kw + k]), int(x[xo + 2u * kw + k]), int(x[xo + 3u * kw + k]));
+        s += ivec4(dotPacked4x8EXT(a, b.x), dotPacked4x8EXT(a, b.y), dotPacked4x8EXT(a, b.z), dotPacked4x8EXT(a, b.w))
+           - ivec4(dotPacked4x8EXT(0x80808080u, b.x), dotPacked4x8EXT(0x80808080u, b.y), dotPacked4x8EXT(0x80808080u, b.z), dotPacked4x8EXT(0x80808080u, b.w));
+    }
+    for (uint j = 0u; j < 4u; j++) o[(t4 * 4u + j) * p.R + r] = s[j];
+#elif MODE == 4
+    uint r = id % p.R, t = id / p.R;
+    if (t >= p.T) return;
+    uint kw = p.K / 4u, wo = r * kw, xo = t * kw;
+    vec4 s = vec4(0.0);
+    for (uint k = 0u; k < kw; k++) s = fma(vec4(w[wo + k]), vec4(x[xo + k]), s);
+    o[t * p.R + r] = s.x + s.y + s.z + s.w;
+#else
+    uint r = id % p.R, t4 = id / p.R;
+    if (t4 * 4u >= p.T) return;
+    uint kw = p.K / 4u, wo = r * kw, xo = t4 * 4u * kw;
+    vec4 s0 = vec4(0.0), s1 = vec4(0.0), s2 = vec4(0.0), s3 = vec4(0.0);
+    for (uint k = 0u; k < kw; k++) {
+        vec4 a = vec4(w[wo + k]);
+        s0 = fma(a, vec4(x[xo + k]), s0);
+        s1 = fma(a, vec4(x[xo + kw + k]), s1);
+        s2 = fma(a, vec4(x[xo + 2u * kw + k]), s2);
+        s3 = fma(a, vec4(x[xo + 3u * kw + k]), s3);
+    }
+    o[(t4 * 4u + 0u) * p.R + r] = s0.x + s0.y + s0.z + s0.w;
+    o[(t4 * 4u + 1u) * p.R + r] = s1.x + s1.y + s1.z + s1.w;
+    o[(t4 * 4u + 2u) * p.R + r] = s2.x + s2.y + s2.z + s2.w;
+    o[(t4 * 4u + 3u) * p.R + r] = s3.x + s3.y + s3.z + s3.w;
+#endif
+}

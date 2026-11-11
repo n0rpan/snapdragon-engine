@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/kernels-sys", "crates/int8-gemm", "crates/image-dit", "crates/image-flow", "crates/image-vae", "crates/image-npu", "crates/gguf", "crates/sched", "crates/model", "crates/oxe-cli", "crates/tokenizer", "crates/chat", "crates/server", "crates/qwen4exp", "crates/flash-iobench"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+memmap2 = "0.9"
+libc = "0.2"
+cc = "1"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.test]
+opt-level = 2

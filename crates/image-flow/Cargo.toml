@@ -1,0 +1,18 @@
+[package]
+name = "image-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+gguf = { path = "../gguf" }
+sched = { path = "../sched" }
+int8-gemm = { path = "../int8-gemm" }
+image-dit = { path = "../image-dit" }
+image-vae = { path = "../image-vae" }
+
+[[bin]]
+name = "oxi"
+path = "src/bin/oxi.rs"

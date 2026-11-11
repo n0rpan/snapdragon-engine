@@ -1,0 +1,1 @@
+Write a Rust function that parses a comma-separated list of CPU ranges such as "0-3,8,10-11" into a sorted Vec<usize> without duplicates, returning an error for malformed input. Then explain the edge cases you handled.

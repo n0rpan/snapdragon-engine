@@ -1,0 +1,35 @@
+[package]
+name = "qwen4exp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Qwen3.8-Flash-Next (qwen4exp) M0 timing prototype: multi-shard GGUF, R4 expert sidecar, io_uring expert cache, replayed routing"
+build = "build.rs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+tokenizer = { path = "../tokenizer" }
+kernels-sys = { path = "../kernels-sys" }
+sched = { path = "../sched" }
+libc.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[[bin]]
+name = "flash-m0"
+path = "src/bin/flash-m0.rs"
+
+[[bin]]
+name = "flash-m1"
+path = "src/bin/flash-m1.rs"
+
+[[bin]]
+name = "flash-m3"
+path = "src/bin/flash-m3.rs"
+
+[[bin]]
+name = "flash-t2"
+path = "src/bin/flash-t2.rs"

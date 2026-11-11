@@ -1,0 +1,3 @@
+# Flash expert-cache quota weights: distinct experts per layer in the fixed353 prompt prefill (P2 trace,
+# 156 tokens); layer 47 = mean of 0-46 (the trace lacks its prefill rows). Slots per layer ~ weight (floor 64).
+342 270 249 138 211 245 266 263 186 172 232 193 246 242 195 121 135 198 242 200 211 236 285 183 196 176 222 196 242 233 203 160 169 227 235 202 228 227 277 192 191 242 249 202 243 226 224 218

@@ -1,0 +1,57 @@
+name: Bug report
+description: Something crashes, hangs, returns a wrong answer or breaks a harness.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Please leave out private prompts, model answers, credentials, user names, home paths and device serials.
+        A minimal synthetic request that reproduces the problem is ideal.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - controller / OpenAI API
+        - oxe engine (Ornith, Qwen3.6)
+        - Flash engine
+        - oxi image engine
+        - harness integration (OpenCode, pi, dsh, other)
+        - tools / benchmarks
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, a minimal request body (synthetic), model id. For tool-call problems, the tool schema and the raw tool-call text if you can share it.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "Lab commit; engine commit and binary SHA-256; model file + SHA-256; harness name and version"
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      placeholder: "Device model; Snapdragon SKU; RAM; kernel; free RAM at load (MemAvailable); MEMLAT on/off. No serials."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Engine stderr / controller log excerpt
+      description: Only the relevant lines, with paths and user names removed. An engine abort (panic=abort) often shows up as a "client disconnect" in the controller.
+      render: text

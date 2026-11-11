@@ -1,0 +1,4 @@
+gemm_bench
+*.spv
+build.log
+run1.log

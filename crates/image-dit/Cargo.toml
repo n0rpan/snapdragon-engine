@@ -1,0 +1,17 @@
+[package]
+name = "image-dit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Image engine (FLUX.2 klein DiT): M0 single-stream block prototype, f32 reference and int8 SMMLA fast path"
+
+[dependencies]
+gguf = { path = "../gguf" }
+sched = { path = "../sched" }
+int8-gemm = { path = "../int8-gemm" }
+serde_json.workspace = true
+
+[[bin]]
+name = "oxi-block"
+path = "src/bin/oxi-block.rs"

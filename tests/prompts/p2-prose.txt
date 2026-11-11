@@ -1,0 +1,1 @@
+The history of the Snapdragon processor family began with a single goal: bring desktop-class performance to devices that run on a battery all day. Describe how memory bandwidth, cache hierarchy and the number of cores interact when a laptop runs a large language model locally, and why decode speed is usually limited by memory rather than arithmetic.

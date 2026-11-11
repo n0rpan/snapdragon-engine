@@ -1,0 +1,12 @@
+[package]
+name = "int8-gemm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared int8 SMMLA GEMM: packed int8 weights x packed int8 activations -> f32, with chunk scales (per-row/per-token fast path, Q8_0-exact and K-quant block-scale paths), fixed accumulation order"
+links = "oxe_int8_gemm"
+build = "build.rs"
+
+[build-dependencies]
+cc.workspace = true

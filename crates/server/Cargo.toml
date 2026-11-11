@@ -1,0 +1,28 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "oxe-server: OpenAI-compatible HTTP server (llama-server compatible shapes) over an Engine trait"
+
+[[bin]]
+name = "oxe-server"
+path = "src/main.rs"
+
+[dependencies]
+tokenizer = { path = "../tokenizer" }
+model = { path = "../model" }
+sched = { path = "../sched" }
+chat = { path = "../chat" }
+qwen4exp = { path = "../qwen4exp", optional = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+bytes = "1.12.1"
+libc.workspace = true
+
+[features]
+# --engine flash: Qwen3.8-Flash-Next (links the production ggml objects, see crates/qwen4exp)
+flash = ["dep:qwen4exp"]

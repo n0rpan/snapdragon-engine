@@ -1,0 +1,12 @@
+device=Adreno X1-85 api=1.4.354 timestampPeriod=52.083332
+case                                          R      K     T     gpu_ms    wall_ms     GMAC/s     check
+int8 dot4x8 peak (registers only)           512   2048   512      3.717      3.841      288.8  -
+fp16 vec4 fma peak (registers only)         512   2048   512     11.116     11.408       96.6  -
+int8 GEMM 1 token/invocation                512   2048   256     12.761     12.978       21.0  0/64 bad
+int8 GEMM 4 tokens/invocation               512   2048   256      5.518      5.672       48.6  0/64 bad
+int8 GEMM 4 tokens/invocation (qkv)        8192   2048   256    232.169    232.810       18.5  0/64 bad
+fp16 GEMM 1 token/invocation                512   2048   256     45.732     46.050        5.9  0/64 bad, rel 0.0e+00
+fp16 GEMM 4 tokens/invocation               512   2048   256     14.668     14.880       18.3  0/64 bad, rel 0.0e+00
+fp16 GEMM 4 tokens/invocation (qkv)        8192   2048   256    480.282    480.615        8.9  0/64 bad, rel 0.0e+00
+fp16 GEMM 4 tokens, 24-token ubatch        8192   2048    24     45.299     45.499        8.9  0/64 bad, rel 0.0e+00
+sync: empty dispatch submit->fence  median 42 us  min 40  p90 50

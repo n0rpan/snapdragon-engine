@@ -1,0 +1,5 @@
+/target
+*.o
+/results/
+tools/oracle/bin/
+__pycache__/

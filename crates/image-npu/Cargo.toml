@@ -1,0 +1,13 @@
+[package]
+name = "image-npu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+image-dit = { path = "../image-dit" }
+
+[dev-dependencies]
+image-flow = { path = "../image-flow" }

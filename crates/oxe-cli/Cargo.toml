@@ -1,0 +1,28 @@
+[package]
+name = "oxe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "oxe command-line tools: oxe (gen/trace/compare/verify/bench/cache), barrier-bench, gguf-dump"
+build = "build.rs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+kernels-sys = { path = "../kernels-sys" }
+sched = { path = "../sched" }
+model = { path = "../model" }
+tokenizer = { path = "../tokenizer" }
+serde_json.workspace = true
+
+[[bin]]
+name = "oxe"
+path = "src/bin/oxe.rs"
+
+[[bin]]
+name = "barrier-bench"
+path = "src/bin/barrier-bench.rs"
+
+[[bin]]
+name = "gguf-dump"
+path = "src/bin/gguf-dump.rs"
