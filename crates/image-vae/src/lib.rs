@@ -27,6 +27,22 @@ pub struct Rgb {
     pub data: Vec<u8>,
 }
 
+/// Loads the decoder from a safetensors file (the load part of [`decode_file`]).
+pub fn load_decoder(vae_path: &Path) -> Result<VaeDecoder, String> {
+    let st = SafeTensors::open(vae_path)?;
+    VaeDecoder::from_safetensors(&st, decoder::DEFAULT_GROUPS)
+}
+
+/// Decodes with an already loaded decoder (the decode part of [`decode_file`]).
+pub fn decode_with(dec: &VaeDecoder, z_nchw: &[f32], channels: usize, h: usize, w: usize, threads: usize) -> Result<Rgb, String> {
+    let (oh, ow) = dec.output_size(h, w);
+    let out = dec.decode(z_nchw, channels, h, w, threads)?;
+    if out.len() != 3 * oh * ow {
+        return Err(format!("decode_file: decoder returned {} values, expected {}", out.len(), 3 * oh * ow));
+    }
+    Ok(to_rgb(&out, oh, ow))
+}
+
 /// Loads the VAE weights from `vae_path` (safetensors), decodes the latent and
 /// converts the result to 8-bit RGB.
 ///
@@ -41,16 +57,8 @@ pub fn decode_file(
     w: usize,
     threads: usize,
 ) -> Result<Rgb, String> {
-    let dec = {
-        let st = SafeTensors::open(vae_path)?;
-        VaeDecoder::from_safetensors(&st, decoder::DEFAULT_GROUPS)?
-    };
-    let (oh, ow) = dec.output_size(h, w);
-    let out = dec.decode(z_nchw, channels, h, w, threads)?;
-    if out.len() != 3 * oh * ow {
-        return Err(format!("decode_file: decoder returned {} values, expected {}", out.len(), 3 * oh * ow));
-    }
-    Ok(to_rgb(&out, oh, ow))
+    let dec = load_decoder(vae_path)?;
+    decode_with(&dec, z_nchw, channels, h, w, threads)
 }
 
 /// Converts raw decoder output `[3][height][width]` to 8-bit RGB with the sd.cpp

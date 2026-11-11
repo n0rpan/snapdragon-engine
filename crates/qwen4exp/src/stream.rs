@@ -1315,7 +1315,17 @@ mod tests {
         let lay = Layout { geom: vec![g; N_LAYER], base, total, r4: true };
         let cfg = StreamConfig { cache_bytes: 0, qd: 32, io_cpu: None, prefault: false };
         // the tests start from the plain op (first-seen order, no read-ahead) and switch things on explicitly
-        let mut st = Stream::from_layout(lay, fd, &vec![quota; N_LAYER], &cfg).unwrap();
+        // A 160-slot pool reserves ~15 GB of address space (not touched). A host with less RAM + swap refuses
+        // the mapping under heuristic overcommit (the 8 GB CI runner): skip there, like the O_DIRECT case.
+        let mut st = match Stream::from_layout(lay, fd, &vec![quota; N_LAYER], &cfg) {
+            Ok(st) => st,
+            Err(e) if e.contains("os error 12") => {
+                eprintln!("expert pool of {quota} slots/layer refused ({e}); skipping");
+                std::fs::remove_dir_all(&dir).ok();
+                return None;
+            }
+            Err(e) => panic!("{e}"),
+        };
         st.pf_order = false;
         st.pf_readahead = 0;
         st.pf_readahead_auto = false;

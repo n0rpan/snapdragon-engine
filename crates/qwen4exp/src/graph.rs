@@ -142,6 +142,14 @@ fn map_file(p: &std::path::Path) -> Result<Mapped, String> {
     Ok(Mapped { ptr: ptr as *mut u8, len })
 }
 
+/// `[off, off + bytes)` inside a mapping of `len` bytes, without overflow.
+pub(crate) fn tensor_in_mapping(off: u64, bytes: u64, len: usize) -> Result<(), String> {
+    match off.checked_add(bytes) {
+        Some(end) if end <= len as u64 => Ok(()),
+        _ => Err(format!("data [{off}, +{bytes}) outside its {len}-byte mapping")),
+    }
+}
+
 pub struct GraphModel {
     pub(crate) m: *mut FgModel,
     pub maps: Vec<Mapped>,
@@ -168,9 +176,16 @@ impl GraphModel {
             } else if is_exp && !map_experts {
                 continue;
             } else {
-                // SAFETY: inside the mapping of its shard.
-                (unsafe { maps[t.shard].ptr.add(t.off as usize) } as *mut c_void, 1 + t.shard as i32)
+                // REVIEW-v0.1.1 S1: check the range against the mapping we actually hold (the file
+                // can differ from the one Gguf::open checked), with checked arithmetic
+                let mp = maps.get(t.shard).ok_or_else(|| format!("{}: shard {} not mapped", t.name, t.shard))?;
+                tensor_in_mapping(t.off, t.bytes, mp.len).map_err(|e| format!("{}: {e}", t.name))?;
+                // SAFETY: [off, off + bytes) lies inside the mapping of its shard (checked above).
+                (unsafe { mp.ptr.add(t.off as usize) } as *mut c_void, 1 + t.shard as i32)
             };
+            if t.shape.len() > 4 || t.shape.iter().any(|&x| x > i64::MAX as u64) {
+                return Err(format!("{}: shape {:?} is not a ggml shape", t.name, t.shape));
+            }
             let mut ne = [1i64; 4];
             for (i, &x) in t.shape.iter().enumerate() {
                 ne[i] = x as i64;
@@ -351,6 +366,41 @@ impl GraphCtx {
             let mut b = vec![0u8; fg_ctx_compact_bytes(self.c, n as u32)];
             fg_ctx_save_compact(self.c, b.as_mut_ptr() as *mut c_void);
             (toks, b)
+        }
+    }
+    /// Bytes `save_compact` produces at the current position (without the token history).
+    pub fn compact_bytes(&self) -> usize {
+        let n = self.pos() as u32;
+        // SAFETY: valid context; fg_ctx_compact_bytes only reads the layout (its pointer is non-const by history).
+        unsafe { fg_ctx_compact_bytes(self.c, n) }
+    }
+    /// Bytes of a compact state at `pos` positions of this context's layout; None past `n_ctx` (FLASH-PREFIX-1:
+    /// a loader checks a stored length against this BEFORE allocating).
+    pub fn compact_bytes_at(&self, pos: usize, n_ctx: usize) -> Option<usize> {
+        if pos > n_ctx || pos > u32::MAX as usize {
+            return None;
+        }
+        // SAFETY: valid context; the size is computed from the layout (pos * row stride per tensor).
+        Some(unsafe { fg_ctx_compact_bytes(self.c, pos as u32) })
+    }
+    /// `save_compact` without its own buffers (FLASH-PREFIX-1: one copy of a ~285 MB state, not two): appends
+    /// `u64 compact length`, the token history (i32 LE each) and the compact state to `out`. The bytes equal
+    /// `len.to_le_bytes() ++ toks ++ b` of `save_compact`.
+    pub fn save_compact_append(&mut self, out: &mut Vec<u8>) {
+        let n = self.pos();
+        let nb = self.compact_bytes();
+        let mut toks = vec![0i32; n];
+        out.reserve(8 + 4 * n + nb);
+        out.extend_from_slice(&(nb as u64).to_le_bytes());
+        // SAFETY: buffers sized by the context; the compact region is written in full by fg_ctx_save_compact.
+        unsafe {
+            fg_ctx_get_tokens(self.c, toks.as_mut_ptr());
+            for t in &toks {
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            let at = out.len();
+            out.resize(at + nb, 0);
+            fg_ctx_save_compact(self.c, out[at..].as_mut_ptr() as *mut c_void);
         }
     }
     /// Load a state saved by `save_compact` (the context's other cells are left as they are).
@@ -572,4 +622,37 @@ pub fn argmax(l: &[f32]) -> usize {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod s1_tests {
+    use super::tensor_in_mapping;
+
+    /// REVIEW-v0.1.1 S1: the shard pointer is only formed for a range inside the mapping;
+    /// an offset near 2^64 must not wrap into range.
+    #[test]
+    fn tensor_range_must_lie_inside_the_mapping() {
+        assert!(tensor_in_mapping(0, 4096, 4096).is_ok());
+        assert!(tensor_in_mapping(4000, 96, 4096).is_ok());
+        assert!(tensor_in_mapping(4000, 97, 4096).is_err());
+        assert!(tensor_in_mapping(u64::MAX - 8, 16, 4096).is_err());
+        assert!(tensor_in_mapping(8, u64::MAX, 4096).is_err());
+    }
+
+    /// The real Flash shards (headers only; skipped when absent) pass the parser limits and
+    /// every tensor lies inside its shard file.
+    #[test]
+    fn real_flash_shards_pass_the_range_check() {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/ai-stack/models/llm/Qwen3.8-Flash-Next/UD-IQ3_XXS");
+        if !dir.is_dir() {
+            eprintln!("skip: no Flash shards");
+            return;
+        }
+        let s = crate::model::Shards::open(&dir).unwrap();
+        for t in &s.tensors {
+            let len = s.files[t.shard].file_bytes as usize;
+            tensor_in_mapping(t.off, t.bytes, len).unwrap_or_else(|e| panic!("{}: {e}", t.name));
+            assert!(t.shape.len() <= 4);
+        }
+    }
 }

@@ -20,3 +20,7 @@ pub mod service;
 mod tests;
 #[cfg(test)]
 mod tests_flash_prod;
+#[cfg(test)]
+mod tests_hotfix;
+#[cfg(test)]
+mod tests_flash_prefix;

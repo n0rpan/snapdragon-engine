@@ -16,10 +16,16 @@
 //! position 0 on the same grid, and a load continues on that grid, so a request that loads
 //! an entry computes bit for bit what a cold server computes for the same prompt.
 //!
-//! Layout: `DIR/<key>.bin` (mode 0600, DIR 0700) = magic `OXEPFX01`, u32 identity length,
-//! identity, u64 n_tokens, n_tokens u32 token ids, the engine state ([`Engine::save_state`]).
+//! Layout: `DIR/<key>.bin` (mode 0600, DIR 0700) = magic `OXEPFX02`, u32 identity length,
+//! identity, u64 n_tokens, n_tokens u32 token ids, u64 state length, u64 state checksum
+//! ([`Check64`]), the engine state ([`Engine::save_state`]). Entries of the older `OXEPFX01`
+//! layout (no length / checksum) are still read. A load whose state length, checksum or trailing
+//! bytes do not match is an error: the entry is deleted and the caller resets the engine (a
+//! flipped bit inside a Flash state would otherwise load silently).
 //! Writes go to `<key>.pending` and are renamed when complete; size is capped with LRU
-//! eviction by mtime (a load touches the file).
+//! eviction by mtime (a load touches the file). After the write (fsync) and after a load the
+//! file's page cache is dropped (POSIX_FADV_DONTNEED): a 285 MB Flash state would otherwise sit
+//! in the engine scope's memory charge next to the expert cache.
 
 use crate::engine::Engine;
 use std::fs;
@@ -30,6 +36,108 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 8] = b"OXEPFX01";
+const MAGIC2: &[u8; 8] = b"OXEPFX02";
+
+/// Streaming 64-bit checksum of an entry's state bytes (integrity against truncation and
+/// bit rot, not an adversary: the directory is 0700 on the encrypted home). One multiply-xor-
+/// rotate lane over little-endian u64 words, several GB/s, so ~60 ms for a 285 MB Flash state.
+#[derive(Clone)]
+pub struct Check64 {
+    h: u64,
+    tail: [u8; 8],
+    nt: usize,
+    len: u64,
+}
+
+impl Default for Check64 {
+    fn default() -> Self {
+        Check64 { h: 0x243f_6a88_85a3_08d3, tail: [0; 8], nt: 0, len: 0 }
+    }
+}
+
+impl Check64 {
+    #[inline]
+    fn word(&mut self, w: u64) {
+        self.h = (self.h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+    }
+    pub fn update(&mut self, mut d: &[u8]) {
+        self.len += d.len() as u64;
+        if self.nt > 0 {
+            let n = (8 - self.nt).min(d.len());
+            self.tail[self.nt..self.nt + n].copy_from_slice(&d[..n]);
+            self.nt += n;
+            d = &d[n..];
+            if self.nt < 8 {
+                return;
+            }
+            let w = u64::from_le_bytes(self.tail);
+            self.word(w);
+            self.nt = 0;
+        }
+        let mut it = d.chunks_exact(8);
+        for c in &mut it {
+            self.word(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let r = it.remainder();
+        self.tail[..r.len()].copy_from_slice(r);
+        self.nt = r.len();
+    }
+    pub fn finish(mut self) -> u64 {
+        if self.nt > 0 {
+            let mut t = [0u8; 8];
+            t[..self.nt].copy_from_slice(&self.tail[..self.nt]);
+            self.word(u64::from_le_bytes(t) ^ ((self.nt as u64) << 56));
+        }
+        let len = self.len;
+        self.word(len);
+        let mut h = self.h;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^ (h >> 33)
+    }
+}
+
+pub fn check64(d: &[u8]) -> u64 {
+    let mut c = Check64::default();
+    c.update(d);
+    c.finish()
+}
+
+/// Reader over exactly `left` state bytes that checksums what the engine reads.
+struct CheckedReader<'a> {
+    r: &'a mut dyn Read,
+    left: u64,
+    sum: Check64,
+}
+
+impl Read for CheckedReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.left) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let k = self.r.read(&mut buf[..n])?;
+        self.sum.update(&buf[..k]);
+        self.left -= k as u64;
+        Ok(k)
+    }
+}
+
+/// MemAvailable from /proc/meminfo.
+pub fn proc_mem_available() -> Option<u64> {
+    let s = fs::read_to_string("/proc/meminfo").ok()?;
+    let l = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    l.split_whitespace().nth(1)?.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+/// Drop the page cache of `f` (whole file). Best effort.
+fn drop_pages(f: &fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid open file descriptor.
+    unsafe {
+        libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
 
 /// Minimal SHA-256 (FIPS 180-4).
 pub struct Sha256 {
@@ -154,6 +262,11 @@ pub struct PrefixStore {
     pub max_bytes: u64,
     /// smallest prefix worth storing (tokens)
     pub min_tokens: usize,
+    /// FLASH-PREFIX-2: skip a save unless MemAvailable >= this floor + 2 x the entry (the state buffer + its
+    /// page cache until the write drops it). 0 = always save (the MoE default).
+    pub save_floor_bytes: u64,
+    /// MemAvailable reader (tests replace it)
+    pub mem_available: fn() -> Option<u64>,
     identity: String,
     entries: Arc<Mutex<Vec<Entry>>>,
     writers: Vec<std::thread::JoinHandle<()>>,
@@ -194,7 +307,16 @@ impl PrefixStore {
                 _ => {}
             }
         }
-        let st = PrefixStore { dir: dir.to_path_buf(), max_bytes, min_tokens, identity, entries: Arc::new(Mutex::new(entries)), writers: Vec::new() };
+        let st = PrefixStore {
+            dir: dir.to_path_buf(),
+            max_bytes,
+            min_tokens,
+            save_floor_bytes: 0,
+            mem_available: proc_mem_available,
+            identity,
+            entries: Arc::new(Mutex::new(entries)),
+            writers: Vec::new(),
+        };
         prune(&st.dir, st.max_bytes, None, &st.entries);
         Ok(st)
     }
@@ -240,6 +362,25 @@ impl PrefixStore {
         gone
     }
 
+    /// FLASH-PREFIX-2: may an entry of about `entry_bytes` be built and written now? False when a floor is set and
+    /// MemAvailable (unknown = no) is below floor + 2 x entry, or while an earlier write still holds its buffer
+    /// (never two ~285 MB Flash states in memory at once). A skipped save only costs the disk hit later.
+    pub fn save_allowed(&mut self, entry_bytes: u64) -> Result<(), String> {
+        self.writers.retain(|h| !h.is_finished());
+        if self.save_floor_bytes == 0 {
+            return Ok(());
+        }
+        if !self.writers.is_empty() {
+            return Err("an earlier entry is still being written".into());
+        }
+        let need = entry_bytes.saturating_mul(2).saturating_add(self.save_floor_bytes);
+        match (self.mem_available)() {
+            Some(a) if a >= need => Ok(()),
+            Some(a) => Err(format!("MemAvailable {} MiB < floor {} MiB + 2 x entry {} MiB", a >> 20, self.save_floor_bytes >> 20, entry_bytes >> 20)),
+            None => Err("MemAvailable unknown".into()),
+        }
+    }
+
     pub fn n_entries(&self) -> usize {
         self.entries.lock().unwrap().len()
     }
@@ -262,16 +403,37 @@ impl PrefixStore {
         let path = self.dir.join(format!("{key}.bin"));
         let r = (|| -> Result<(), String> {
             let f = fs::File::open(&path).map_err(|e| e.to_string())?;
+            let file_len = f.metadata().map_err(|e| e.to_string())?.len();
             let mut r = BufReader::with_capacity(4 << 20, f);
-            let toks = read_header_from(&mut r, &self.identity).map_err(|e| e.to_string())?.ok_or("identity mismatch")?;
+            let (toks, check) = read_header_v(&mut r, &self.identity, file_len).map_err(|e| e.to_string())?.ok_or("identity mismatch or bad header")?;
             if toks[..] != prompt[..n] {
                 return Err("token mismatch".into());
             }
-            eng.load_state(&mut r, n).map_err(|e| e.0)?;
+            match check {
+                Some((len, sum)) => {
+                    // the stored state length must be exactly what follows the header in this file
+                    let hdr = header_len(&self.identity, toks.len()).ok_or("header size overflow")?;
+                    if file_len.checked_sub(hdr) != Some(len) {
+                        return Err(format!("state length {len} does not match the file ({file_len} bytes, header {hdr})"));
+                    }
+                    let mut cr = CheckedReader { r: &mut r, left: len, sum: Check64::default() };
+                    let res = eng.load_state(&mut cr, n).map_err(|e| e.0);
+                    let (left, got) = (cr.left, cr.sum.finish());
+                    res?;
+                    if left != 0 {
+                        return Err(format!("the engine read {left} bytes less than the stored state"));
+                    }
+                    if got != sum {
+                        return Err("state checksum mismatch".into());
+                    }
+                }
+                None => eng.load_state(&mut r, n).map_err(|e| e.0)?,
+            }
             let mut extra = [0u8; 1];
             if r.read(&mut extra).map_err(|e| e.to_string())? != 0 {
                 return Err("trailing bytes".into());
             }
+            drop_pages(r.get_ref());
             Ok(())
         })();
         match r {
@@ -300,14 +462,17 @@ impl PrefixStore {
             let w = (|| -> std::io::Result<()> {
                 let f = fs::File::options().write(true).create(true).truncate(true).mode(0o600).open(&pending)?;
                 let mut w = BufWriter::with_capacity(4 << 20, f);
-                w.write_all(MAGIC)?;
+                w.write_all(MAGIC2)?;
                 w.write_all(&(identity.len() as u32).to_le_bytes())?;
                 w.write_all(identity.as_bytes())?;
                 w.write_all(&(tokens.len() as u64).to_le_bytes())?;
                 w.write_all(&tokens_bytes(&tokens))?;
+                w.write_all(&(state.len() as u64).to_le_bytes())?;
+                w.write_all(&check64(&state).to_le_bytes())?;
                 w.write_all(&state)?;
                 let f = w.into_inner().map_err(|e| e.into_error())?;
                 f.sync_all()?;
+                drop_pages(&f);
                 fs::rename(&pending, &fin)?;
                 Ok(())
             })();
@@ -346,8 +511,15 @@ fn entry_key(identity: &str, tokens: &[u32]) -> String {
 }
 
 fn read_header(p: &Path, identity: &str) -> std::io::Result<Option<Vec<u32>>> {
-    let mut r = BufReader::new(fs::File::open(p)?);
-    read_header_from(&mut r, identity)
+    let f = fs::File::open(p)?;
+    let len = f.metadata()?.len();
+    let mut r = BufReader::new(f);
+    Ok(read_header_v(&mut r, identity, len)?.map(|h| h.0))
+}
+
+/// Bytes of an `OXEPFX02` header (magic .. checksum) for `identity` and `n_tokens` tokens.
+fn header_len(identity: &str, n_tokens: usize) -> Option<u64> {
+    (n_tokens as u64).checked_mul(4)?.checked_add(8 + 4 + identity.len() as u64 + 8 + 16)
 }
 
 /// Header of an entry: Some(tokens) if it belongs to `identity`.
@@ -356,7 +528,7 @@ fn read_identity(p: &Path) -> Option<String> {
     let mut r = BufReader::new(fs::File::open(p).ok()?);
     let mut m = [0u8; 8];
     r.read_exact(&mut m).ok()?;
-    if &m != MAGIC {
+    if &m != MAGIC && &m != MAGIC2 {
         return None;
     }
     let mut u = [0u8; 4];
@@ -375,10 +547,14 @@ fn model_of(identity: &str) -> Option<&str> {
     identity.split(' ').find(|c| c.starts_with("model="))
 }
 
-fn read_header_from(r: &mut dyn Read, identity: &str) -> std::io::Result<Option<Vec<u32>>> {
+/// Header of an entry: Some(tokens) if it belongs to `identity`, plus the state's (length, checksum) of an `OXEPFX02` entry (None:
+/// an `OXEPFX01` entry, which has neither).
+/// `file_len` bounds every count before it sizes an allocation (a corrupt or crafted header is a miss).
+fn read_header_v(r: &mut dyn Read, identity: &str, file_len: u64) -> std::io::Result<Option<(Vec<u32>, Option<(u64, u64)>)>> {
     let mut m = [0u8; 8];
     r.read_exact(&mut m)?;
-    if &m != MAGIC {
+    let v2 = &m == MAGIC2;
+    if &m != MAGIC && !v2 {
         return Ok(None);
     }
     let mut u = [0u8; 4];
@@ -394,13 +570,22 @@ fn read_header_from(r: &mut dyn Read, identity: &str) -> std::io::Result<Option<
     }
     let mut u8b = [0u8; 8];
     r.read_exact(&mut u8b)?;
-    let nt = u64::from_le_bytes(u8b) as usize;
-    if nt > 1 << 22 {
+    let nt = u64::from_le_bytes(u8b);
+    if nt > 1 << 22 || nt.checked_mul(4).map_or(true, |b| b > file_len) {
         return Ok(None);
     }
+    let nt = nt as usize;
     let mut b = vec![0u8; nt * 4];
     r.read_exact(&mut b)?;
-    Ok(Some(b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()))
+    let toks = b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    if !v2 {
+        return Ok(Some((toks, None)));
+    }
+    let mut l = [0u8; 8];
+    r.read_exact(&mut l)?;
+    let mut c = [0u8; 8];
+    r.read_exact(&mut c)?;
+    Ok(Some((toks, Some((u64::from_le_bytes(l), u64::from_le_bytes(c))))))
 }
 
 /// Delete this store's least recently used entries until they fit `max_bytes`. Only files
@@ -434,6 +619,24 @@ fn prune(dir: &Path, max_bytes: u64, keep: Option<&str>, entries: &Mutex<Vec<Ent
             entries.lock().unwrap().retain(|e| e.key != stem);
         }
     }
+}
+
+/// The directory of `file` when `dir` lies inside it (both canonicalized; `dir` may not exist
+/// yet: its nearest existing ancestor is used). Flash refuses a prefix store there (O-21: the
+/// expert sidecar may sit on an unencrypted partition; prompts must not).
+pub fn inside_dir_of(dir: &Path, file: Option<&Path>) -> Option<PathBuf> {
+    let side = fs::canonicalize(file?.parent()?).ok()?;
+    let mut probe = if dir.is_absolute() { dir.to_path_buf() } else { std::env::current_dir().ok()?.join(dir) };
+    let mut rest = Vec::new();
+    let base = loop {
+        if let Ok(c) = fs::canonicalize(&probe) {
+            break c;
+        }
+        rest.push(probe.file_name()?.to_os_string());
+        probe = probe.parent()?.to_path_buf();
+    };
+    let full = rest.iter().rev().fold(base, |p, c| p.join(c));
+    full.starts_with(&side).then_some(side)
 }
 
 /// Identity string for a model file and engine (see the module docs).

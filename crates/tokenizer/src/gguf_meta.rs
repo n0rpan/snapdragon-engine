@@ -90,7 +90,8 @@ impl<T: Read> R<T> {
                 if n > (1 << 28) {
                     return Err(err("array too long"));
                 }
-                let mut v = Vec::with_capacity(n as usize);
+                // grow as items are read: a crafted length must not reserve gigabytes up front
+                let mut v = Vec::with_capacity((n as usize).min(4096));
                 for _ in 0..n {
                     v.push(self.value(it)?);
                 }

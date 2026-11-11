@@ -199,29 +199,47 @@ fn layout_for(t: &TensorInfo, embd: bool) -> Result<Layout, String> {
     Ok(Layout::Packed(q))
 }
 
+/// Geometry `k x rows x n_expert` of a tensor, checked against its byte size (REVIEW-v0.1.1 S1):
+/// the kernels address rows by this shape, so a size that does not match it would read past
+/// the tensor (a crafted file).
+fn checked_geometry(t: &TensorInfo) -> Result<(usize, usize, usize, usize), String> {
+    let bad = || format!("{}: shape {:?} does not match its {} data bytes", t.name, t.shape, t.bytes());
+    let (_, blk, size) = t.ty.info().ok_or_else(bad)?;
+    let k = t.shape.first().copied().unwrap_or(0);
+    let rows = t.shape.get(1).copied().unwrap_or(1);
+    let n_expert = t.shape.get(2).copied().unwrap_or(1);
+    if k == 0 || rows == 0 || n_expert == 0 || k % blk != 0 || t.shape.iter().skip(3).any(|&d| d != 1) {
+        return Err(bad());
+    }
+    let want = (k / blk).checked_mul(size).and_then(|r| r.checked_mul(rows)).and_then(|r| r.checked_mul(n_expert));
+    let want = match want {
+        Some(w) if Some(w) == t.checked_bytes() => w,
+        _ => return Err(bad()),
+    };
+    let u = |x: u64| usize::try_from(x).map_err(|_| bad());
+    Ok((u(k)?, u(rows)?, u(n_expert)?, u(want)?))
+}
+
 fn make_ref(t: &TensorInfo, embd: bool, ptr: usize) -> Result<WeightRef, String> {
-    Ok(WeightRef {
-        ptr,
-        layout: layout_for(t, embd)?,
-        k: t.shape[0] as usize,
-        rows: t.shape.get(1).copied().unwrap_or(1) as usize,
-        n_expert: t.shape.get(2).copied().unwrap_or(1) as usize,
-        bytes: t.bytes() as usize,
-    })
+    let (k, rows, n_expert, bytes) = checked_geometry(t)?;
+    Ok(WeightRef { ptr, layout: layout_for(t, embd)?, k, rows, n_expert, bytes })
 }
 
 /// Arena offsets: tensors >= 2 MiB start on a 2 MiB boundary, smaller ones on 4 KiB.
-fn arena_layout(tensors: &[TensorInfo], ids: &[Tid]) -> (Vec<(Tid, usize)>, usize) {
+/// Checked arithmetic: every `(off, bytes)` lies inside the returned total.
+fn arena_layout(tensors: &[TensorInfo], ids: &[Tid]) -> Result<(Vec<(Tid, usize)>, usize), String> {
+    let over = || "weight arena size overflows".to_string();
+    let up = |x: usize, a: usize| x.checked_add(a - 1).map(|v| v / a * a);
     let mut off = 0usize;
     let mut out = Vec::new();
     for &id in ids {
-        let b = tensors[id].bytes() as usize;
+        let b = usize::try_from(tensors[id].checked_bytes().ok_or_else(over)?).map_err(|_| over())?;
         let align = if b >= HUGE { HUGE } else { 4096 };
-        off = off.div_ceil(align) * align;
+        off = up(off, align).ok_or_else(over)?;
         out.push((id, off));
-        off += b;
+        off = off.checked_add(b).ok_or_else(over)?;
     }
-    (out, off.div_ceil(HUGE) * HUGE)
+    Ok((out, up(off, HUGE).ok_or_else(over)?))
 }
 
 // ------------------------------------------------------------------ hashing
@@ -545,7 +563,10 @@ impl WeightStore {
         let eid = engine_id();
         let path = dir.join(format!("{sha}-{eid}{tag}.bin"));
         let mut info = LoadInfo { cache_path: path.display().to_string(), model_sha256: sha.clone(), ..Default::default() };
-        let (offs, total) = arena_layout(&tensors, &ids);
+        let (offs, total) = arena_layout(&tensors, &ids)?;
+        for &id in &ids {
+            checked_geometry(&tensors[id])?;
+        }
 
         let mut hdr = None;
         if path.exists() {
@@ -579,14 +600,18 @@ impl WeightStore {
             }
         };
         info.cache_hit = !built;
-        // entries must match the plan's layout exactly
+        // entries must match the plan's layout exactly (and the arena its size: every ref below
+        // points into [base, base + total))
+        if hdr.total != total as u64 {
+            return Err("cache arena size does not match the plan".into());
+        }
         if hdr.entries.len() != ids.len() {
             return Err("cache entry count does not match the plan".into());
         }
         for (e, &(id, off)) in hdr.entries.iter().zip(&offs) {
             let t = &tensors[id];
             let want = make_ref(t, Some(id) == embd, 0)?;
-            if e.name != t.name || e.off as usize != off || e.bytes as usize != want.bytes || e.layout != want.layout {
+            if e.name != t.name || e.off as usize != off || e.bytes as usize != want.bytes || e.layout != want.layout || e.n_expert != want.n_expert as u64 {
                 return Err(format!("cache entry {} does not match the model/plan", e.name));
             }
         }
@@ -760,8 +785,8 @@ fn open_cache(path: &Path, eid: &str, sha: &str, model_bytes: u64) -> Result<(Fi
         return Err("model identity mismatch".into());
     }
     let flen = f.metadata().map_err(|e| e.to_string())?.len();
-    if flen != h.data_off + h.total {
-        return Err(format!("cache file is {flen} bytes, header says {}", h.data_off + h.total));
+    if h.data_off.checked_add(h.total) != Some(flen) {
+        return Err(format!("cache file is {flen} bytes, header says {} + {}", h.data_off, h.total));
     }
     Ok((f, h))
 }
@@ -865,7 +890,10 @@ fn build_cache(
                 let t = &tensors[offs[ei].0];
                 let eb = (e.bytes / e.n_expert) as usize;
                 let src = &g.tensor_data(t)[x * eb..(x + 1) * eb];
-                // SAFETY: each (tensor, expert) item owns a disjoint range of the mapping.
+                // arena_layout keeps every (off, bytes) inside total; a cheap release assert
+                assert!(e.off as usize + (x + 1) * eb <= total, "weight cache item outside the arena");
+                // SAFETY: each (tensor, expert) item owns a disjoint range of the mapping, inside
+                // [data_off, data_off + total) by the assert above.
                 let dst = unsafe { std::slice::from_raw_parts_mut((base + e.off as usize + x * eb) as *mut u8, eb) };
                 match e.layout {
                     Layout::F32 | Layout::Raw(_) => dst.copy_from_slice(src),
@@ -913,4 +941,56 @@ fn build_cache(
         eprintln!("load: weight cache written in {:.1} s", t0.elapsed().as_secs_f64());
     }
     Ok(h)
+}
+
+#[cfg(test)]
+mod s1_tests {
+    use super::*;
+
+    fn t(shape: &[u64], ty: GgmlType) -> TensorInfo {
+        TensorInfo { name: "w".into(), shape: shape.to_vec(), ty, offset: 0 }
+    }
+
+    /// REVIEW-v0.1.1 S1: the refs the kernels address by shape must have exactly that many bytes,
+    /// and the arena layout must not wrap.
+    #[test]
+    fn geometry_and_arena_are_checked() {
+        // normal 2-D / 3-D tensors pass
+        let r = make_ref(&t(&[256, 8], GgmlType::Q4_K), false, 0).unwrap();
+        assert_eq!((r.k, r.rows, r.n_expert, r.bytes), (256, 8, 1, 8 * 144));
+        let r = make_ref(&t(&[256, 8, 4], GgmlType::Q8_0), false, 0).unwrap();
+        assert_eq!(r.bytes, 4 * 8 * (256 / 32) * 34);
+        assert!(make_ref(&t(&[64], GgmlType::F32), false, 0).is_ok());
+        // a 4th dimension the kernels ignore would make the data larger than the shape they read
+        assert!(make_ref(&t(&[64, 1, 1, 2], GgmlType::F32), false, 0).is_err());
+        // zero experts (divide by zero in the cache build) and overflowing shapes
+        assert!(make_ref(&t(&[64, 8, 0], GgmlType::F32), false, 0).is_err());
+        assert!(make_ref(&t(&[1 << 40, 1 << 40], GgmlType::F32), false, 0).is_err());
+        // arena: sizes that wrap usize are an error, not a small arena
+        let ts = vec![t(&[1 << 61], GgmlType::F32), t(&[1 << 61], GgmlType::F32)];
+        assert!(arena_layout(&ts, &[0, 1]).is_err());
+        let ts = vec![t(&[1024], GgmlType::F32), t(&[(HUGE / 4) as u64], GgmlType::F32)];
+        let (offs, total) = arena_layout(&ts, &[0, 1]).unwrap();
+        for (id, off) in offs {
+            assert!(off + ts[id].bytes() as usize <= total);
+        }
+    }
+    /// The real model headers (header only, no weights read; skipped when absent) still pass.
+    #[test]
+    fn real_model_headers_pass_the_geometry_check() {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/ai-stack/models/llm");
+        for f in ["Ornith-1.5-35B-A3B-APEX-MTP-Compact.gguf", "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf", "Qwen3.8-27B-Q4_K_M.gguf"] {
+            let p = dir.join(f);
+            if !p.is_file() {
+                eprintln!("skip: {f}");
+                continue;
+            }
+            let g = Gguf::open(&p).unwrap();
+            for t in &g.header.tensors {
+                checked_geometry(t).unwrap_or_else(|e| panic!("{f}: {e}"));
+            }
+            let ids: Vec<Tid> = (0..g.header.tensors.len()).collect();
+            arena_layout(&g.header.tensors, &ids).unwrap();
+        }
+    }
 }

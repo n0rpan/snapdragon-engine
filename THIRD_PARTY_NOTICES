@@ -67,3 +67,18 @@ against it, but contains no BigMoeOnEdge source.
 
 Rust crates are not vendored. Cargo fetches them from crates.io under their
 own licences; Cargo.lock pins the exact versions.
+
+5. CI-built Flash binary distributions
+   Build sources: Helldez/BigMoeOnEdge, Apache-2.0, commit
+     930b2c9ebd8c2cface6566bd9f11075ac07adfe0
+     https://github.com/Helldez/BigMoeOnEdge
+   and Helldez/llama.cpp, MIT (The ggml authors), commit
+     7ac98f4a8089a36c0581b7c6e8973417a8fa175c
+     https://github.com/Helldez/llama.cpp
+   Flash tarballs link ggml static libraries built within that source setup.
+   Both exact upstream LICENSE texts accompany those tarballs as
+   licenses/BigMoeOnEdge-LICENSE and licenses/llama.cpp-LICENSE; their hashes and
+   pins are recorded in FLASH-SOURCE-LICENSES.json. Neither pinned project has a
+   root NOTICE file. Reference copies of these exact legal texts are kept under
+   third_party/. The demand-mapping patch changes llama.cpp/src/llama-model.cpp;
+   the ggml library sources are unchanged by that patch.

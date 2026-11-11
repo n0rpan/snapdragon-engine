@@ -244,6 +244,10 @@ impl WarmFile {
 
     /// The stored hint, if the file belongs to this identity.
     pub fn read(&self) -> Option<Vec<u8>> {
+        // a hot list is <= 8 + 4 * 48 * 512 bytes: refuse anything far larger before reading it (FLASH-PREFIX-1 sweep)
+        if std::fs::metadata(&self.path).ok()?.len() > 1 << 20 {
+            return None;
+        }
         let b = std::fs::read(&self.path).ok()?;
         let id = self.identity.as_bytes();
         let head = 12 + id.len();
@@ -657,10 +661,15 @@ impl<E: Engine> Worker<E> {
             if prio == crate::cache::PRIO_ANCHOR && aligned {
                 if let Some(st) = &mut self.store {
                     if pos >= st.min_tokens && !st.contains(&prompt[..pos]) {
-                        let mut buf = Vec::new();
-                        match self.engine.save_state(&mut buf) {
-                            Ok(()) => st.save_async(prompt[..pos].to_vec(), buf),
-                            Err(e) => eprintln!("oxe-server: prefix store: {}", e.0),
+                        // FLASH-PREFIX-2: no state buffer while memory is short (checked BEFORE it is built)
+                        let hint = self.engine.state_size_hint() as u64;
+                        if let Err(why) = st.save_allowed(hint) {
+                            eprintln!("oxe-server: prefix store: save of {pos} tokens skipped: {why}");
+                        } else {
+                            match self.engine.save_state_vec() {
+                                Ok(buf) => st.save_async(prompt[..pos].to_vec(), buf),
+                                Err(e) => eprintln!("oxe-server: prefix store: {}", e.0),
+                            }
                         }
                     }
                 }
@@ -699,7 +708,9 @@ impl<E: Engine> Worker<E> {
         let u = self.ubatch.max(1);
         // the lattice the request would prefill on: from the restore point (or 0 when aligned)
         let base = if self.cache.clean && n0 % u == 0 { 0 } else { n0 };
-        let g = base + (hist.len() - base) / u * u;
+        // the last grid point strictly inside `hist` (prefill_head needs g + 1 tokens): an exactly
+        // aligned history used to give g == len and slice past the end (abort in release)
+        let g = base + (hist.len() - 1).saturating_sub(base) / u * u;
         if g <= n0 + u {
             return Ok(0); // less than one ubatch to gain
         }

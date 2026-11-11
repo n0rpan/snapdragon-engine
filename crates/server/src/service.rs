@@ -40,6 +40,9 @@ pub struct State<E: Engine> {
     pub reqs: std::sync::atomic::AtomicU64,
     /// idle jobs finished (tests)
     pub idle_done: std::sync::atomic::AtomicU64,
+    /// S8: a stream whose client takes no frame for this long is dropped and its generation
+    /// cancelled (`--stream-stall-timeout`, env `OXE_STREAM_STALL_SECS`, default 30 s)
+    pub stream_stall: std::time::Duration,
 }
 
 pub enum Reply {
@@ -74,6 +77,9 @@ impl<E: Engine> State<E> {
             idle: Mutex::new(None),
             reqs: Default::default(),
             idle_done: Default::default(),
+            stream_stall: std::time::Duration::from_secs_f64(
+                std::env::var("OXE_STREAM_STALL_SECS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(30.0),
+            ),
         })
     }
 
@@ -128,7 +134,8 @@ impl<E: Engine> State<E> {
                 let mut first = true;
                 for x in a {
                     match x {
-                        Json::Number(n) => out.push(n.as_u64().ok_or("bad token")? as Token),
+                        // ids above u32 used to wrap onto valid ids (`as`)
+                        Json::Number(n) => out.push(n.as_u64().and_then(|v| Token::try_from(v).ok()).ok_or("bad token")?),
                         Json::String(s) => {
                             out.extend(self.tok.encode(s, add_special && first, true));
                             first = false;
@@ -155,7 +162,8 @@ impl<E: Engine> State<E> {
 
 /// Route a request. Blocking work (generation) is done in `spawn_blocking`.
 pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8]) -> Reply {
-    let path = path.trim_end_matches('/');
+    // exact paths like llama-server (REVIEW S4: a trimmed `/v1/chat/completions/` ran as a chat
+    // completion while the controller did not treat it as inference)
     let parse = || -> Result<Json, Reply> {
         if body.is_empty() {
             return Ok(json!({}));
@@ -211,7 +219,7 @@ pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, quer
                 Err(r) => return r,
             };
             let toks: Vec<Token> =
-                b.get("tokens").and_then(Json::as_array).map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as Token)).collect()).unwrap_or_default();
+                b.get("tokens").and_then(Json::as_array).map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| Token::try_from(v).unwrap_or(Token::MAX))).collect()).unwrap_or_default();
             if let Err(e) = st.check_tokens(&toks).or_else(|e| if toks.is_empty() { Ok(()) } else { Err(e) }) {
                 return bad(e);
             }
@@ -352,6 +360,36 @@ fn spawn_idle_reprefill<E: Engine>(st: &Arc<State<E>>, b: &Json, reply: Json, re
     });
 }
 
+/// S8 (REVIEW-v0.1.1): send one SSE frame from the generation thread; false = stop generating.
+/// A client that keeps its socket open but stops reading fills the channel; `blocking_send`
+/// then held the worker (and every later request) for ever. Now, after `stall` without room
+/// for the next frame, the stream is given up: the generation is cancelled like a disconnect.
+pub(crate) fn send_frame(tx: &mpsc::Sender<String>, frame: String, stall: std::time::Duration) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    let t0 = std::time::Instant::now();
+    let mut frame = frame;
+    loop {
+        match tx.try_send(frame) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(f)) => {
+                if t0.elapsed() >= stall {
+                    eprintln!("oxe-server: stream client took no data for {:.0} s: stream dropped, generation cancelled", stall.as_secs_f64());
+                    return false;
+                }
+                frame = f;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// The async side of [`send_frame`] (final frames after the worker is free): false when the
+/// client is gone or has taken nothing for `stall`.
+async fn send_final(tx: &mpsc::Sender<String>, frame: String, stall: std::time::Duration) -> bool {
+    matches!(tokio::time::timeout(stall, tx.send(frame)).await, Ok(Ok(())))
+}
+
 /// Streams: cancel when the client's end of the SSE channel is dropped (the client went
 /// away), also while the prompt is still being prefilled.
 fn cancel_on_close(gp: &mut GenParams, tx: &mpsc::Sender<String>) {
@@ -429,10 +467,11 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     let n_prompt = prompt.len();
     let tx2 = tx.clone();
     let st2 = st.clone();
+    let stall = st.stream_stall;
     tokio::spawn(async move {
         let res = run_blocking(st2, prompt, gp.clone(), move |p: Partial| {
             let j = api::completion_partial(&p.text, p.n_decoded, n_prompt, p.probs.as_ref(), post);
-            tx2.blocking_send(api::sse(&j)).is_ok()
+            send_frame(&tx2, api::sse(&j), stall)
         })
         .await;
         let frame = match res {
@@ -440,7 +479,7 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
             Err(GenError::Cancelled) => return,
             Err(e) => api::sse(&gen_error_json(e)),
         };
-        let _ = tx.send(frame).await;
+        let _ = send_final(&tx, frame, stall).await;
     });
     Reply::Stream(rx)
 }
@@ -515,6 +554,7 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     sess0.incremental = std::env::var_os("OXE_SERVER_LEGACY").is_none();
     let sess = Arc::new(Mutex::new(sess0));
     let st2 = st.clone();
+    let stall = st.stream_stall;
     tokio::spawn(async move {
         let tx2 = tx.clone();
         let m2 = meta.clone();
@@ -532,12 +572,12 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
                     }
                 }
                 Err(e) => {
-                    let _ = tx2.blocking_send(api::sse(&api::error_json(500, &e)));
+                    let _ = send_frame(&tx2, api::sse(&api::error_json(500, &e)), stall);
                     return false;
                 }
             }
             for f in frames {
-                if tx2.blocking_send(api::sse(&f)).is_err() {
+                if !send_frame(&tx2, api::sse(&f), stall) {
                     return false;
                 }
             }
@@ -548,7 +588,7 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
             Ok(r) => r,
             Err(GenError::Cancelled) => return,
             Err(e) => {
-                let _ = tx.send(api::sse(&gen_error_json(e))).await;
+                let _ = send_final(&tx, api::sse(&gen_error_json(e)), stall).await;
                 return;
             }
         };
@@ -566,7 +606,7 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
                 }
             }
             Err(e) => {
-                let _ = tx.send(api::sse(&api::error_json(500, &e))).await;
+                let _ = send_final(&tx, api::sse(&api::error_json(500, &e)), stall).await;
                 return;
             }
         }
@@ -582,11 +622,11 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
             last.insert("timings".into(), api::timings_json(&r.timings));
         }
         for f in frames {
-            if tx.send(api::sse(&f)).await.is_err() {
+            if !send_final(&tx, api::sse(&f), stall).await {
                 return;
             }
         }
-        let _ = tx.send("data: [DONE]\n\n".to_string()).await;
+        let _ = send_final(&tx, "data: [DONE]\n\n".to_string(), stall).await;
     });
     Reply::Stream(rx)
 }

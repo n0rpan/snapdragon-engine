@@ -44,6 +44,46 @@ fn num<T: Copy>(body: &Json, keys: &[&str], f: impl Fn(&Json) -> Option<T>, def:
     def
 }
 
+pub const MAX_N_PROBS: usize = 100;
+
+/// REVIEW-v0.1.1 B2: out-of-range sampling values are a 400, not a server abort. Ranges: the
+/// OpenAI API's where it has one (temperature 0..=2 is NOT enforced: llama-server treats any
+/// value <= 0 as greedy and allows > 2), else llama-server's meaning: top_p / min_p / typical_p
+/// in 0..=1, top_k an integer (<= 0 = off), penalties finite (presence / frequency -2..=2,
+/// repeat >= 0). A present field of the wrong type is a 400 too (null = absent).
+pub fn check_sampling(body: &Json) -> Result<(), String> {
+    let get = |k: &str| body.get(k).filter(|v| !v.is_null());
+    let float = |k: &str, lo: f64, hi: f64| -> Result<(), String> {
+        let Some(v) = get(k) else { return Ok(()) };
+        let x = v.as_f64().ok_or_else(|| format!("\"{k}\" must be a number"))?;
+        // the engine computes in f32: a value that is finite in f64 but not in f32 is out of range
+        if !(x as f32).is_finite() || x < lo || x > hi {
+            return Err(format!("\"{k}\" = {x} is out of range ({lo} to {hi})"));
+        }
+        Ok(())
+    };
+    let big = f32::MAX as f64;
+    float("temperature", -big, big)?;
+    float("top_p", 0.0, 1.0)?;
+    float("min_p", 0.0, 1.0)?;
+    float("typical_p", 0.0, 1.0)?;
+    float("presence_penalty", -2.0, 2.0)?;
+    float("frequency_penalty", -2.0, 2.0)?;
+    float("repeat_penalty", 0.0, big)?;
+    if let Some(v) = get("top_k") {
+        match v.as_i64() {
+            Some(k) if i32::try_from(k).is_ok() => {}
+            _ => return Err("\"top_k\" must be an integer in the 32-bit range (<= 0 = off)".into()),
+        }
+    }
+    if let Some(v) = get("seed") {
+        if v.as_i64().is_none() && v.as_u64().is_none() {
+            return Err("\"seed\" must be an integer".into());
+        }
+    }
+    Ok(())
+}
+
 /// Sampling / stopping parameters common to /completion and /v1/chat/completions
 /// (`params_from_json_cmpl`).
 pub fn gen_params(body: &Json, chat: bool) -> Result<GenParams, String> {
@@ -55,11 +95,12 @@ pub fn gen_params(body: &Json, chat: bool) -> Result<GenParams, String> {
     }
     p.sampling = SamplingParams {
         temperature: num(body, &["temperature"], |v| v.as_f64().map(|x| x as f32), d.temperature),
-        top_k: num(body, &["top_k"], |v| v.as_i64().map(|x| x as i32), d.top_k),
+        top_k: num(body, &["top_k"], |v| v.as_i64().map(|x| x.clamp(i32::MIN as i64, i32::MAX as i64) as i32), d.top_k),
         top_p: num(body, &["top_p"], |v| v.as_f64().map(|x| x as f32), d.top_p),
         min_p: num(body, &["min_p"], |v| v.as_f64().map(|x| x as f32), d.min_p),
         seed: num(body, &["seed"], |v| v.as_i64().map(|x| x as u64), d.seed),
     };
+    check_sampling(body)?;
     p.stop = match body.get("stop") {
         Some(Json::String(s)) => vec![s.clone()],
         Some(Json::Array(a)) => a.iter().filter_map(Json::as_str).filter(|s| !s.is_empty()).map(str::to_string).collect(),
@@ -86,6 +127,11 @@ pub fn gen_params(body: &Json, chat: bool) -> Result<GenParams, String> {
         }
     } else {
         p.n_probs = num(body, &["n_probs", "logprobs"], Json::as_u64, 0) as usize;
+    }
+    // every generated token keeps n_probs entries (vocabulary-sized for a huge value): bound the
+    // memory a request can ask for (OpenAI allows top_logprobs <= 20)
+    if p.n_probs > MAX_N_PROBS {
+        return Err(format!("n_probs / top_logprobs = {} is above the limit {MAX_N_PROBS}", p.n_probs));
     }
     Ok(p)
 }

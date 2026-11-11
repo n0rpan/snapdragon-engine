@@ -1,0 +1,25 @@
+name: checks
+# Build + model-free tests on every push to main and every pull request (F-PUB5).
+# GitHub's standard arm64 runners are free for public repositories. In the private development
+# repository push/pull_request runs are skipped (they would spend the account's minutes on
+# every lane push); start them there by hand with "Run workflow".
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    uses: ./.github/workflows/build.yml
+    with:
+      version: dev-${{ github.sha }}
+      package: false

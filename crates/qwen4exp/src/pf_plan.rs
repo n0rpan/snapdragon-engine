@@ -254,22 +254,42 @@ pub fn swap_tolerant_budget_gib(inp: &AdmitInputs, mem_total_gib: f64, cache_gib
     mem_total_gib - (cache_gib + inp.dense_base_gib + inp.kv_extra_gib() + inp.anon_peak_gib) - desktop_floor_gib
 }
 
+/// S2 (REVIEW-v0.1.1): the MemTotal rule assumes idle desktop pages can go to swap; without swap the OOM killer
+/// picks desktop victims instead. Margin on top of what must leave RAM (lab `flash_cache_pref.SWAP_MARGIN_GIB`).
+pub const SWAP_MARGIN_GIB: f64 = 1.0;
+
+/// GiB that must leave RAM (to swap) for a `cache_gib` load: the working set (cache + dense/base + KV extra + model
+/// growth + the 1 GiB host floor; no harness allowance) minus MemAvailable, >= 0. Mirrors the lab's
+/// `flash_cache_pref.swap_needed_bytes`.
+pub fn swap_needed_gib(inp: &AdmitInputs, cache_gib: f64) -> f64 {
+    let working_set = cache_gib + inp.dense_base_gib + inp.kv_extra_gib() + inp.anon_peak_gib + inp.floor_gib;
+    (working_set - inp.mem_available_gib).max(0.0)
+}
+
+/// SwapFree covers what must leave RAM plus [`SWAP_MARGIN_GIB`]; no or unknown swap (<= 0, NaN) never does.
+/// Mirrors the lab's `flash_cache_pref.swap_covers`.
+pub fn swap_covers(inp: &AdmitInputs, swap_free_gib: f64, cache_gib: f64) -> bool {
+    swap_free_gib.is_finite() && swap_free_gib > 0.0 && swap_free_gib >= swap_needed_gib(inp, cache_gib) + SWAP_MARGIN_GIB
+}
+
 /// The decision with the opt-in swap-tolerant rule: an explicit preference of 20 (or 18) takes the largest
-/// swap-tolerant tier <= the preference whose budget is >= 0; if none, the MemAvailable rule of [`cache_select`]
-/// (largest tier that fits, NOTE, refuse below 14). Any other preference (auto, 16, 14) is exactly [`cache_select`].
-/// Returns the decision and, for the swap-tolerant tiers considered, (tier, budget).
+/// swap-tolerant tier <= the preference whose budget is >= 0 AND whose RAM overflow SwapFree covers (S2,
+/// [`swap_covers`]); if none, the MemAvailable rule of [`cache_select`] (largest tier that fits, NOTE, refuse below
+/// 14). Any other preference (auto, 16, 14) is exactly [`cache_select`]. Returns the decision and, for the
+/// swap-tolerant tiers considered, (tier, budget).
 pub fn cache_select_swap_tolerant(
     inp: &AdmitInputs,
     pref_gib: Option<f64>,
     mem_total_gib: f64,
     desktop_floor_gib: f64,
+    swap_free_gib: f64,
 ) -> (CacheDecision, Vec<(f64, f64)>) {
     let mut seen = Vec::new();
     if let Some(p) = pref_gib.filter(|p| SWAP_TOLERANT_TIERS_GIB.contains(p)) {
         for t in SWAP_TOLERANT_TIERS_GIB.iter().copied().filter(|&t| t <= p) {
             let b = swap_tolerant_budget_gib(inp, mem_total_gib, t, desktop_floor_gib);
             seen.push((t, b));
-            if mem_total_gib.is_finite() && b >= 0.0 {
+            if mem_total_gib.is_finite() && b >= 0.0 && swap_covers(inp, swap_free_gib, t) {
                 let mut d = cache_select(inp, Some(t));
                 d.cache_gib = Some(t);
                 d.reason = CacheReason::PreferredSwapTolerant;
@@ -284,8 +304,17 @@ pub fn cache_select_swap_tolerant(
 
 /// MemTotal from /proc/meminfo in bytes.
 pub fn mem_total_bytes() -> Option<u64> {
+    meminfo_bytes("MemTotal:")
+}
+
+/// SwapFree from /proc/meminfo in bytes (S2).
+pub fn swap_free_bytes() -> Option<u64> {
+    meminfo_bytes("SwapFree:")
+}
+
+fn meminfo_bytes(key: &str) -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let rest = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+    let rest = text.lines().find_map(|l| l.strip_prefix(key))?;
     rest.trim().split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
 }
 
@@ -838,7 +867,7 @@ mod tests {
     #[test]
     fn pref_20_swap_tolerant_admits_20_when_budget_nonnegative() {
         // MemAvailable 25.5 (the 1st rule would give 14) but MemTotal admits 20 with a 2 GiB desktop floor
-        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 2.0);
+        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 2.0, 16.0);
         assert_eq!((d.cache_gib, d.reason), (Some(20.0), CacheReason::PreferredSwapTolerant));
         assert!((d.margin_gib - 0.395).abs() < 1e-9 && seen.len() == 1);
         assert!(d.status_json().contains("\"reason\":\"preferred-swap-tolerant\""));
@@ -847,18 +876,39 @@ mod tests {
     #[test]
     fn pref_20_falls_to_18_then_memavailable_rule() {
         // 3 GiB floor: 20 budget -0.605 -> 18 (+1.395)
-        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 3.0);
+        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 3.0, 16.0);
         assert_eq!((d.cache_gib, d.reason), (Some(18.0), CacheReason::PreferredSwapTolerant));
         assert_eq!(seen.len(), 2);
         // 5 GiB floor: 20 and 18 negative -> MemAvailable rule (25.5 -> 14, NOTE)
-        let (d, _) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 5.0);
+        let (d, _) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), MT, 5.0, 16.0);
         assert_eq!((d.cache_gib, d.reason), (Some(14.0), CacheReason::PreferredDoesNotFit));
         // and refuse only when the MemAvailable rule refuses too
-        let (d, _) = cache_select_swap_tolerant(&inp(24.0, 16384), Some(20.0), MT, 5.0);
+        let (d, _) = cache_select_swap_tolerant(&inp(24.0, 16384), Some(20.0), MT, 5.0, 16.0);
         assert_eq!(d.reason, CacheReason::Refuse);
         // unreadable MemTotal never admits the swap-tolerant tiers
-        let (d, _) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), f64::NAN, 0.0);
+        let (d, _) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(20.0), f64::NAN, 0.0, 16.0);
         assert_eq!(d.cache_gib, Some(14.0));
+    }
+
+    /// REVIEW-v0.1.1 S2: total 32, available 12, no swap -> never PreferredSwapTolerant (the OOM killer would pick
+    /// desktop victims); with enough swap the MemTotal rule still applies. Same numbers as the lab's swap_covers.
+    #[test]
+    fn swap_tolerant_rule_needs_free_swap() {
+        let (d, _) = cache_select_swap_tolerant(&inp(12.0, 16384), Some(20.0), 32.0, 0.0, 0.0);
+        assert_ne!(d.reason, CacheReason::PreferredSwapTolerant);
+        let (d, _) = cache_select_swap_tolerant(&inp(12.0, 16384), Some(20.0), 32.0, 0.0, f64::NAN);
+        assert_ne!(d.reason, CacheReason::PreferredSwapTolerant);
+        // 20 needs 20 + 4.825 + 3.50 + 1.0 = 29.325 GiB resident: 17.325 must leave RAM, + 1 GiB margin
+        let i = inp(12.0, 16384);
+        assert!((swap_needed_gib(&i, 20.0) - 17.325).abs() < 1e-9);
+        assert!(!swap_covers(&i, 18.3, 20.0) && swap_covers(&i, 18.325, 20.0));
+        // short of 20 but enough for 18 (15.325 + 1) -> 18
+        let (d, _) = cache_select_swap_tolerant(&i, Some(20.0), 32.0, 0.0, 16.5);
+        assert_eq!((d.cache_gib, d.reason), (Some(18.0), CacheReason::PreferredSwapTolerant));
+        let (d, _) = cache_select_swap_tolerant(&i, Some(20.0), 32.0, 0.0, 18.5);
+        assert_eq!((d.cache_gib, d.reason), (Some(20.0), CacheReason::PreferredSwapTolerant));
+        // nothing has to leave RAM: the margin alone is enough
+        assert!(swap_covers(&inp(40.0, 16384), 1.0, 20.0) && !swap_covers(&inp(40.0, 16384), 0.5, 20.0));
     }
 
     #[test]
@@ -866,12 +916,12 @@ mod tests {
         // auto, 16 and 14 never use MemTotal: identical to cache_select
         for p in [None, Some(16.0), Some(14.0)] {
             let i = inp(25.5, 16384);
-            let (d, seen) = cache_select_swap_tolerant(&i, p, MT, 0.0);
+            let (d, seen) = cache_select_swap_tolerant(&i, p, MT, 0.0, 16.0);
             assert_eq!(d, cache_select(&i, p), "{p:?}");
             assert!(seen.is_empty());
         }
         // pref 18 considers only 18 (never 20)
-        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(18.0), MT, 0.0);
+        let (d, seen) = cache_select_swap_tolerant(&inp(25.5, 16384), Some(18.0), MT, 0.0, 16.0);
         assert_eq!((d.cache_gib, seen.len()), (Some(18.0), 1));
     }
 

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// Arrays longer than this are kept as a length only (same bound as model_inspect.py).
 pub const LONG_ARRAY: u64 = 4096;
+/// GGML_MAX_DIMS
+pub const MAX_DIMS: u32 = 4;
 
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -147,12 +149,22 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// Element count, `None` on u64 overflow (a crafted header).
+    pub fn checked_elements(&self) -> Option<u64> {
+        self.shape.iter().try_fold(1u64, |a, &d| a.checked_mul(d))
+    }
+    /// Data size in bytes, `None` on overflow or an unknown type.
+    pub fn checked_bytes(&self) -> Option<u64> {
+        let (_, blk, size) = self.ty.info()?;
+        (self.checked_elements()? / blk).checked_mul(size)
+    }
+    /// [`parse_header`] guarantees these do not overflow; a hand-built header that does gets
+    /// `u64::MAX`, which fails every bounds check (REVIEW-v0.1.1 S1).
     pub fn elements(&self) -> u64 {
-        self.shape.iter().product()
+        self.checked_elements().unwrap_or(u64::MAX)
     }
     pub fn bytes(&self) -> u64 {
-        let (_, blk, size) = self.ty.info().expect("type checked at parse time");
-        self.elements() / blk * size
+        self.checked_bytes().unwrap_or(u64::MAX)
     }
 }
 
@@ -233,7 +245,8 @@ fn value(c: &mut Cursor, vtype: u32) -> Result<Value> {
             let n = c.u64()?;
             if n > LONG_ARRAY {
                 if let Some(sz) = scalar_size(item) {
-                    c.take(sz * n as usize)?;
+                    let len = usize::try_from(n).ok().and_then(|n| n.checked_mul(sz)).ok_or_else(|| Error("metadata array too long".into()))?;
+                    c.take(len)?;
                 } else {
                     for _ in 0..n {
                         value(c, item)?;
@@ -263,6 +276,12 @@ pub fn parse_header(buf: &[u8]) -> Result<Header> {
     }
     let n_tensors = c.u64()?;
     let n_kv = c.u64()?;
+    // counts come from the file: never reserve more than the bytes left could hold (a key/value
+    // takes >= 12 bytes, a tensor entry >= 24), so a crafted count cannot abort the allocation
+    let left = (buf.len() - c.pos) as u64;
+    if n_kv > left / 12 || n_tensors > left / 24 {
+        return err(format!("GGUF header claims {n_kv} keys / {n_tensors} tensors, more than its {left} bytes hold"));
+    }
     let mut metadata = Vec::with_capacity(n_kv as usize);
     for _ in 0..n_kv {
         let key = c.string()?;
@@ -273,23 +292,53 @@ pub fn parse_header(buf: &[u8]) -> Result<Header> {
     for _ in 0..n_tensors {
         let name = c.string()?;
         let nd = c.u32()?;
+        if nd > MAX_DIMS {
+            return err(format!("{name}: {nd} dimensions (ggml has at most {MAX_DIMS})"));
+        }
         let shape = (0..nd).map(|_| c.u64()).collect::<Result<Vec<_>>>()?;
+        // ggml keeps ne as int64
+        if shape.iter().any(|&d| d > i64::MAX as u64) {
+            return err(format!("{name}: dimension above 2^63"));
+        }
         let ty = GgmlType(c.u32()?);
         let offset = c.u64()?;
         let (tname, blk, _) = match ty.info() {
             Some(i) => i,
             None => return err(format!("{name}: unknown ggml type id {}", ty.0)),
         };
-        let n: u64 = shape.iter().product();
+        let t = TensorInfo { name, shape, ty, offset };
+        let Some(n) = t.checked_elements().filter(|&n| n <= i64::MAX as u64) else {
+            return err(format!("{}: element count overflows (shape {:?})", t.name, t.shape));
+        };
         if n % blk != 0 {
-            return err(format!("{name}: {n} elements not a multiple of {tname} block {blk}"));
+            return err(format!("{}: {n} elements not a multiple of {tname} block {blk}", t.name));
         }
-        tensors.push(TensorInfo { name, shape, ty, offset });
+        if t.checked_bytes().is_none() {
+            return err(format!("{}: byte size overflows", t.name));
+        }
+        tensors.push(t);
     }
     let mut h = Header { version, metadata, tensors, data_offset: 0, header_bytes_read: c.pos as u64 };
     let align = h.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32);
+    if align == 0 || !align.is_power_of_two() {
+        return err(format!("general.alignment {align} is not a power of two"));
+    }
     h.data_offset = (c.pos as u64).div_ceil(align) * align;
     Ok(h)
+}
+
+/// Every tensor's data range lies inside a file of `file_bytes` bytes, with checked arithmetic
+/// (REVIEW-v0.1.1 S1: plain u64 adds wrapped for an offset near 2^64 and passed the check).
+/// After this, `data_offset + offset + bytes` fits in u64 and in the mapping for every tensor.
+pub fn check_bounds(h: &Header, file_bytes: u64) -> Result<()> {
+    for t in &h.tensors {
+        let end = t.checked_bytes().and_then(|b| h.data_offset.checked_add(t.offset)?.checked_add(b));
+        match end {
+            Some(e) if e <= file_bytes => {}
+            _ => return err(format!("{}: data beyond end of file", t.name)),
+        }
+    }
+    Ok(())
 }
 
 /// An mmapped GGUF file plus its parsed header.
@@ -310,11 +359,7 @@ impl Gguf {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error(format!("mmap {}: {e}", path.display())))?;
         let header = parse_header(&mmap)?;
         let file_bytes = mmap.len() as u64;
-        for t in &header.tensors {
-            if header.data_offset + t.offset + t.bytes() > file_bytes {
-                return err(format!("{}: data beyond end of file", t.name));
-            }
-        }
+        check_bounds(&header, file_bytes)?;
         Ok(Gguf { path, header, file_bytes, mmap, file })
     }
 

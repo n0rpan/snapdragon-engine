@@ -2,7 +2,9 @@
 //!
 //! - `Pool::new(cpus)` creates `cpus.len() - 1` worker threads once, each pinned to one
 //!   core with `sched_setaffinity`; the calling thread becomes worker 0 and is pinned to
-//!   `cpus[0]`. No thread is created per op or per token.
+//!   `cpus[0]`. No thread is created per op or per token. Dropping the pool gives the
+//!   calling thread its original CPU mask back (threads it spawns later inherit that mask:
+//!   without the restore, a later 12-thread stage ran all its threads on one core).
 //! - `Pool::run(job)` publishes `job` through a "go" epoch, runs it on every worker
 //!   (including the caller) and ends with one full barrier (the join), which is counted.
 //! - Idle workers spin on the epoch for `idle_spin` and then sleep on a futex, so an idle
@@ -103,6 +105,9 @@ struct Shared {
     epoch: Padded<AtomicU32>,
     sleepers: Padded<AtomicU32>,
     shutdown: AtomicBool,
+    /// a `run` is in progress (REVIEW-v0.1.1 S6: `run(&self)` is reachable from two threads
+    /// through `&Pool`; the second one must not touch `job` / `senses[0]`)
+    busy: AtomicBool,
     idle_spin: Duration,
     job: UnsafeCell<Option<JobPtr>>,
     barrier: Barrier,
@@ -122,6 +127,8 @@ pub struct Pool {
     handles: Vec<JoinHandle<()>>,
     cpus: Vec<usize>,
     tids: Arc<Vec<AtomicU32>>,
+    /// The creating thread's CPU mask before `new` pinned it (restored on drop), if readable.
+    caller_mask: Option<libc::cpu_set_t>,
 }
 
 /// Pin the calling thread to one CPU.
@@ -135,6 +142,38 @@ pub fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// CPU mask of thread `tid` (0 = the calling thread).
+pub fn thread_affinity(tid: u32) -> std::io::Result<libc::cpu_set_t> {
+    // SAFETY: cpu_set_t is plain data; the kernel writes at most its size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(tid as libc::pid_t, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(set)
+    }
+}
+
+/// Sets the CPU mask of thread `tid` (0 = the calling thread).
+pub fn set_thread_affinity(tid: u32, set: &libc::cpu_set_t) -> std::io::Result<()> {
+    // SAFETY: plain syscall on a valid cpu_set_t.
+    unsafe {
+        if libc::sched_setaffinity(tid as libc::pid_t, std::mem::size_of::<libc::cpu_set_t>(), set) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Number of CPUs the calling thread may run on.
+pub fn allowed_cpus() -> usize {
+    match thread_affinity(0) {
+        // SAFETY: CPU_COUNT reads the set only.
+        Ok(set) => unsafe { libc::CPU_COUNT(&set) as usize },
+        Err(_) => 0,
+    }
 }
 
 pub fn gettid() -> u32 {
@@ -198,12 +237,14 @@ impl Pool {
             epoch: Padded::default(),
             sleepers: Padded::default(),
             shutdown: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             idle_spin,
             job: UnsafeCell::new(None),
             barrier: Barrier::new(n),
             senses: (0..n).map(|_| Padded(UnsafeCell::new(0))).collect(),
         });
         let tids: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+        let caller_mask = thread_affinity(0).ok();
         pin_current_thread(cpus[0])?;
         tids[0].store(gettid(), Relaxed);
         let mut handles = Vec::new();
@@ -223,7 +264,7 @@ impl Pool {
         while tids.iter().any(|t| t.load(Acquire) == 0) {
             std::thread::yield_now();
         }
-        Ok(Pool { shared, handles, cpus: cpus.to_vec(), tids })
+        Ok(Pool { shared, handles, cpus: cpus.to_vec(), tids, caller_mask })
     }
 
     pub fn nthreads(&self) -> usize {
@@ -242,8 +283,16 @@ impl Pool {
     }
 
     /// Run `job` on all workers; returns after the join barrier.
+    ///
+    /// Panics (before touching any shared state) if another `run` on this pool is in progress
+    /// (another thread, or a job calling `run` re-entrantly). A panic inside a job aborts the
+    /// process (see [`AbortOnUnwind`]): workers may still be calling the job, so unwinding past
+    /// this frame would free it under them (F15).
     pub fn run<F: Fn(&mut Ctx) + Sync>(&self, job: F) {
         let sh = &*self.shared;
+        if sh.busy.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+            panic!("sched::Pool::run called while another run is in progress (concurrent or re-entrant use of one pool)");
+        }
         let ptr: *const (dyn Fn(&mut Ctx) + Sync + '_) = &job;
         // SAFETY: the job outlives this call and every worker finishes with it before the
         // join barrier below returns, so erasing the lifetime is sound.
@@ -255,18 +304,35 @@ impl Pool {
             futex_wake_all(&sh.epoch);
         }
         let _ = e;
-        // SAFETY: slot 0 belongs to the calling thread.
+        // SAFETY: slot 0 belongs to the thread that holds `busy` (this one).
         run_job(sh, 0, unsafe { &mut *sh.senses[0].get() });
+        sh.busy.store(false, Release);
+    }
+}
+
+/// Aborts the process if dropped during unwinding. Armed around a job and its join barrier:
+/// a panic there would otherwise free the job's closure while other workers still call it
+/// (caller side, F15) or leave the team one short at the barrier for ever (worker side). With
+/// `panic = "abort"` (release) this changes nothing; in unwinding builds (tests, downstream
+/// crates) it makes F15 unreachable.
+pub struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        eprintln!("sched: a job panicked inside Pool::run; aborting (workers may still use the job)");
+        std::process::abort();
     }
 }
 
 fn run_job(sh: &Shared, tid: usize, sense: &mut u32) {
+    let guard = AbortOnUnwind;
     // SAFETY: published before the epoch bump that this thread observed (or by itself).
     let job = unsafe { (*sh.job.get()).expect("job published") };
     let mut ctx = Ctx { tid, nthreads: sh.n, barrier: &sh.barrier, sense };
     // SAFETY: the job pointer is valid until the join barrier completes (see Pool::run).
     unsafe { (*job)(&mut ctx) };
     ctx.barrier(); // join
+    std::mem::forget(guard); // normal return: disarm
 }
 
 fn worker_loop(sh: &Shared, tid: usize) {
@@ -310,6 +376,11 @@ impl Drop for Pool {
         futex_wake_all(&self.shared.epoch);
         for h in self.handles.drain(..) {
             let _ = h.join();
+        }
+        // Give the creating thread (worker 0) its original mask back. By tid, so this is right
+        // whichever thread drops the pool; a thread that has exited makes it a harmless ESRCH.
+        if let Some(mask) = &self.caller_mask {
+            let _ = set_thread_affinity(self.tids[0].load(Relaxed), mask);
         }
     }
 }

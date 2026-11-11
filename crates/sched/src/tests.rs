@@ -151,3 +151,129 @@ fn detached_pool_runs_jobs_from_any_thread() {
     // 2 barriers per job (one inside + the join)
     assert_eq!(pool.barrier_episodes(), 200);
 }
+
+// ---------------------------------------------------------------- REVIEW-v0.1.1 S6 / F15
+
+/// Two threads with `&Pool` call `run` at the same time. Before the busy flag both wrote the
+/// job pointer and `senses[0]` (undefined behaviour, typically a hang). Now the second call
+/// panics before touching anything and the first one completes normally.
+#[test]
+fn concurrent_run_is_refused() {
+    let pool = Arc::new(Pool::new(&test_cpus(3), Duration::from_millis(1)).unwrap());
+    let inside = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let first = {
+        let (pool, inside, release) = (pool.clone(), inside.clone(), release.clone());
+        std::thread::spawn(move || {
+            pool.run(|c| {
+                if c.tid == 0 {
+                    inside.store(true, SeqCst);
+                    let t0 = Instant::now();
+                    while !release.load(SeqCst) && t0.elapsed() < Duration::from_secs(10) {
+                        spin_loop();
+                    }
+                }
+            })
+        })
+    };
+    while !inside.load(SeqCst) {
+        spin_loop();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.run(|_| {})));
+            let _ = tx.send(r.is_err());
+        });
+    }
+    let refused = rx.recv_timeout(Duration::from_secs(5));
+    release.store(true, SeqCst);
+    assert_eq!(refused, Ok(true), "a second concurrent run must panic up front");
+    first.join().unwrap();
+    // the pool is still usable
+    let n = AtomicUsize::new(0);
+    pool.run(|_| {
+        n.fetch_add(1, SeqCst);
+    });
+    assert_eq!(n.load(SeqCst), 3);
+}
+
+/// Child-process half of the abort tests: `OXE_SCHED_PANIC_CHILD=caller|worker` runs a job that
+/// panics on that thread. The parent expects SIGABRT, not an unwind (F15: the caller's unwind
+/// freed the closure under the workers) or a hang (a dead worker left the barrier one short).
+#[test]
+fn panic_child() {
+    let Ok(who) = std::env::var("OXE_SCHED_PANIC_CHILD") else { return };
+    let pool = Pool::new(&test_cpus(3), Duration::from_millis(1)).unwrap();
+    let victim = if who == "caller" { 0 } else { 1 };
+    pool.run(|c| {
+        if c.tid == victim {
+            panic!("synthetic job failure on tid {victim}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    });
+    // only reached if the panic did not abort: exit differently from SIGABRT
+    std::process::exit(3);
+}
+
+fn run_panic_child(who: &str) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", "tests::panic_child", "--nocapture", "--test-threads", "1"])
+        .env("OXE_SCHED_PANIC_CHILD", who)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if t0.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let s = child.wait().unwrap();
+            panic!("child ({who} panic) hung: {s:?} (signal {:?})", s.signal());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn caller_job_panic_aborts() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = run_panic_child("caller");
+    assert_eq!(s.signal(), Some(libc::SIGABRT), "caller-side job panic must abort, got {s:?}");
+}
+
+#[test]
+fn worker_job_panic_aborts() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = run_panic_child("worker");
+    assert_eq!(s.signal(), Some(libc::SIGABRT), "worker-side job panic must abort, got {s:?}");
+}
+
+/// Dropping a pool gives the creating thread its CPU mask back, so threads it spawns later are
+/// not all stuck on `cpus[0]` (the oxi VAE ran its 12 threads on one core after the fast DiT).
+#[test]
+fn drop_restores_caller_affinity() {
+    std::thread::spawn(|| {
+        let before = thread_affinity(0).unwrap();
+        let n_before = unsafe { libc::CPU_COUNT(&before) } as usize;
+        let cpus = test_cpus(2.min(n_before.max(1)));
+        let pool = Pool::new(&cpus, Duration::from_micros(50)).unwrap();
+        assert_eq!(allowed_cpus(), 1, "Pool::new pins the caller");
+        // a thread spawned now inherits the single-CPU mask (the bug)
+        let inherited = std::thread::spawn(allowed_cpus).join().unwrap();
+        assert_eq!(inherited, 1);
+        drop(pool);
+        let after = thread_affinity(0).unwrap();
+        assert!(unsafe { libc::CPU_EQUAL(&before, &after) }, "mask restored on drop");
+        let spawned = std::thread::spawn(allowed_cpus).join().unwrap();
+        assert_eq!(spawned, n_before);
+    })
+    .join()
+    .unwrap();
+}

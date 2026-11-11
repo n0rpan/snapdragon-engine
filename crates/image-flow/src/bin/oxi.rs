@@ -214,6 +214,43 @@ fn make_pool(kind: &str, threads: usize) -> Result<Option<sched::Pool>, String> 
     sched::Pool::new(&cpus, Duration::from_micros(spin_us)).map(Some).map_err(|e| format!("pool: {e}"))
 }
 
+/// One VAE decode with its timing split (file load vs decode) and the CPU mask it ran under.
+struct VaeReport {
+    rgb: image_vae::Rgb,
+    conv: String,
+    load_s: f64,
+    decode_s: f64,
+    allowed_cpus: usize,
+    threads: usize,
+}
+
+impl VaeReport {
+    fn json(&self) -> Value {
+        json!({"conv": self.conv, "load_seconds": self.load_s, "decode_seconds": self.decode_s,
+               "seconds_incl_load": self.load_s + self.decode_s, "allowed_cpus": self.allowed_cpus,
+               "threads": self.threads})
+    }
+}
+
+fn decode_vae(vae: &Path, z: &[f32], gh: usize, gw: usize, threads: usize, conv: &str) -> Result<VaeReport, String> {
+    image_vae::decoder::set_conv_mode(conv)?;
+    let allowed = sched::allowed_cpus();
+    if allowed != 0 && allowed < threads {
+        eprintln!("oxi: WARNING: the VAE may use only {allowed} cpu(s) for {threads} threads (inherited CPU mask)");
+    }
+    let t = Instant::now();
+    let dec = image_vae::load_decoder(vae)?;
+    let load_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let rgb = image_vae::decode_with(&dec, z, latent::LATENT_CHANNELS, gh, gw, threads)?;
+    let decode_s = t.elapsed().as_secs_f64();
+    eprintln!(
+        "oxi: vae decode ({conv} conv) {:.3} s (includes loading the VAE file: load {load_s:.3} s, decode {decode_s:.3} s, {allowed} cpus allowed)",
+        load_s + decode_s
+    );
+    Ok(VaeReport { rgb, conv: conv.to_string(), load_s, decode_s, allowed_cpus: allowed, threads })
+}
+
 fn fast_config(a: &Args) -> Result<FastConfig, String> {
     let mut cfg = FastConfig::default();
     cfg.chunk1 = a.usize_or("chunk1", cfg.chunk1)?;
@@ -289,15 +326,20 @@ fn cmd_generate(a: &Args) -> Result<(), String> {
         std::fs::write(p, bytes).map_err(|e| format!("{p}: {e}"))?;
     }
     let z = latent::diffusion_to_vae_latents(&nchw, latent::LATENT_CHANNELS, gh, gw)?;
+    // Free the DiT and its pinned pool before the VAE: Pool::new pinned this thread to cpu 0 and
+    // the VAE's worker threads inherit this thread's mask (IMG-VAE: 12 VAE threads on one core,
+    // 21.9 s instead of ~3 s). Dropping the pool restores the mask; it also frees the DiT weights.
+    let backend_name = be.name();
+    let model_times = std::mem::take(&mut be.times);
+    drop(be);
+    drop(pool);
     let vae_conv = a.opt("vae-conv").unwrap_or("f32");
-    image_vae::decoder::set_conv_mode(vae_conv)?;
-    let t_vae = Instant::now();
-    let rgb = image_vae::decode_file(&vae, &z, latent::LATENT_CHANNELS, gh, gw, threads)?;
-    eprintln!("oxi: vae decode ({vae_conv} conv) {:.3} s (includes loading the VAE file)", t_vae.elapsed().as_secs_f64());
-    image_vae::png::write_png(&out, &rgb)?;
+    let vae_rep = decode_vae(&vae, &z, gh, gw, threads, vae_conv)?;
+    let rgb = &vae_rep.rgb;
+    image_vae::png::write_png(&out, rgb)?;
 
     let report = json!({
-        "backend": be.name(),
+        "backend": backend_name,
         "attn_prec": cfg.attn_prec.name(),
         "arith": a.opt("arith").unwrap_or("f32"),
         "threads": threads,
@@ -313,7 +355,8 @@ fn cmd_generate(a: &Args) -> Result<(), String> {
         "total_seconds": total,
         "image": { "width": rgb.width, "height": rgb.height },
         "out": out.display().to_string(),
-        "model_times": be.times.iter().map(|t| json!({
+        "vae": vae_rep.json(),
+        "model_times": model_times.iter().map(|t| json!({
             "embed": t.embed, "double_blocks": t.double_blocks, "single_blocks": t.single_blocks,
             "final_layer": t.final_layer, "attention": t.attention, "total": t.total,
         })).collect::<Vec<_>>(),
@@ -677,15 +720,20 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
         std::fs::write(p, bytes).map_err(|e| format!("{p}: {e}"))?;
     }
     let z = latent::diffusion_to_vae_latents(&nchw, latent::LATENT_CHANNELS, gh, gw)?;
+    // Free the DiT and its pinned pool before the VAE: Pool::new pinned this thread to cpu 0 and
+    // the VAE's worker threads inherit this thread's mask (IMG-VAE: 12 VAE threads on one core,
+    // 21.9 s instead of ~3 s). Dropping the pool restores the mask; it also frees the DiT weights.
+    let backend_name = be.name();
+    let model_times = std::mem::take(&mut be.times);
+    drop(be);
+    drop(pool);
     let vae_conv = a.opt("vae-conv").unwrap_or("f32");
-    image_vae::decoder::set_conv_mode(vae_conv)?;
-    let t_vae = Instant::now();
-    let rgb = image_vae::decode_file(&vae, &z, latent::LATENT_CHANNELS, gh, gw, threads)?;
-    eprintln!("oxi: vae decode ({vae_conv} conv) {:.3} s (includes loading the VAE file)", t_vae.elapsed().as_secs_f64());
-    image_vae::png::write_png(&out, &rgb)?;
+    let vae_rep = decode_vae(&vae, &z, gh, gw, threads, vae_conv)?;
+    let rgb = &vae_rep.rgb;
+    image_vae::png::write_png(&out, rgb)?;
 
     let report = json!({
-        "backend": be.name(),
+        "backend": backend_name,
         "attn_prec": cfg.attn_prec.name(),
         "threads": threads,
         "noise": noise_kind,
@@ -701,7 +749,8 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
         "total_seconds": total,
         "image": { "width": rgb.width, "height": rgb.height },
         "out": out.display().to_string(),
-        "model_times": be.times.iter().map(|t| json!({
+        "vae": vae_rep.json(),
+        "model_times": model_times.iter().map(|t| json!({
             "embed": t.embed, "double_blocks": t.double_blocks, "single_blocks": t.single_blocks,
             "final_layer": t.final_layer, "attention": t.attention, "total": t.total,
         })).collect::<Vec<_>>(),
@@ -837,12 +886,32 @@ fn cmd_vae_decode(a: &Args) -> Result<(), String> {
     let z = h.vae_z.as_ref().ok_or("the hand-over has no dump.vae.z")?;
     let (gh, gw) = h.vae_grid().ok_or("the hand-over has no dump.vae.z")?;
     let vae_conv = a.opt("vae-conv").unwrap_or("f32");
-    image_vae::decoder::set_conv_mode(vae_conv)?;
-    let t0 = Instant::now();
-    let rgb = image_vae::decode_file(&vae, &z.data, latent::LATENT_CHANNELS, gh, gw, threads)?;
-    let secs = t0.elapsed().as_secs_f64();
-    image_vae::png::write_png(&out, &rgb)?;
-    println!("{}", json!({"vae_conv": vae_conv, "grid": [gh, gw], "width": rgb.width, "height": rgb.height, "decode_seconds_incl_load": secs, "threads": threads}));
+    let repeat = a.usize_or("repeat", 1)?.max(1);
+    let rep = decode_vae(&vae, &z.data, gh, gw, threads, vae_conv)?;
+    // --repeat N: N-1 more decodes on a fresh load each time is not wanted (file cache noise), so
+    // the extra runs reuse one loaded decoder and report the best warm decode time.
+    let mut warm = Vec::new();
+    if repeat > 1 {
+        let dec = image_vae::load_decoder(&vae)?;
+        for _ in 1..repeat {
+            let t = Instant::now();
+            let again = image_vae::decode_with(&dec, &z.data, latent::LATENT_CHANNELS, gh, gw, threads)?;
+            warm.push(t.elapsed().as_secs_f64());
+            if again.data != rep.rgb.data {
+                return Err("vae-decode: a repeated decode differs from the first (non-deterministic)".into());
+            }
+        }
+    }
+    image_vae::png::write_png(&out, &rep.rgb)?;
+    let best_warm = warm.iter().cloned().fold(f64::INFINITY, f64::min);
+    println!(
+        "{}",
+        json!({"vae_conv": vae_conv, "grid": [gh, gw], "width": rep.rgb.width, "height": rep.rgb.height,
+               "decode_seconds_incl_load": rep.load_s + rep.decode_s, "load_seconds": rep.load_s,
+               "decode_seconds": rep.decode_s, "warm_decode_seconds": warm,
+               "best_warm_decode_seconds": if warm.is_empty() { Value::Null } else { json!(best_warm) },
+               "allowed_cpus": rep.allowed_cpus, "threads": threads})
+    );
     Ok(())
 }
 

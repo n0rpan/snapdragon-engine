@@ -22,11 +22,6 @@ fn main() {
         b.flag_if_supported("-fno-fast-math");
     };
 
-    // ggml-base items (no -march), C
-    let mut c0 = cc::Build::new();
-    base(&mut c0);
-    c0.include(&vendor).include(&generated).file(generated.join("quants_base.c")).flag("-std=gnu11").compile("oxe_ggml_base");
-
     // ggml-cpu C items
     let mut c1 = cc::Build::new();
     base(&mut c1);
@@ -56,6 +51,13 @@ fn main() {
         .file(upstream.join("src/ggml-cpu/vec.cpp"))
         .file(csrc.join("oxe_ops.cpp"))
         .compile("oxe_ggml_ops");
+
+    // ggml-base items (no -march), C. Compiled (and so linked) LAST: oxe_ggml_cpp calls
+    // quantize_row_q8_K_ref, and a single-pass static link only resolves it from a later archive
+    // (the kernels-sys lib test failed to link in CI otherwise). Link order only; same objects.
+    let mut c0 = cc::Build::new();
+    base(&mut c0);
+    c0.include(&vendor).include(&generated).file(generated.join("quants_base.c")).flag("-std=gnu11").compile("oxe_ggml_base");
 
     println!("cargo:rerun-if-changed={}", vendor.display());
     println!("cargo:rerun-if-changed={}", csrc.display());

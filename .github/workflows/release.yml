@@ -1,0 +1,123 @@
+name: release
+# Release binaries, built by CI from the tagged source (docs: README "Download").
+# A pushed tag v* builds, tests and packages oxe-server (MoE), oxe-server-flash and oxi on the
+# ARM64 runner, writes SHA256SUMS, generates build provenance (actions/attest-build-provenance)
+# and creates the GitHub Release with the commit message (the changelog) as its notes.
+# Manual runs build, test and package (artifacts only); they publish only when started from a
+# tag with "publish" ticked. No secrets: the job token with the minimal permissions below.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Create the GitHub Release (only when run from a v* tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then v=$REF_NAME; else v=dev-${GITHUB_SHA::12}; fi
+          case $v in *[!A-Za-z0-9._-]*) echo "bad version string: $v" >&2; exit 1;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      package: true
+
+  release:
+    needs: [version, build]
+    # Only v* tags publish (a push of the tag, or a manual run from it with "publish").
+    if: >-
+      github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+      && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Protect this environment in the public repository (Settings > Environments > release:
+    # required reviewer, deployment tags v*), together with a tag ruleset that limits who may
+    # create v* tags. Without that configuration the job runs unreviewed.
+    environment: release
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # sign the provenance (Sigstore)
+      attestations: write  # store the attestation
+    steps:
+      - name: Refuse a release without provenance
+        # Artifact attestations need a public repository on GitHub Free/Pro, and a release without
+        # one is not made: in the private development repository this job fails here.
+        if: github.event.repository.private
+        run: |
+          echo "::error::release only from the public repository (no build provenance in a private one)"
+          exit 1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          rm ./*.tar.gz.sha256
+          sha256sum -c SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 3
+          cat SHA256SUMS
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          changelog=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .commit.message)
+          {
+            echo "$changelog"
+            echo
+            echo "## Binaries"
+            echo
+            echo "Built by GitHub Actions from \`$TAG\` (commit $GITHUB_SHA) in [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID); nobody uploads binaries by hand."
+            echo "Linux aarch64, for ARMv8.6-A cores with dotprod, i8mm, fp16 and bf16 (Snapdragon X Elite / X Plus); glibc requirement and toolchain in each tarball's README.txt."
+            echo "CI builds pass the model-free tests and the Flash selftest; they have not been through the lab's model-based identity gates, and their outputs can differ from the measured laptop builds in the last floating-point bits (README, \"Download\")."
+            echo
+            echo "| File | Contents |"
+            echo "|---|---|"
+            echo "| \`oxe-server-$TAG-linux-aarch64.tar.gz\` | \`oxe-server\`: the oxe MoE engine (Ornith 1.5, Qwen3.6 35B-A3B) |"
+            echo "| \`oxe-server-flash-$TAG-linux-aarch64.tar.gz\` | \`oxe-server\` with the Flash engine (\`--engine flash\`) + \`flash-m0\` (expert sidecar) and \`flash-m3\` (selftest); ggml built in the same run from the pinned public sources |"
+            echo "| \`oxi-$TAG-linux-aarch64.tar.gz\` | \`oxi\`: FLUX.2 klein image engine (experimental) |"
+            echo
+            echo "Verify:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo "gh attestation verify oxe-server-$TAG-linux-aarch64.tar.gz --repo $GITHUB_REPOSITORY \\"
+            echo "  --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml"
+            echo '```'
+            echo
+            echo "No model weights are included."
+          } > notes.md
+          opts=()
+          case $TAG in *-*) opts+=(--prerelease);; esac
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$TAG" --notes-file notes.md "${opts[@]}"

@@ -131,6 +131,13 @@ pub trait Engine: Send + 'static {
     fn save_state(&mut self, _w: &mut dyn std::io::Write) -> Result<()> {
         Err(EngineError("engine has no persistent state".into()))
     }
+    /// The bytes of [`Engine::save_state`] as one buffer (the prefix store's anchor save). Engines with
+    /// large states override it to build the buffer once (Flash: ~285 MB at 5.5K tokens).
+    fn save_state_vec(&mut self) -> Result<Vec<u8>> {
+        let mut b = Vec::with_capacity(self.state_size_hint());
+        self.save_state(&mut b)?;
+        Ok(b)
+    }
     /// Read a state written by [`Engine::save_state`] at `n_pos` positions; `n_past`
     /// becomes `n_pos`. On error the caller resets the engine.
     fn load_state(&mut self, _r: &mut dyn std::io::Read, _n_pos: usize) -> Result<()> {

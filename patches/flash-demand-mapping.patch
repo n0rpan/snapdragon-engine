@@ -1,0 +1,13 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3c4e598f14962fa2123c603c20377ebcaa8039a6..2e1b9b739fc059e38195cbac95a25318cbcddb00 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1979,7 +1979,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    ml.init_mappings(false, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers

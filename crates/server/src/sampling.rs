@@ -88,6 +88,9 @@ impl Sampler {
         }
         let k = if self.p.top_k <= 0 { logits.len() } else { (self.p.top_k as usize).min(logits.len()) };
         let mut cand = top_probs(logits, k); // sorted, softmax over all (renormalized below)
+        if cand.is_empty() {
+            return argmax(logits);
+        }
         let s: f32 = cand.iter().map(|c| c.1).sum();
         for c in cand.iter_mut() {
             c.1 /= s;
@@ -108,11 +111,19 @@ impl Sampler {
             let thr = cand[0].1 * self.p.min_p;
             cand.retain(|c| c.1 >= thr);
         }
+        // total: the request checks keep min_p <= 1, but NaN probabilities or a direct caller can
+        // still empty the list (REVIEW-v0.1.1 B2: this was an unwrap panic = abort in release)
+        if cand.is_empty() {
+            return argmax(logits);
+        }
         // temperature on the remaining logits
         let lg: Vec<f64> = cand.iter().map(|c| (logits[c.0 as usize] / self.p.temperature) as f64).collect();
         let m = lg.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let w: Vec<f64> = lg.iter().map(|l| (l - m).exp()).collect();
         let tot: f64 = w.iter().sum();
+        if !(tot.is_finite() && tot > 0.0) {
+            return cand[0].0; // degenerate weights (temperature ~1e-38 gives NaN): most probable
+        }
         let mut r = self.next_f64() * tot;
         for (i, x) in w.iter().enumerate() {
             r -= x;
@@ -120,7 +131,7 @@ impl Sampler {
                 return cand[i].0;
             }
         }
-        cand.last().unwrap().0
+        cand[cand.len() - 1].0
     }
 }
 
@@ -140,5 +151,25 @@ mod tests {
         let mut s = Sampler::new(SamplingParams { seed: 7, ..Default::default() });
         let t = s.sample(&l);
         assert!(t == 1 || t == 3 || t == 2);
+    }
+
+    /// REVIEW-v0.1.1 B2: min_p > 1 removed every candidate and `cand.last().unwrap()` panicked
+    /// (abort in release). The sampler is total now: an empty list gives the argmax.
+    #[test]
+    fn min_p_above_one_falls_back_to_argmax() {
+        let mut s = Sampler::new(SamplingParams { temperature: 1.0, min_p: 2.0, seed: 1, ..Default::default() });
+        assert_eq!(s.sample(&[0.0, 1.0]), 1);
+        let mut s = Sampler::new(SamplingParams { temperature: 1.0, min_p: f32::INFINITY, top_k: 0, top_p: 1.0, seed: 1 });
+        assert_eq!(s.sample(&[0.5, 2.0, 1.0]), 1);
+    }
+
+    /// NaN logits or a vanishing temperature (REVIEW N7) never panic and pick a candidate.
+    #[test]
+    fn degenerate_inputs_do_not_panic() {
+        let mut s = Sampler::new(SamplingParams { temperature: 1e-38, seed: 3, ..Default::default() });
+        assert_eq!(s.sample(&[0.0, 5.0, 1.0]), 1);
+        let mut s = Sampler::new(SamplingParams { temperature: 1.0, seed: 3, ..Default::default() });
+        let t = s.sample(&[f32::NAN, f32::NAN, f32::NAN]);
+        assert!(t < 3);
     }
 }

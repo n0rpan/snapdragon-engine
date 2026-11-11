@@ -33,6 +33,20 @@ it is safe to run without the inference lease. llama-server flags that the contr
 passes (`--threads`, `--jinja`, `-b/-ub`, `--spec-type`, `--reasoning-budget`, ...) are
 accepted and ignored (`IGNORED` in `src/main.rs`); unknown flags are an error.
 
+### Access (v0.1.1)
+
+The port is for local clients. `oxe-server` sends no CORS headers, refuses (403) a request whose
+`Host` is not `127.0.0.1`, `localhost` or `[::1]` with the server's port (add names with
+`--allow-host NAME`; a specific non-loopback `--host` address is accepted as a Host), and refuses
+any request whose `Origin` is not loopback or that carries `Sec-Fetch-Site: cross-site`. That
+stops web pages (including DNS rebinding) from using the engine. Against other local users, set
+a key: `--api-key-file PATH` or `OXE_API_KEY_FILE=PATH` (one key per line, file mode 0600); every
+route, `/health` included, then needs `Authorization: Bearer KEY` (or `X-Api-Key: KEY`), else 401.
+The lab controller creates a fresh key per launch. Sampling values out of range (`min_p` or
+`top_p` outside 0..1, `top_k` beyond 32 bits, non-finite numbers, penalties outside their range,
+`n_probs` / `top_logprobs` above 100) are a 400. A streaming client that takes no data for
+`--stream-stall-timeout` seconds (30) is dropped and its generation cancelled.
+
 Endpoints (llama-server shapes, key order included):
 
 | Endpoint | Status |

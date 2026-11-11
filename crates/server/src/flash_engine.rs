@@ -130,13 +130,15 @@ pub fn cache_decide_now(n_ctx: usize, harness_gib: Option<f64>, pref_gib: Option
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let avail = qwen4exp::pf_plan::mem_available_bytes().map_or(f64::NAN, gib);
     let total = qwen4exp::pf_plan::mem_total_bytes().map_or(f64::NAN, gib);
+    let swap_free = qwen4exp::pf_plan::swap_free_bytes().map_or(f64::NAN, gib);
     let inp = qwen4exp::pf_plan::AdmitInputs::measured(avail, n_ctx, harness_gib);
-    let (d, seen) = qwen4exp::pf_plan::cache_select_swap_tolerant(&inp, pref_gib, total, desktop_floor_gib);
+    let (d, seen) = qwen4exp::pf_plan::cache_select_swap_tolerant(&inp, pref_gib, total, desktop_floor_gib, swap_free);
     let mut line = d.log_line(&inp);
     if !seen.is_empty() {
         let parts: Vec<String> = seen.iter().map(|(t, b)| format!("{t:.0}: budget {b:+.2}")).collect();
         line += &format!(
-            "; swap-tolerant (explicit pref, MemTotal {total:.2} - cache - dense/base - model growth - desktop floor {desktop_floor_gib:.2}): [{}]{}",
+            "; swap-tolerant (explicit pref, MemTotal {total:.2} - cache - dense/base - model growth - desktop floor {desktop_floor_gib:.2}; SwapFree {swap_free:.2} must cover the RAM overflow + {:.1}): [{}]{}",
+            qwen4exp::pf_plan::SWAP_MARGIN_GIB,
             parts.join("; "),
             if d.reason == qwen4exp::pf_plan::CacheReason::PreferredSwapTolerant {
                 format!(" -> cache {:.0} GiB (idle desktop pages may go to swap; engine scope swap.max=0)", d.cache_gib.unwrap_or(0.0))
@@ -453,6 +455,24 @@ impl Engine for FlashEngine {
         let hot = unsafe { self.st.hot_list() };
         w.write_all(&hot_bytes(&hot)).map_err(e)
     }
+    /// FLASH-PREFIX-1: the bytes of [`Engine::save_state`] in ONE buffer of the exact size (the ~285 MB anchor state at
+    /// 5.5K tokens is built once; `save_state` into a Vec holds it twice for a moment, in the middle of a cold prefill).
+    fn save_state_vec(&mut self) -> Result<Vec<u8>> {
+        // SAFETY: engine thread, no compute in progress.
+        let hot = hot_bytes(&unsafe { self.st.hot_list() });
+        let mut out = Vec::with_capacity(self.state_size_hint() + hot.len());
+        self.ctx.save_compact_append(&mut out);
+        out.reserve_exact(N_VOCAB * 4 + hot.len());
+        for x in &self.logits {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.extend_from_slice(&hot);
+        Ok(out)
+    }
+    fn state_size_hint(&self) -> usize {
+        // the hot list (<= 8 + 4 * 48 * 512 bytes) is not included: callers reserve it on top or let the Vec grow once
+        8 + 4 * self.ctx.pos() + self.ctx.compact_bytes() + N_VOCAB * 4
+    }
     fn snapshot_bytes(s: &FlashSnapshot) -> usize {
         s.rec.len()
     }
@@ -476,9 +496,16 @@ impl Engine for FlashEngine {
     }
     fn load_state(&mut self, r: &mut dyn std::io::Read, n_pos: usize) -> Result<()> {
         let e = |e: std::io::Error| EngineError(format!("load state: {e}"));
+        // every length is checked against this context's layout BEFORE any allocation (a corrupt or crafted
+        // file must miss + reset, not request a huge buffer)
+        let expect = self.ctx.compact_bytes_at(n_pos, self.n_ctx).ok_or_else(|| EngineError(format!("load state: {n_pos} positions > n_ctx {}", self.n_ctx)))?;
         let mut u = [0u8; 8];
         r.read_exact(&mut u).map_err(e)?;
-        let n = u64::from_le_bytes(u) as usize;
+        let n = u64::from_le_bytes(u);
+        if n != expect as u64 {
+            return Err(EngineError(format!("load state: compact length {n} != {expect} for {n_pos} positions of this context")));
+        }
+        let n = expect;
         let mut tb = vec![0u8; n_pos * 4];
         r.read_exact(&mut tb).map_err(e)?;
         let toks: Vec<i32> = tb.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();

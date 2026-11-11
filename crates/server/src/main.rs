@@ -14,12 +14,16 @@ const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0
   [--spec-type draft-mtp|none] [--spec-draft-n-max N (1-3)] [--mtp] [--draft N]
   [--flash-threads 4] [--flash-threads-batch 6] [--flash-cache-gib 16|auto (auto: 20 / 18 / 16 / 14 GiB, the largest tier MemAvailable covers, else refuse = exit 74; W5-C, F122, O-27)] [--flash-cache-pref auto|20|18|16|14 (preferred tier; falls back to the largest that fits with a NOTE; implies auto; 20 / 18 use the swap-tolerant MemTotal rule)] [--flash-desktop-floor-gib 3.0] [--flash-psi-some 10 --flash-psi-full 2 (percent avg10; default 0 = off on release main, 064 proposes 10 / 2)] [--flash-admit-harness-gib 0.80 (F118 growth)] [--flash-admit-dry-run] [--flash-pf-admit 0|1 (long-prompt guard, default 1)] [--flash-fuse N (S-c fused phases, 63 = all, default 0)] [--flash-pf-order 0|1|2 (default 1; 2 = F123 residents then misses, each by last use in the prompt)] [--flash-pf-readahead N|auto (default 0)] [--flash-pf-max-pass N|auto (default 0)] [--flash-io-cpu-prefill LIST] [--flash-io-cpu N] [--flash-sidecar PATH] [--flash-lookahead TABLE.lat [--flash-la-max 2] [--flash-la-pending 2]] [--flash-cache-policy lfu|clock] [--flash-quota-weights builtin|equal|FILE] [--flash-exact] (--engine flash: needs the `flash` feature)
   [--prefix-cache DIR|default (off unless given; default = ~/.cache/local-ai/snapdragon-engine/prefix)]
-  [--prefix-cache-max-bytes N (4 GiB)] [--prefix-cache-min-tokens N (1024)]
+  [--prefix-cache-max-bytes N (4 GiB)] [--prefix-cache-min-tokens N (1024)] [--prefix-cache-save-floor-mib N (flash 1024, else 0: save an entry only while MemAvailable >= N MiB + 2 x the entry)] [--prefix-cache-ttl-h N (0 = off; at start, delete this store's entries and the same model's older-build orphans unused for N hours)]
   [--turn-checkpoints N (4; only checkpoint slots beyond 4 are used for them)]
   [--session-ram-bytes N (0 = off: RAM for parked sessions)] [--park-min-tokens N (512)]
   [--session-cache DIR (off; whole conversations on disk, written on SIGTERM and RAM eviction)]
   [--session-cache-max-bytes N (8 GiB)] [--session-cache-ttl-hours N (24)]
   [--ledger PATH (off; one JSON line of numbers per generation, appended, mode 0600)]
+  [--api-key-file PATH (or env OXE_API_KEY_FILE; one key per line; every route, /health included, then needs
+   \"Authorization: Bearer KEY\")] [--api-key KEY (visible in argv: prefer the file)]
+  [--allow-host NAME (extra accepted Host name; default only 127.0.0.1 / localhost / [::1] with the port)]
+  [--stream-stall-timeout SECS (30: a streaming client that takes no data this long is dropped, its generation cancelled)]
   [--repeat-watchdog N (stop a generation that ends in a token loop within the last N tokens; 0 = off)]
   [--mtp-head GGUF (MTP block from a sidecar; default <model>.mtp-head.gguf if present)]
   [--mtp-tune FILE (measured MTP depth per context bucket; default <model>.mtp-tune.json if present)]
@@ -50,6 +54,9 @@ fn main() {
     let mut model = None;
     let mut alias = None;
     let mut host = "127.0.0.1".to_string();
+    let mut api_key_file: Option<String> = None;
+    let mut api_keys: Vec<Vec<u8>> = Vec::new();
+    let mut allow_hosts: Vec<String> = Vec::new();
     let mut port: u16 = 8080;
     let mut n_ctx: usize = 16384;
     let mut checkpoints: usize = 4;
@@ -124,6 +131,8 @@ fn main() {
     let mut prefix_dir: Option<String> = None;
     let mut prefix_max: u64 = 4 << 30;
     let mut prefix_min: usize = 1024;
+    let mut prefix_ttl_h: u64 = 0;
+    let mut prefix_save_floor_mib: Option<u64> = None;
     let mut turn_checkpoints: usize = 4;
     let mut session_ram: usize = 0;
     let mut park_min: usize = 512;
@@ -182,11 +191,21 @@ fn main() {
             "--prefix-cache" => prefix_dir = Some(need(i)),
             "--prefix-cache-max-bytes" => prefix_max = need(i).parse().expect("--prefix-cache-max-bytes"),
             "--prefix-cache-min-tokens" => prefix_min = need(i).parse().expect("--prefix-cache-min-tokens"),
+            "--prefix-cache-ttl-h" => prefix_ttl_h = need(i).parse().expect("--prefix-cache-ttl-h"),
+            "--prefix-cache-save-floor-mib" => prefix_save_floor_mib = Some(need(i).parse().expect("--prefix-cache-save-floor-mib")),
             "--turn-checkpoints" => turn_checkpoints = need(i).parse().expect("--turn-checkpoints"),
             "--session-ram-bytes" => session_ram = need(i).parse().expect("--session-ram-bytes"),
             "--park-min-tokens" => park_min = need(i).parse().expect("--park-min-tokens"),
             "--session-cache" => session_dir = Some(need(i)),
             "--ledger" => ledger = Some(need(i)),
+            "--api-key-file" => api_key_file = Some(need(i)),
+            "--api-key" => {
+                eprintln!("oxe-server: --api-key is visible to other local users in the process list; prefer --api-key-file");
+                api_keys.push(need(i).trim().as_bytes().to_vec())
+            }
+            "--allow-host" => allow_hosts.push(need(i).trim().to_ascii_lowercase()),
+            // S8: read by State::new (single-threaded here)
+            "--stream-stall-timeout" => std::env::set_var("OXE_STREAM_STALL_SECS", need(i).parse::<f64>().ok().filter(|v| *v > 0.0).expect("--stream-stall-timeout").to_string()),
             "--session-cache-max-bytes" => session_max = need(i).parse().expect("--session-cache-max-bytes"),
             "--session-cache-ttl-hours" => session_ttl_h = need(i).parse().expect("--session-cache-ttl-hours"),
             "--prefill-split" => {
@@ -358,6 +377,40 @@ fn main() {
         }
         i += used;
     }
+    // B1: API key (fails closed: a named but unusable key file stops the server)
+    let api_key_file = api_key_file.or_else(|| std::env::var("OXE_API_KEY_FILE").ok().filter(|v| !v.is_empty()));
+    if let Some(p) = &api_key_file {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| server::http::parse_key_file(&t)) {
+            Ok(k) => api_keys.extend(k),
+            Err(e) => {
+                eprintln!("oxe-server: API key file {p}: {e}");
+                std::process::exit(2)
+            }
+        }
+        if let Ok(m) = std::fs::metadata(p) {
+            if m.permissions().mode() & 0o077 != 0 {
+                eprintln!("oxe-server: WARNING: API key file {p} is readable by other users (chmod 600)");
+            }
+        }
+    }
+    if api_keys.iter().any(|k| k.is_empty()) {
+        eprintln!("oxe-server: empty API key");
+        std::process::exit(2)
+    }
+    // a specific non-loopback bind address is a Host name its clients use
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            allow_hosts.push(match ip {
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                v4 => v4.to_string(),
+            });
+        }
+    }
+    let access = server::http::Access { port: 0, extra_hosts: allow_hosts, keys: api_keys };
+    if !access.keys.is_empty() {
+        eprintln!("oxe-server: API key required on every route");
+    }
     // O-27: a preference selects among the auto tiers; a fixed --flash-cache-gib N together with a preference is a
     // contradiction (which one would the user mean?)
     if flash_cache_pref_set {
@@ -431,7 +484,9 @@ fn main() {
         } else {
             std::path::PathBuf::from(d)
         };
-        PrefixOpts { dir, max_bytes: prefix_max, min_tokens: prefix_min, model: std::path::PathBuf::from(&model) }
+        // FLASH-PREFIX-2: Flash saves only with MemAvailable >= this + 2 x entry (default = the controller's 1 GiB host floor)
+        let save_floor_mib = prefix_save_floor_mib.unwrap_or(if engine == "flash" { 1024 } else { 0 });
+        PrefixOpts { dir, max_bytes: prefix_max, min_tokens: prefix_min, ttl_h: prefix_ttl_h, save_floor_bytes: save_floor_mib << 20, model: std::path::PathBuf::from(&model) }
     });
     let warm = hotset.filter(|h| h != "off").map(|h| {
         if h == "default" {
@@ -457,7 +512,7 @@ fn main() {
         "stub" => {
             let script = tok.encode(&stub_reply, false, true);
             let eng = StubEngine::new(n_ctx, tok.n_vocab(), tok.eos.unwrap_or(0), script);
-            serve(cfg, tok, eng, sess, ubatch, prefix, host, port, engine, n_ctx, repeat_watchdog, None, None, None)
+            serve(cfg, tok, eng, sess, ubatch, prefix, host, port, engine, n_ctx, repeat_watchdog, None, None, None, access)
         }
         "oxe" => {
             let cpus = sched::parse_cpu_list(&oxe_cpus).unwrap_or_else(|e| {
@@ -546,10 +601,18 @@ fn main() {
                 mtp_max_ctx.map(|m| m.to_string()).unwrap_or_else(|| "off".into()),
                 tune_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
             );
-            serve(cfg, tok, eng, sess, ubatch, prefix, host, port, engine, n_ctx, repeat_watchdog, table, use_lookup.then_some(lookup_cfg), mtp_max_ctx)
+            serve(cfg, tok, eng, sess, ubatch, prefix, host, port, engine, n_ctx, repeat_watchdog, table, use_lookup.then_some(lookup_cfg), mtp_max_ctx, access)
         }
         #[cfg(feature = "flash")]
         "flash" => {
+            // O-21: prompt prefixes stay off the unencrypted weights partition (the sidecar's directory tree)
+            let prefix = prefix.filter(|p| match server::prefix_store::inside_dir_of(&p.dir, flash_sidecar.as_deref()) {
+                Some(side) => {
+                    eprintln!("oxe-server: prefix store disabled: {} is inside the expert sidecar's directory {} (O-21: prompts stay on the encrypted home)", p.dir.display(), side.display());
+                    false
+                }
+                None => true,
+            });
             let o = server::flash_engine::FlashOptions {
                 threads: flash_threads,
                 threads_batch: flash_threads_batch,
@@ -595,7 +658,7 @@ fn main() {
                 eprintln!("flash engine: {e}");
                 std::process::exit(1)
             });
-            serve(cfg, tok, eng, sess, if ubatch_set { ubatch } else { 4096 }, prefix, host, port, engine, n_ctx, repeat_watchdog, None, None, None)
+            serve(cfg, tok, eng, sess, if ubatch_set { ubatch } else { 4096 }, prefix, host, port, engine, n_ctx, repeat_watchdog, None, None, None, access)
         }
         x => {
             eprintln!("unknown engine {x} (stub|oxe{})", if cfg!(feature = "flash") { "|flash" } else { "" });
@@ -630,11 +693,15 @@ struct PrefixOpts {
     dir: std::path::PathBuf,
     max_bytes: u64,
     min_tokens: usize,
+    /// `--prefix-cache-ttl-h` (0 = off)
+    ttl_h: u64,
+    /// `--prefix-cache-save-floor-mib` in bytes (0 = off)
+    save_floor_bytes: u64,
     model: std::path::PathBuf,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: SessionOpts, ubatch: usize, prefix: Option<PrefixOpts>, host: String, port: u16, engine: String, n_ctx: usize, repeat_watchdog: usize, spec_table: Option<server::generate::SpecTable>, lookup: Option<server::lookup::LookupConfig>, mtp_max_ctx: Option<usize>) {
+fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: SessionOpts, ubatch: usize, prefix: Option<PrefixOpts>, host: String, port: u16, engine: String, n_ctx: usize, repeat_watchdog: usize, spec_table: Option<server::generate::SpecTable>, lookup: Option<server::lookup::LookupConfig>, mtp_max_ctx: Option<usize>, mut access: server::http::Access) {
     let mut w = Worker::new(eng, sess.checkpoints);
     w.ubatch = ubatch;
     w.spec_table = spec_table;
@@ -704,8 +771,22 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
             Some(sid) => {
                 let id = server::prefix_store::identity(&p.model, &format!("{sid}{sched}"), ubatch);
                 match server::prefix_store::PrefixStore::open(&p.dir, id, p.max_bytes, p.min_tokens) {
-                    Ok(s) => {
-                        eprintln!("oxe-server: prefix store {} ({} usable entries)", p.dir.display(), s.n_entries());
+                    Ok(mut s) => {
+                        s.save_floor_bytes = p.save_floor_bytes;
+                        if p.ttl_h > 0 {
+                            // own entries + the same model's orphans of older builds (W4-4 c rules)
+                            let gone = s.prune_older_than(std::time::Duration::from_secs(p.ttl_h * 3600));
+                            if gone > 0 {
+                                eprintln!("oxe-server: prefix store: {gone} entries unused for {} h removed", p.ttl_h);
+                            }
+                        }
+                        eprintln!(
+                            "oxe-server: prefix store {} ({} usable entries, cap {} MiB, min {} tokens)",
+                            p.dir.display(),
+                            s.n_entries(),
+                            p.max_bytes >> 20,
+                            p.min_tokens
+                        );
                         w.store = Some(s);
                     }
                     Err(e) => eprintln!("oxe-server: prefix store disabled: {e}"),
@@ -759,7 +840,8 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
             eprintln!("bind {host}:{port}: {e}");
             std::process::exit(1)
         });
-        eprintln!("oxe-server listening on http://{host}:{port} (engine {engine}, n_ctx {n_ctx})");
-        server::http::serve(st, l).await.unwrap();
+        access.port = l.local_addr().map(|a| a.port()).unwrap_or(port);
+        eprintln!("oxe-server listening on http://{host}:{} (engine {engine}, n_ctx {n_ctx})", access.port);
+        server::http::serve_with(st, l, access).await.unwrap();
     });
 }
