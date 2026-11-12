@@ -7,6 +7,11 @@ publish.workspace = true
 description = "oxe command-line tools: oxe (gen/trace/compare/verify/bench/cache), barrier-bench, gguf-dump"
 build = "build.rs"
 
+[features]
+f32-reference = ["model/f32-reference"]
+npu-prefill = ["model/npu-prefill", "dep:oxn"]
+npu-device = ["npu-prefill", "model/npu-device", "oxn/device"]
+
 [dependencies]
 gguf = { path = "../gguf" }
 kernels-sys = { path = "../kernels-sys" }
@@ -14,6 +19,7 @@ sched = { path = "../sched" }
 model = { path = "../model" }
 tokenizer = { path = "../tokenizer" }
 serde_json.workspace = true
+oxn = { path = "../oxn", optional = true }
 
 [[bin]]
 name = "oxe"

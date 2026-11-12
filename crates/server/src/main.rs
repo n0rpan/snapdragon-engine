@@ -9,16 +9,25 @@ use std::sync::Arc;
 
 const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0.0.1] [--port 8080]
   [--ctx-size N] [--ctx-checkpoints N] [--chat-template-kwargs JSON] [--reasoning-format none|auto|deepseek]
-  [--reasoning on|off] [--slots] [--idle-reprefill (SX-2, off by default)] [--engine stub|oxe|flash] [--stub-reply TEXT] [--oxe-cpus 0-7]
+  [--reasoning on|off] [--slots] [--idle-reprefill (SX-2, off by default)] [--engine stub|oxe|flash (stub: tokenizer + template only, no weights: /apply-template, /tokenize)] [--stub-reply TEXT] [--echo on|off (CACHE-PERFECT ECHO, default on)] [--echo-max-tokens 4194304] [--echo-ttl-secs 604800] [--oxe-cpus 0-7]
   [--oxe-prefill-cpus LIST (default: --oxe-cpus)] [--ubatch-size 256 (oxe prefill ubatch)]
+  [--oxe-npu-prefill device|emu --oxe-npu-go-file PATH (guarded W2 experiment, optional build; off by default)]
   [--spec-type draft-mtp|none] [--spec-draft-n-max N (1-3)] [--mtp] [--draft N]
   [--flash-threads 4] [--flash-threads-batch 6] [--flash-cache-gib 16|auto (auto: 20 / 18 / 16 / 14 GiB, the largest tier MemAvailable covers, else refuse = exit 74; W5-C, F122, O-27)] [--flash-cache-pref auto|20|18|16|14 (preferred tier; falls back to the largest that fits with a NOTE; implies auto; 20 / 18 use the swap-tolerant MemTotal rule)] [--flash-desktop-floor-gib 3.0] [--flash-psi-some 10 --flash-psi-full 2 (percent avg10; default 0 = off on release main, 064 proposes 10 / 2)] [--flash-admit-harness-gib 0.80 (F118 growth)] [--flash-admit-dry-run] [--flash-pf-admit 0|1 (long-prompt guard, default 1)] [--flash-fuse N (S-c fused phases, 63 = all, default 0)] [--flash-pf-order 0|1|2 (default 1; 2 = F123 residents then misses, each by last use in the prompt)] [--flash-pf-readahead N|auto (default 0)] [--flash-pf-max-pass N|auto (default 0)] [--flash-io-cpu-prefill LIST] [--flash-io-cpu N] [--flash-sidecar PATH] [--flash-lookahead TABLE.lat [--flash-la-max 2] [--flash-la-pending 2]] [--flash-cache-policy lfu|clock] [--flash-quota-weights builtin|equal|FILE] [--flash-exact] (--engine flash: needs the `flash` feature)
   [--prefix-cache DIR|default (off unless given; default = ~/.cache/local-ai/snapdragon-engine/prefix)]
   [--prefix-cache-max-bytes N (4 GiB)] [--prefix-cache-min-tokens N (1024)] [--prefix-cache-save-floor-mib N (flash 1024, else 0: save an entry only while MemAvailable >= N MiB + 2 x the entry)] [--prefix-cache-ttl-h N (0 = off; at start, delete this store's entries and the same model's older-build orphans unused for N hours)]
   [--turn-checkpoints N (4; only checkpoint slots beyond 4 are used for them)]
   [--session-ram-bytes N (0 = off: RAM for parked sessions)] [--park-min-tokens N (512)]
-  [--session-cache DIR (off; whole conversations on disk, written on SIGTERM and RAM eviction)]
+  [--park-disk-min-bytes N (0 = off; LONG-CTX: a session whose state is >= N bytes parks to the --session-cache,
+   streamed, instead of a RAM copy; e.g. 536870912 for 128K contexts)]
+  [--session-cache DIR (off; whole conversations on disk, written on RAM eviction and on SIGTERM unless --state-cache)]
   [--session-cache-max-bytes N (8 GiB)] [--session-cache-ttl-hours N (24)]
+  [--state-cache DIR|default (CACHE-PERFECT P2 disk state store, off unless given; DIR is the root shared by
+   all models, inside the home; default = ~/.cache/local-ai/snapdragon-engine/state)] [--state-budget-bytes N
+   (64000000000; one budget over every model under DIR; 0 = off)] [--state-ttl-secs N (604800)]
+   [--state-min-tokens N (1024)] [--state-cache-strict-build (the binary's sha in the identity: gates)]
+  capabilities: oxe-capability state-preload-v1 (POST /state-cache/preload; the controller's read-only
+   binary probe looks for this literal: route strings need not survive LTO as one string)
   [--ledger PATH (off; one JSON line of numbers per generation, appended, mode 0600)]
   [--api-key-file PATH (or env OXE_API_KEY_FILE; one key per line; every route, /health included, then needs
    \"Authorization: Bearer KEY\")] [--api-key KEY (visible in argv: prefer the file)]
@@ -69,6 +78,8 @@ fn main() {
     let mut stub_reply = "Hello from the oxe stub engine.".to_string();
     let mut oxe_cpus = "0-7".to_string();
     let mut oxe_prefill_cpus: Option<String> = None;
+    let mut oxe_npu_prefill: Option<String> = None;
+    let mut oxe_npu_go_file: Option<String> = None;
     let mut ubatch = model::engine::UBATCH;
     let mut ubatch_set = false;
     // --engine flash (cargo feature `flash`): Qwen3.8-Flash-Next, graph port + streaming experts
@@ -136,12 +147,18 @@ fn main() {
     let mut turn_checkpoints: usize = 4;
     let mut session_ram: usize = 0;
     let mut park_min: usize = 512;
+    let mut park_disk_min: usize = 0;
     let mut session_dir: Option<String> = None;
     let mut session_max: u64 = 8 << 30;
     let mut session_ttl_h: u64 = 24;
     let mut prefill_split: Option<bool> = None;
     let mut hotset: Option<String> = None;
     let mut ledger: Option<String> = None;
+    let mut state_dir: Option<String> = None;
+    let mut state_budget: u64 = 64_000_000_000;
+    let mut state_ttl: u64 = 7 * 24 * 3600;
+    let mut state_min: usize = 1024;
+    let mut state_strict = false;
     let mut i = 0;
     let need = |i: usize| -> String {
         args.get(i + 1).cloned().unwrap_or_else(|| {
@@ -196,7 +213,16 @@ fn main() {
             "--turn-checkpoints" => turn_checkpoints = need(i).parse().expect("--turn-checkpoints"),
             "--session-ram-bytes" => session_ram = need(i).parse().expect("--session-ram-bytes"),
             "--park-min-tokens" => park_min = need(i).parse().expect("--park-min-tokens"),
+            "--park-disk-min-bytes" => park_disk_min = need(i).parse().expect("--park-disk-min-bytes"),
             "--session-cache" => session_dir = Some(need(i)),
+            "--state-cache" => state_dir = Some(need(i)),
+            "--state-budget-bytes" => state_budget = need(i).parse().expect("--state-budget-bytes"),
+            "--state-ttl-secs" => state_ttl = need(i).parse().expect("--state-ttl-secs"),
+            "--state-min-tokens" => state_min = need(i).parse().expect("--state-min-tokens"),
+            "--state-cache-strict-build" => {
+                state_strict = true;
+                used = 1;
+            }
             "--ledger" => ledger = Some(need(i)),
             "--api-key-file" => api_key_file = Some(need(i)),
             "--api-key" => {
@@ -226,6 +252,10 @@ fn main() {
                 }
             }
             "--stub-reply" => stub_reply = need(i),
+            // CACHE-PERFECT ECHO (echo.rs): on by default; read by State::new from the environment
+            "--echo" => std::env::set_var("OXE_ECHO", if matches!(need(i).as_str(), "off" | "0" | "false") { "0" } else { "1" }),
+            "--echo-max-tokens" => std::env::set_var("OXE_ECHO_MAX_TOKENS", need(i).parse::<usize>().expect("--echo-max-tokens").to_string()),
+            "--echo-ttl-secs" => std::env::set_var("OXE_ECHO_TTL_SECS", need(i).parse::<u64>().expect("--echo-ttl-secs").to_string()),
             "--oxe-cpus" => oxe_cpus = need(i),
             "--oxe-prefill-cpus" => oxe_prefill_cpus = Some(need(i)),
             "--flash-threads" => flash_threads = need(i).parse().unwrap_or(4),
@@ -268,6 +298,8 @@ fn main() {
                 let _ = v;
                 flash_cache_pref_set = true;
             }
+            "--oxe-npu-prefill" => oxe_npu_prefill = Some(need(i)),
+            "--oxe-npu-go-file" => oxe_npu_go_file = Some(need(i)),
             "--flash-desktop-floor-gib" | "--flash-psi-some" | "--flash-psi-full" => {
                 let v = need(i);
                 let g = match v.parse::<f64>() {
@@ -376,6 +408,9 @@ fn main() {
             },
         }
         i += used;
+    }
+    if oxe_npu_prefill.is_some() && (engine!="oxe" || !cfg!(feature="npu-prefill")) {
+        eprintln!("oxe-server: --oxe-npu-prefill needs engine=oxe and the optional npu-prefill build");std::process::exit(2);
     }
     // B1: API key (fails closed: a named but unusable key file stops the server)
     let api_key_file = api_key_file.or_else(|| std::env::var("OXE_API_KEY_FILE").ok().filter(|v| !v.is_empty()));
@@ -500,6 +535,7 @@ fn main() {
         turn_checkpoints,
         session_ram,
         park_min,
+        park_disk_min,
         dir: session_dir.map(std::path::PathBuf::from),
         max_bytes: session_max,
         ttl_h: session_ttl_h,
@@ -507,6 +543,17 @@ fn main() {
         msg_split: prefill_split.unwrap_or(engine == "flash"),
         warm,
         ledger: ledger.map(std::path::PathBuf::from),
+        state_dir: state_dir.map(|d| {
+            if d == "default" {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/local-ai/snapdragon-engine/state")
+            } else {
+                std::path::PathBuf::from(d)
+            }
+        }),
+        state_budget,
+        state_ttl,
+        state_min,
+        state_strict,
     };
     match engine.as_str() {
         "stub" => {
@@ -589,10 +636,18 @@ fn main() {
                 eprintln!("oxe-server: KV cache {kv} (K {cache_k}, V {cache_v})");
             }
             eprintln!("oxe-server: engine switches: {}", model::engine::effective_switches());
-            let eng = server::oxe_engine::OxeEngine::open_head(std::path::Path::new(&model), head.as_deref(), &cpus, pcpus.as_deref(), ubatch, n_ctx, depth).unwrap_or_else(|e| {
+            let mut eng = server::oxe_engine::OxeEngine::open_head(std::path::Path::new(&model), head.as_deref(), &cpus, pcpus.as_deref(), ubatch, n_ctx, depth).unwrap_or_else(|e| {
                 eprintln!("oxe engine: {e}");
                 std::process::exit(1)
             });
+            if let Some(mode)=oxe_npu_prefill.as_deref(){
+                #[cfg(feature="npu-prefill")]
+                eng.enable_npu_prefill(std::path::Path::new(&model),mode,oxe_npu_go_file.as_deref().map(std::path::Path::new),pcpus.as_deref().unwrap_or(&cpus)).unwrap_or_else(|e|{
+                    eprintln!("oxe-server: NPU proof preparation failed: {e}");std::process::exit(1)
+                });
+                #[cfg(not(feature="npu-prefill"))]
+                {let _=mode;eprintln!("oxe-server: build with npu-prefill/npu-device for this opt-in proof");std::process::exit(2);}
+            }
             // W4-4 a: one stable, machine-checkable MTP line (the T1 gate checks it)
             eprintln!(
                 "oxe-server: mtp depth={depth} head={} head_cache={} max_ctx={} table={}",
@@ -601,6 +656,16 @@ fn main() {
                 mtp_max_ctx.map(|m| m.to_string()).unwrap_or_else(|| "off".into()),
                 tune_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
             );
+            // LONG-CTX: what the context costs (full context; scratch pages become resident as it fills)
+            let m = eng.ctx_mem();
+            let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "oxe-server: context {} positions: KV {:.2} GiB ({} B/position), recurrent {:.2} GiB, decode scratch {:.2} GiB, prefill scratch {:.2} GiB/thread",
+                m.n_ctx, gib(m.kv), m.kv_per_pos, gib(m.recurrent), gib(m.decode_scratch), gib(m.prefill_per_thread)
+            );
+            if mtp_max_ctx.is_some_and(|c| c >= m.n_ctx) {
+                eprintln!("oxe-server: note: --mtp-max-ctx {} >= the context {}: never reached", mtp_max_ctx.unwrap(), m.n_ctx);
+            }
             serve(cfg, tok, eng, sess, ubatch, prefix, host, port, engine, n_ctx, repeat_watchdog, table, use_lookup.then_some(lookup_cfg), mtp_max_ctx, access)
         }
         #[cfg(feature = "flash")]
@@ -672,6 +737,7 @@ struct SessionOpts {
     turn_checkpoints: usize,
     session_ram: usize,
     park_min: usize,
+    park_disk_min: usize,
     dir: Option<std::path::PathBuf>,
     max_bytes: u64,
     ttl_h: u64,
@@ -681,6 +747,12 @@ struct SessionOpts {
     /// warm-up hint file (`--flash-hotset`)
     warm: Option<std::path::PathBuf>,
     ledger: Option<std::path::PathBuf>,
+    /// CACHE-PERFECT P2 state store (`--state-cache*`)
+    state_dir: Option<std::path::PathBuf>,
+    state_budget: u64,
+    state_ttl: u64,
+    state_min: usize,
+    state_strict: bool,
 }
 
 static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -717,6 +789,7 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
     w.cache.max_turn = turns;
     w.cache.park_budget = sess.session_ram;
     w.cache.park_min = sess.park_min;
+    w.cache.park_disk_min = sess.park_disk_min;
     w.msg_split = sess.msg_split;
     // stored states are only valid for the schedule that computed them
     let sched = if sess.msg_split { " sched=messages" } else { "" };
@@ -766,6 +839,13 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
         sess.checkpoints,
         if sess.session_ram > 0 { format!("up to {} MiB", sess.session_ram >> 20) } else { "off".into() }
     );
+    if sess.park_disk_min > 0 {
+        if session_cache {
+            eprintln!("oxe-server: sessions of >= {} MiB park to the session cache (streamed)", sess.park_disk_min >> 20);
+        } else {
+            eprintln!("oxe-server: --park-disk-min-bytes needs --session-cache: large sessions park in RAM");
+        }
+    }
     if let Some(p) = prefix {
         match w.engine.state_id() {
             Some(sid) => {
@@ -795,10 +875,57 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
             None => eprintln!("oxe-server: prefix store disabled: engine has no persistent state"),
         }
     }
+    if let Some(dir) = &sess.state_dir {
+        match (w.engine.state_id(), w.engine.kv_row_bytes()) {
+            (Some(sid), rb) if rb > 0 => {
+                let model_id = server::prefix_store::model_id(&sess.model);
+                let build = std::env::current_exe().ok().and_then(|p| server::prefix_store::sha256_file(&p).ok()).unwrap_or_else(|| "unknown".into());
+                let ident = server::state_store::Identity::new(&model_id, &format!("{sid}{sched}"), ubatch, &w.engine.arith_id(), &build, sess.state_strict);
+                match server::state_store::StateStore::open(dir, ident, sess.state_budget, sess.state_ttl, false) {
+                    Ok(mut s) => {
+                        s.min_tokens = sess.state_min;
+                        eprintln!(
+                            "oxe-server: state cache {} (model {}, {} sessions, {} MiB of {} MiB budget, numerics epoch {})",
+                            dir.display(),
+                            s.ident.model_key(),
+                            s.manifests.len(),
+                            s.used_bytes() >> 20,
+                            s.budget >> 20,
+                            server::state_store::NUMERICS_EPOCH
+                        );
+                        w.states = Some(s);
+                    }
+                    Err(e) => eprintln!("oxe-server: state cache disabled: {e}"),
+                }
+            }
+            _ => eprintln!("oxe-server: state cache disabled: engine has no segmented state (Flash keeps its prefix store)"),
+        }
+    }
+    let state_cache = w.states.is_some();
+    let echo_dir = w.states.as_ref().map(|s| (s.dir.join("echo"), s.ident.text.clone()));
+    // a disk budget of 0: no conversation state on disk at all (Codex P2/P3 review 2): the echo
+    // files and the legacy prefix / session stores are off too until the budget rises
+    let budget_off = w.states.as_ref().is_some_and(|s| s.budget == 0);
+    if budget_off && (w.store.is_some() || w.sessions.is_some()) {
+        eprintln!("oxe-server: state cache budget 0: the prefix store and session cache are off too");
+        w.legacy_off = Some((w.store.take(), w.sessions.take()));
+    }
     let st = State::new(cfg, tok, w).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
+    if let Some((d, id)) = echo_dir {
+        // M3: echo records next to the state cache, under the same identity (M4)
+        let mut es = st.echo.lock().unwrap();
+        es.set_identity(&id);
+        match es.attach(&d) {
+            Ok(n) => eprintln!("oxe-server: echo records: {n} read back"),
+            Err(e) => eprintln!("oxe-server: echo records stay in RAM: {e}"),
+        }
+        if budget_off {
+            *st.echo_dir_off.lock().unwrap() = es.set_disk(None);
+        }
+    }
     let st = Arc::new(st);
     // SIGTERM/SIGINT (controller unload, model switch): write the sessions, then exit
     unsafe {
@@ -811,25 +938,32 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
         if !TERM.load(std::sync::atomic::Ordering::SeqCst) {
             continue;
         }
-        if session_cache || warm_file {
-            // wait up to 5 s for a running generation; the controller allows 10 s
+        if session_cache || warm_file || state_cache || cfg!(feature="npu-prefill") {
+            // P2b M2: a guard trip allows 3 s (unload 10 s). Cancel the running generation (it stops
+            // within one prefill chunk or one token, leaving a consistent prefix), take the worker
+            // within 1 s, then write only what is not on disk yet (with M1 at most ~4K tokens of
+            // blocks + the head snapshot, streamed: no state-sized buffer) until 2.5 s after the
+            // signal; the manifest of what was written goes last. Logged in one line.
             let t0 = std::time::Instant::now();
+            let deadline = t0 + std::time::Duration::from_millis(2500);
+            for f in [&st_term.running, &st_term.idle, &st_term.persist, &st_term.preload] {
+                if let Some(f) = f.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             loop {
                 if let Ok(mut w) = st_term.worker.try_lock() {
-                    if w.save_warm(true) {
-                        eprintln!("oxe-server: warm file written");
+                    for l in w.shutdown_writes(state_cache, session_cache, t0, deadline, &mut |w| w.persist_sessions()) {
+                        eprintln!("oxe-server: {l}");
                     }
-                    if session_cache {
-                        let n = w.persist_sessions();
-                        eprintln!("oxe-server: session cache: wrote {n} sessions in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
-                    }
+                    #[cfg(feature="npu-prefill")] w.engine.release_accelerators();
                     break;
                 }
-                if t0.elapsed().as_secs() >= 5 {
-                    eprintln!("oxe-server: shutdown: worker busy, warm file and sessions not written");
+                if t0.elapsed().as_millis() >= 1000 {
+                    eprintln!("oxe-server: shutdown: worker busy after 1 s, nothing written (the last prefill-progress and post-reply writes stay valid)");
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         std::process::exit(0);

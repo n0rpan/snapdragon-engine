@@ -1,4 +1,4 @@
-// pf_attn: fixed-chunk attention part op of prefill ubatches in register tiles (see pf_attn.cpp, PROGRESS-PF.md FP-1).
+// pf_attn: fixed-chunk attention part op of prefill ubatches in register tiles (see pf_attn.cpp, docs/lab-notes/PROGRESS-PF.md FP-1).
 #pragma once
 
 #ifdef __cplusplus

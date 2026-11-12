@@ -1,5 +1,7 @@
 # WP-P1: turn checkpoints, parked sessions, session persistence, 32K (design)
 
+> **Historical working note.** The branches and worktrees named here were merged into `main` and then deleted; the commit hashes cited still resolve in `main`'s history. Current state: [README](README.md).
+
 Branch `claude/ctx-sessions` from main 707a0ec. Owner Opus-C. Gate: G-exact + no OOM at 28 GiB (Qwen, 32K).
 Tags: [M] measured, [E] estimate, [S] read from source.
 

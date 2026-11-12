@@ -36,6 +36,10 @@ pub const Q8_0_BLOCK_BYTES: usize = 34;
 pub mod ffi {
     use std::os::raw::c_int;
     extern "C" {
+        pub fn oxe_native_expert_tile(out: *mut u16, out_halfs: usize,
+            src: *const u8, bytes: usize, kind: u32, k: u32, rows: u32,
+            experts: u32, expert: u32, row0: u32, k0: u32) -> i32;
+
         pub fn oxe_sizeof_block_q8_K() -> usize;
         pub fn oxe_sizeof_block_q3_K() -> usize;
         pub fn oxe_sizeof_block_q4_K() -> usize;
@@ -59,6 +63,7 @@ pub mod ffi {
         pub fn oxe_f32_to_f16(x: *const f32, y: *mut u16, n: i64);
 
         pub fn dequantize_row_q8_0(x: *const u8, y: *mut f32, k: i64);
+        pub fn dequantize_row_q3_K(x: *const u8, y: *mut f32, k: i64);
         pub fn dequantize_row_q4_K(x: *const u8, y: *mut f32, k: i64);
         pub fn dequantize_row_q5_K(x: *const u8, y: *mut f32, k: i64);
         pub fn dequantize_row_q6_K(x: *const u8, y: *mut f32, k: i64);
@@ -209,7 +214,7 @@ pub mod ffi {
             p16: *mut u16,
             out: *mut f32,
         );
-        /// Block of `ggml_vec_dot_f16` results, bit-identical per element (M3-ATTN.md):
+        /// Block of `ggml_vec_dot_f16` results, bit-identical per element (docs/lab-notes/M3-ATTN.md):
         /// out[r*ox + c*oy] = dot(n, x + r*xs, y + c*ys); optional per-column `n_full` tail rule.
         pub fn oxe_dot_f16_tile(
             n: c_int,
@@ -244,6 +249,43 @@ pub mod ffi {
             st: *mut u8,
         );
         pub fn oxe_attn_softmax_row_f16(kq: *const f32, pos: c_int, n_kv: c_int, scale: f32, wp: *mut f32, dp: *mut f32, p16: *mut u16, n_out: c_int);
+        /// O-70 fused attention, one (KV head, chunk) item: chunk-local softmax of the unscaled scores
+        /// `s` ([col][ss], overwritten; column c valid on [0, nvalid[c])), f16 weights exp(x - m_c)
+        /// into `p16` (ncol * len), partial out[c*hd + d] = V^T[d][0..len) . p (f16 accumulation),
+        /// ml[c] = m_c (-inf if empty), ml[ncol + c] = sum of the f16 weights. len % 32 == 0; the dot
+        /// equals the one of length `len_full` (tail rule; V^T readable and finite up to it).
+        pub fn oxe_attn_fchunk_f16(
+            s: *mut f32,
+            ss: i64,
+            ncol: c_int,
+            nvalid: *const c_int,
+            len: c_int,
+            len_full: c_int,
+            scale: f32,
+            vt: *const u16,
+            v_stride: i64,
+            hd: c_int,
+            p16: *mut u16,
+            out: *mut f32,
+            ml: *mut f32,
+        );
+        /// O-70: merge one column's chunk partials (part + ch*ps, m/l at ch*mls) for dims [d0, d1):
+        /// out[d] = (sum_ch exp(m_ch - M) part[ch][d]) / (sum_ch exp(m_ch - M) l_ch) * gate[d], in
+        /// chunk order (independent of the dim range and of trailing empty chunks).
+        /// w: round_up(nch, 4) floats of scratch.
+        pub fn oxe_attn_fmerge_f32(
+            nch: c_int,
+            part: *const f32,
+            ps: i64,
+            m: *const f32,
+            l: *const f32,
+            mls: i64,
+            d0: c_int,
+            d1: c_int,
+            gate: *const f32,
+            out: *mut f32,
+            w: *mut f32,
+        );
         /// O-13: Q8_0 rows x Q8_0 columns, each element bitwise `ggml_vec_dot_q8_0_q8_0_generic`:
         /// out[r*ox + c*oy] = dot(n, x + r*xs, y + c*ys) (strides in bytes).
         pub fn oxe_dot_q8_tile(n: c_int, x: *const u8, xs: i64, nx: c_int, y: *const u8, ys: i64, ny: c_int, out: *mut f32, ox: i64, oy: i64);
@@ -667,7 +709,7 @@ pub fn dequantize_row(ty: QType, src: &[u8], out: &mut [f32]) {
             QType::Q4K => ffi::dequantize_row_q4_K(s, o, kk),
             QType::Q5K => ffi::dequantize_row_q5_K(s, o, kk),
             QType::Q6K => ffi::dequantize_row_q6_K(s, o, kk),
-            QType::Q3K => panic!("Q3_K embedding rows are not supported"),
+            QType::Q3K => ffi::dequantize_row_q3_K(s, o, kk),
         }
     }
 }
@@ -745,3 +787,63 @@ pub mod ops {
 
 #[cfg(test)]
 mod tests;
+
+/// Scalar correctness oracle: native packed expert -> one temporary HMX tile.
+/// No allocation or resident format change. Not a performance implementation.
+pub fn native_expert_tile(ty: QType, src: &[u8], k: usize, rows: usize, experts: usize,
+        expert: usize, row0: usize, k0: usize, out: &mut [u16;1024]) -> Result<(), &'static str> {
+    let kind=match ty {QType::Q3K=>3,QType::Q4K=>4,_=>return Err("native expert type unsupported")};
+    let cv=|n|u32::try_from(n).map_err(|_|"native expert geometry exceeds protocol");
+    let (k,rows,experts,expert,row0,k0)=(cv(k)?,cv(rows)?,cv(experts)?,cv(expert)?,cv(row0)?,cv(k0)?);
+    // SAFETY: source/output slices are disjoint and live; C validates all geometry,
+    // source bounds and fixed tile capacity before indexing either slice.
+    let rc=unsafe{ffi::oxe_native_expert_tile(out.as_mut_ptr(),1024,src.as_ptr(),src.len(),kind,k,rows,experts,expert,row0,k0)};
+    match rc {0=>Ok(()),-2=>Err("non-finite native expert tile"),_=>Err("native expert tile geometry/bounds")}
+}
+
+#[cfg(test)]
+mod native_expert_tests {
+    use super::*;
+    fn source(ty:QType,k:usize,rows:usize,experts:usize,seed:u32)->Vec<u8>{
+        let block=ty.block_bytes();let mut data=vec![0u8;ty.row_bytes(k)*rows*experts];let mut rng=seed;
+        for b in data.chunks_exact_mut(block){
+            for v in b.iter_mut(){rng=rng.wrapping_mul(1664525).wrapping_add(1013904223);*v=(rng>>24)as u8;}
+            let put=|b:&mut[u8],at:usize,h:u16|b[at..at+2].copy_from_slice(&h.to_le_bytes());
+            // finite scales with varied mantissas/exponents, including subnormals
+            let h=if rng&7==0{(rng as u16&0x03ff)|1}else{0x1000|(rng as u16&0x0fff)};
+            if ty==QType::Q3K{put(b,108,h);}else{put(b,0,h);put(b,2,0x0c00|(rng as u16&0x03ff));}
+        }
+        data
+    }
+    #[test]
+    fn native_tiles_equal_original_row_dequantization_for_all_elements(){
+        for ty in [QType::Q3K,QType::Q4K]{for (k,rows,experts,seed) in [(256,32,1,1),(512,64,3,29),(1024,96,2,149)]{
+            let raw=source(ty,k,rows,experts,seed);let mut packed=vec![0u8;raw.len()];
+            repack(ty,&raw,&mut packed,rows*experts,k);
+            let mut reference=vec![0f32;k*rows*experts];
+            for (r,row) in reference.chunks_exact_mut(k).enumerate(){let bytes=ty.row_bytes(k);dequantize_row(ty,&raw[r*bytes..(r+1)*bytes],row);}
+            let mut expected=vec![0u16;reference.len()];f32_to_f16(&reference,&mut expected);
+            for e in 0..experts{for row0 in (0..rows).step_by(32){for k0 in (0..k).step_by(32){
+                let mut tile=[0u16;1024];native_expert_tile(ty,&packed,k,rows,experts,e,row0,k0,&mut tile).unwrap();
+                for n in 0..32{for c in 0..32{
+                    let at=(c/2)*64+2*n+c%2;
+                    assert_eq!(tile[at],expected[(e*rows+row0+n)*k+k0+c],"{ty:?} e{e} row{} k{}",row0+n,k0+c);
+                }}
+            }}}
+        }}
+    }
+    #[test]
+    fn malformed_geometry_refused_without_output_write(){
+        let src=vec![0u8;3520];
+        for (ty,k,rows,experts,e,r,c,len) in [
+            (QType::Q5K,256,32,1,0,0,0,3520),(QType::Q3K,0,32,1,0,0,0,3520),
+            (QType::Q3K,256,31,1,0,0,0,3520),(QType::Q3K,256,32,0,0,0,0,3520),
+            (QType::Q3K,256,32,1,1,0,0,3520),(QType::Q3K,256,32,1,0,1,0,3520),
+            (QType::Q3K,256,32,1,0,0,1,3520),(QType::Q3K,256,32,1,0,32,0,3520),
+            (QType::Q3K,256,32,1,0,0,256,3520),(QType::Q3K,256,32,1,0,0,0,3519),
+            (QType::Q3K,usize::MAX,32,1,0,0,0,3520),
+        ]{
+            let mut out=[0x2a2a;1024];assert!(native_expert_tile(ty,&src[..len],k,rows,experts,e,r,c,&mut out).is_err());assert_eq!(out,[0x2a2a;1024]);
+        }
+    }
+}

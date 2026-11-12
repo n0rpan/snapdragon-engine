@@ -74,6 +74,9 @@ pub struct CacheStats {
     pub park_evictions: u64,
     pub park_ms: f64,
     pub unpark_ms: f64,
+    /// LONG-CTX: sessions parked to the disk session cache (streamed, no RAM copy)
+    pub disk_parks: u64,
+    pub disk_park_ms: f64,
 }
 
 pub struct PrefixCache<S> {
@@ -102,9 +105,18 @@ pub struct PrefixCache<S> {
     /// session cache on disk)
     pub spill: bool,
     pub spilled: Vec<(Vec<u32>, Vec<u8>)>,
+    /// LONG-CTX: a session whose state is at least this many bytes is parked to the disk
+    /// session cache by the worker (streamed, see `Worker::park_large`) instead of copied into
+    /// RAM. 0 = off (every park goes to RAM, as before).
+    pub park_disk_min: usize,
+    /// set by the worker after a disk park: the next `prepare` does not park again
+    pub skip_park_once: bool,
     /// where the last `prepare` found its prefix: none|live|checkpoint|parked|parked-checkpoint
-    /// (the worker overrides it with store|session after a disk load)
+    /// (the worker overrides it with store|session|state after a disk load)
     pub last_src: &'static str,
+    /// CACHE-PERFECT P2: the lowest length `tokens` had since the state store last marked it
+    /// (KV rows below it are unchanged since then; blocks written below it stay valid)
+    pub low_water: usize,
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -151,7 +163,10 @@ impl<S> PrefixCache<S> {
             stats: CacheStats::default(),
             spill: false,
             spilled: Vec::new(),
+            park_disk_min: 0,
+            skip_park_once: false,
             last_src: "none",
+            low_water: 0,
         }
     }
 
@@ -179,11 +194,56 @@ impl<S> PrefixCache<S> {
         self.parked.iter().map(Parked::bytes).sum()
     }
 
+    /// LONG-CTX: the position `prepare(prompt)` would bring the live session back to when it
+    /// parks it (`Some(keep)`), None when it would not park (no parking budget, the live state is a
+    /// prefix of the prompt, or too few prompt tokens would be lost). Pure: same decision as
+    /// [`PrefixCache::prepare`].
+    pub fn park_keep(&self, prompt: &[u32]) -> Option<usize> {
+        if self.park_budget == 0 || prompt.is_empty() || self.skip_park_once {
+            return None;
+        }
+        let lim = prompt.len() - 1;
+        let limit = common_prefix(&self.tokens, prompt).min(lim);
+        if limit == self.tokens.len() {
+            return None;
+        }
+        let live = deepest(&self.snaps, limit);
+        let parked_best = self
+            .parked
+            .iter()
+            .map(|p| {
+                let l = common_prefix(&p.tokens, prompt).min(lim);
+                if l == p.tokens.len() { l } else { deepest(&p.snaps, l) }
+            })
+            .max()
+            .unwrap_or(0);
+        let keep = if parked_best > live { 0 } else { live };
+        (self.prompt_len >= keep + self.park_min.max(1)).then_some(keep)
+    }
+
+    /// LONG-CTX disk park: take the live checkpoints above `keep` (they belong to the session
+    /// being dropped) as (position, snapshot), the ones worth persisting first (see
+    /// `persist_points`), at most `max`. The rest are dropped.
+    pub fn take_points_above(&mut self, keep: usize, max: usize) -> Vec<(usize, S)> {
+        let (stay, go): (Vec<_>, Vec<_>) = std::mem::take(&mut self.snaps).into_iter().partition(|s| s.pos <= keep);
+        self.snaps = stay;
+        let mut v = persist_points(go, self.tokens.len());
+        v.truncate(max);
+        v
+    }
+
+    /// Go back to the live checkpoint at `pos` (public [`PrefixCache::restore_live`]).
+    pub fn rewind_to<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, pos: usize) -> Result<usize> {
+        self.restore_live(eng, pos)
+    }
+
     /// Bring the engine to the longest reusable prefix of `prompt`; returns the number of
     /// prompt tokens already in the state (`n_cached`). `use_cache=false` starts from scratch.
     pub fn prepare<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, prompt: &[u32], use_cache: bool) -> Result<usize> {
         self.clock += 1;
         self.last_src = "none";
+        // one prepare after a disk park (the worker already saved the session)
+        let skip_park = std::mem::take(&mut self.skip_park_once);
         if !use_cache || prompt.is_empty() {
             self.reset(eng);
             return Ok(0);
@@ -210,7 +270,9 @@ impl<S> PrefixCache<S> {
         // take the parked session out first: parking the live one may evict others
         let from_parked = best_parked.filter(|b| b.1 > live).map(|(i, pos)| (self.parked.remove(i), pos));
         // keep the session this request would drop, if it is worth it
-        self.park(eng, if from_parked.is_some() { 0 } else { live })?;
+        if !skip_park {
+            self.park(eng, if from_parked.is_some() { 0 } else { live })?;
+        }
         if let Some((p, pos)) = from_parked {
             let full = pos == p.tokens.len();
             let n = self.unpark(eng, p, pos)?;
@@ -234,6 +296,7 @@ impl<S> PrefixCache<S> {
         eng.restore(&s.s)?;
         self.clean = s.clean;
         self.tokens.truncate(pos);
+        self.low_water = self.low_water.min(pos);
         self.prompt_len = self.prompt_len.min(pos);
         // the next write goes to `pos`: checkpoints past it become invalid
         self.snaps.retain(|s| s.pos <= pos);
@@ -245,6 +308,12 @@ impl<S> PrefixCache<S> {
     /// is shared), the others move with the parked state.
     fn park<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, keep: usize) -> Result<()> {
         if self.park_budget == 0 || self.prompt_len < keep + self.park_min.max(1) {
+            return Ok(());
+        }
+        // LONG-CTX: a state that cannot fit the budget is not copied at all (it used to be built,
+        // then dropped: a transient full-state copy, 2.75 GiB at 128K f16)
+        let hint = eng.state_size_hint();
+        if hint > self.park_budget {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
@@ -292,6 +361,7 @@ impl<S> PrefixCache<S> {
             return Ok(0);
         }
         self.snaps.clear();
+        self.low_water = 0;
         self.tokens = p.tokens.clone();
         self.prompt_len = p.prompt_len;
         self.clean = p.clean;
@@ -318,6 +388,13 @@ impl<S> PrefixCache<S> {
 
     /// Take every parked session out for the session cache: (tokens, state bytes, the
     /// checkpoints worth persisting, deepest first; see [`persist_points`]).
+    /// Drop the parked sessions whose tokens match `f` (session clear); returns how many.
+    pub fn drop_parked_where(&mut self, f: &dyn Fn(&[u32]) -> bool) -> usize {
+        let before = self.parked.len();
+        self.parked.retain(|p| !f(&p.tokens));
+        before - self.parked.len()
+    }
+
     pub fn drain_parked(&mut self) -> Vec<(Vec<u32>, Vec<u8>, Vec<(usize, S)>)> {
         std::mem::take(&mut self.parked)
             .into_iter()
@@ -337,6 +414,7 @@ impl<S> PrefixCache<S> {
     pub fn reset<E: Engine<Snapshot = S>>(&mut self, eng: &mut E) {
         eng.reset();
         self.tokens.clear();
+        self.low_water = 0;
         self.snaps.clear();
         self.clean = true;
         self.prompt_len = 0;
@@ -345,11 +423,17 @@ impl<S> PrefixCache<S> {
     /// The engine state was replaced wholesale (a prefix-store load): it now holds `tokens`,
     /// computed elsewhere, so no in-memory checkpoint matches its KV any more.
     pub fn adopt(&mut self, tokens: &[u32], clean: bool) {
+        self.low_water = 0;
         self.tokens.clear();
         self.tokens.extend_from_slice(tokens);
         self.snaps.clear();
         self.clean = clean;
         self.prompt_len = tokens.len();
+    }
+
+    /// (position, priority, clean, snapshot) of every live checkpoint (the state store persists them).
+    pub fn checkpoints(&self) -> Vec<(usize, u8, bool, &S)> {
+        self.snaps.iter().map(|s| (s.pos, s.prio, s.clean, &s.s)).collect()
     }
 
     /// Record tokens that were just appended to the engine state.

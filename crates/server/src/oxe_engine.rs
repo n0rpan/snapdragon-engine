@@ -40,6 +40,8 @@ pub struct OxeEngine {
     /// tokens committed by the last lookup verify (for spec_rewind), and (drafted, accepted)
     lookup_last: Option<usize>,
     lookup_counts: (u64, u64),
+    #[cfg(feature="npu-prefill")]
+    npu_prefill_identity:Option<String>,
 }
 
 /// Per-model MTP default when no --spec-type flag is given (M3.1 speed results, Codex
@@ -80,9 +82,63 @@ pub fn mtp_head_path(model: &Path, explicit: Option<&Path>) -> Option<std::path:
 
 pub struct OxeSnapshot {
     rec: RecurrentSnapshot,
-    /// target h_nextn of position pos-1 (MTP draft input)
-    h: Option<Vec<f32>>,
+    /// MTP driver state at the snapshot position (CACHE-PERFECT P2b, G3): q, the pending catch-up
+    /// pairs (tokens + target h rows) and the target h_nextn of position pos-1 (the draft input).
+    /// A restore imports it exactly, so a resumed MTP run has the uninterrupted run's draft state.
+    mtp: Option<MtpState>,
 }
+
+/// [`MtpDriver::export_state`]: (q, catch-up tokens, their h rows, h_prev).
+pub struct MtpState {
+    q: usize,
+    cu_tok: Vec<u32>,
+    cu_h: Vec<f32>,
+    hl: Vec<f32>,
+}
+
+impl MtpState {
+    fn of(d: &MtpDriver) -> MtpState {
+        let (q, cu_tok, cu_h, hl) = d.export_state();
+        MtpState { q, cu_tok, cu_h, hl }
+    }
+    fn bytes(&self) -> usize {
+        4 * (self.cu_tok.len() + self.cu_h.len() + self.hl.len()) + 8
+    }
+    /// snapshot file part: u64 q, u64 n, n u32 tokens, n*ne f32 h rows, ne f32 h_prev (LE)
+    fn write(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        w.write_all(&(self.q as u64).to_le_bytes())?;
+        w.write_all(&(self.cu_tok.len() as u64).to_le_bytes())?;
+        for t in &self.cu_tok {
+            w.write_all(&t.to_le_bytes())?;
+        }
+        for x in self.cu_h.iter().chain(&self.hl) {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        Ok(())
+    }
+    fn read(r: &mut dyn std::io::Read, ne: usize, n_pos: usize) -> std::io::Result<MtpState> {
+        let mut u = [0u8; 8];
+        r.read_exact(&mut u)?;
+        let q = u64::from_le_bytes(u) as usize;
+        r.read_exact(&mut u)?;
+        let n = u64::from_le_bytes(u) as usize;
+        // the catch-up queue is a few positions (the MTP lanes); q + n is the snapshot position
+        if n > 4096 || q.checked_add(n) != Some(n_pos) {
+            return Err(std::io::Error::other("MTP state does not match the snapshot position"));
+        }
+        let mut b = vec![0u8; n * 4 + (n + 1) * ne * 4];
+        r.read_exact(&mut b)?;
+        let cu_tok = b[..n * 4].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let f: Vec<f32> = b[n * 4..].chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let (h, hl) = f.split_at(n * ne);
+        Ok(MtpState { q, cu_tok, cu_h: h.to_vec(), hl: hl.to_vec() })
+    }
+}
+
+/// Snapshot file tag after the recurrent part: no MTP / MTP driver state v2 (q + catch-up + h_prev).
+/// (Tag 1, P2's h_prev only, is refused: the state store's format version moved with it.)
+const SNAP_NO_MTP: u8 = 0;
+const SNAP_MTP_V2: u8 = 2;
 
 impl OxeEngine {
     /// Load `model` (building the weight cache on first use) for decode on `cpus`.
@@ -104,6 +160,12 @@ impl OxeEngine {
     /// As [`OxeEngine::open_full`], with the MTP block read from `head` (a sidecar GGUF) instead of
     /// the model file. `OXE_MTP_FROM` overrides both (experiments).
     pub fn open_head(model: &Path, head: Option<&Path>, cpus: &[usize], prefill_cpus: Option<&[usize]>, ubatch: usize, n_ctx: usize, depth: usize) -> std::result::Result<OxeEngine, String> {
+        Self::open_cache(model, head, cpus, prefill_cpus, ubatch, n_ctx, depth, None)
+    }
+
+    /// As [`OxeEngine::open_head`] with the weight cache in `cache_dir` (tests: never the user's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_cache(model: &Path, head: Option<&Path>, cpus: &[usize], prefill_cpus: Option<&[usize]>, ubatch: usize, n_ctx: usize, depth: usize, cache_dir: Option<std::path::PathBuf>) -> std::result::Result<OxeEngine, String> {
         // OXE_WEIGHTS=anon (--oxe-weights anon): chunked copy into a THP-advised anonymous arena;
         // OXE_MLOCK=1 (--mlock): lock the arena, or fail to start
         let backing = match std::env::var("OXE_WEIGHTS").as_deref() {
@@ -111,7 +173,7 @@ impl OxeEngine {
             Ok("file") | Err(_) => model::weights::Backing::File,
             Ok(x) => return Err(format!("--oxe-weights {x}: file|anon")),
         };
-        let opt = LoadOptions { threads: cpus.len().max(1), backing, mlock: std::env::var_os("OXE_MLOCK").is_some(), ..LoadOptions::default() };
+        let opt = LoadOptions { threads: cpus.len().max(1), backing, mlock: std::env::var_os("OXE_MLOCK").is_some(), progress: cache_dir.is_none(), cache_dir, ..LoadOptions::default() };
         let (plan, ws) = model::load::open_static(model, cpus.len(), n_ctx, &opt)?;
         // OXE_IDLE_SPIN_US (diagnostic): how long idle decode workers spin before sleeping
         // (default 200 us, as `oxe bench`); between tokens the server's own work decides
@@ -158,8 +220,36 @@ impl OxeEngine {
                 None => (Core::new(plan, ws, cfg)?, None),
             }
         };
-        Ok(OxeEngine { n_vocab: plan.desc.n_vocab, eng, pool, prefill_pool, ubatch: ubatch.max(1), mtp, mtp_id, mtp_max_depth: depth, lookup_last: None, lookup_counts: (0, 0) })
+        Ok(OxeEngine { n_vocab: plan.desc.n_vocab, eng, pool, prefill_pool, ubatch: ubatch.max(1), mtp, mtp_id, mtp_max_depth: depth, lookup_last: None, lookup_counts: (0, 0),
+            #[cfg(feature="npu-prefill")] npu_prefill_identity:None,
+        })
     }
+    /// Guarded W2 experiment only, explicit CLI opt-in; never auto-enabled by env.
+    #[cfg(feature="npu-prefill")]
+    pub fn enable_npu_prefill(&mut self,model:&Path,mode:&str,go:Option<&Path>,pack_cpus:&[usize])->std::result::Result<(),String>{
+        if self.mtp.is_some(){return Err("W2 initial proof requires --spec-type none".into());}
+        if !["device","emu"].contains(&mode){return Err("--oxe-npu-prefill device|emu".into());}
+        let g=gguf::Gguf::open(model).map_err(|e|e.to_string())?;
+        let dir=model::weights::cache_dir(None)?;
+        let sha=model::weights::model_sha256_opt(model,&dir,false)?;
+        for t in &g.header.tensors{g.release_range(t,0,t.bytes()as usize);g.drop_cache(t);}
+        let backend:Box<dyn oxn::Backend>=if mode=="emu"{Box::new(oxn::emu::Emu::new(8<<20,1))}else{
+            let go=go.ok_or("W2 device proof requires --oxe-npu-go-file guard handshake")?;
+            eprintln!("oxe-server: ready_before_device pid={}",std::process::id());
+            let deadline=std::time::Instant::now()+Duration::from_secs(30);
+            while !go.is_file(){if std::time::Instant::now()>deadline{return Err("NPU guard handshake timeout; device unopened".into());}std::thread::sleep(Duration::from_millis(20));}
+            #[cfg(feature="npu-device")]{Box::new(oxn::device::Device::open(1)?)}
+            #[cfg(not(feature="npu-device"))]{return Err("build with npu-device".into());}
+        };
+        let stats=self.eng.enable_npu_prefill(&g,&sha,backend,model::npu_prefill::Config::default(),pack_cpus)?;
+        self.npu_prefill_identity=Some(format!("fp16-v2-rec-{}-mask{:016x}-rows32-1024",stats.recurrent_mode,stats.recurrent_mask));
+        self.log_npu_prefill();Ok(())
+    }
+    #[cfg(feature="npu-prefill")]
+    fn log_npu_prefill(&self){
+        if let Some(s)=self.eng.npu_prefill_stats(){eprintln!("oxe-server: npu-prefill {}",serde_json::json!({"prepared":s.prepared,"calls":s.calls,"rows":s.rows,"reserved_dma_bytes":s.reserved_dma_bytes,"first_error":s.first_error}));}
+    }
+
 }
 
 /// `OXE_SMALL_PREFILL=N` (default 0 = off): prompt segments of at most N tokens run on the decode
@@ -185,6 +275,20 @@ fn team_for<'a>(prefill_pool: &'a Option<DetachedPool>, pool: &'a DetachedPool, 
 impl OxeEngine {
     /// The MTP head identity used in the session identity ("true" for the model's own head,
     /// "head:<weight cache name>" for a sidecar), None without MTP.
+    /// LONG-CTX: the context-dependent memory of the engine (KV, recurrent slots, scratch).
+    pub fn ctx_mem(&self) -> model::engine::CtxMem {
+        self.eng.ctx_mem()
+    }
+    /// The MTP driver after a recurrent restore: the snapshot's exact driver state (G3); a
+    /// snapshot without one (or that does not fit) only re-syncs (drafts only, output unchanged).
+    fn restore_mtp(&mut self, m: Option<&MtpState>) {
+        let Some(d) = &mut self.mtp else { return };
+        match m {
+            Some(m) if d.import_state(&self.eng, m.q, m.cu_tok.clone(), m.cu_h.clone(), &m.hl).is_ok() => {}
+            Some(m) => d.sync(&self.eng, Some(&m.hl)),
+            None => d.sync(&self.eng, None),
+        }
+    }
     pub fn mtp_identity(&self) -> Option<&str> {
         self.mtp_id.as_deref()
     }
@@ -201,6 +305,13 @@ impl Engine for OxeEngine {
     }
     fn n_past(&self) -> usize {
         self.eng.pos()
+    }
+    #[cfg(feature="npu-prefill")]
+    fn release_accelerators(&mut self){
+        if let Some(s)=self.eng.npu_prefill_stats(){
+            self.eng.release_npu_prefill();
+            eprintln!("oxe-server: npu-prefill released reserved_dma_bytes={}",s.reserved_dma_bytes);
+        }
     }
     fn reset(&mut self) {
         self.eng.reset();
@@ -235,6 +346,7 @@ impl Engine for OxeEngine {
                 self.eng.prefill(team, tokens, self.ubatch);
             }
         }
+        #[cfg(feature="npu-prefill")] self.log_npu_prefill();
         Ok(self.eng.logits())
     }
     /// MAGIC-PLAN MP-5: with `OXE_PREFILL_QUIET=1` a multi-token segment whose logits are not read
@@ -253,23 +365,15 @@ impl Engine for OxeEngine {
         }
         let team = team_for(&self.prefill_pool, &self.pool, tokens.len());
         self.eng.prefill_state_only(team, tokens, self.ubatch);
+        #[cfg(feature="npu-prefill")] self.log_npu_prefill();
         Ok(())
     }
     fn snapshot(&mut self) -> Result<OxeSnapshot> {
-        Ok(OxeSnapshot { rec: self.eng.save_recurrent(), h: self.mtp.as_ref().map(|d| d.h_prev().to_vec()) })
+        Ok(OxeSnapshot { rec: self.eng.save_recurrent(), mtp: self.mtp.as_ref().map(MtpState::of) })
     }
     fn snapshot_reuse(&mut self, old: OxeSnapshot) -> Result<OxeSnapshot> {
         let rec = self.eng.save_recurrent_into(old.rec);
-        let h = match (self.mtp.as_ref(), old.h) {
-            (Some(d), Some(mut v)) => {
-                v.clear();
-                v.extend_from_slice(d.h_prev());
-                Some(v)
-            }
-            (Some(d), None) => Some(d.h_prev().to_vec()),
-            (None, _) => None,
-        };
-        Ok(OxeSnapshot { rec, h })
+        Ok(OxeSnapshot { rec, mtp: self.mtp.as_ref().map(MtpState::of) })
     }
     fn state_size_hint(&self) -> usize {
         // + MTP rows when on (h per position): a hint only
@@ -280,17 +384,73 @@ impl Engine for OxeEngine {
             return Err(EngineError("restore of a snapshot ahead of the current position".into()));
         }
         self.eng.restore_recurrent(&s.rec);
-        if let Some(d) = &mut self.mtp {
-            d.sync(&self.eng, s.h.as_deref());
-        }
+        self.restore_mtp(s.mtp.as_ref());
         Ok(())
     }
     fn snapshot_bytes(s: &OxeSnapshot) -> usize {
-        s.rec.bytes() + 4 * s.h.as_ref().map_or(0, Vec::len)
+        s.rec.bytes() + s.mtp.as_ref().map_or(0, MtpState::bytes)
     }
     fn state_id(&self) -> Option<String> {
+        #[cfg(feature="npu-prefill")]
+        if let Some(id)=&self.npu_prefill_identity{return Some(format!("oxe-state-v1 {} mtp={} npu-prefill={id}",self.eng.state_layout(),self.mtp_id.as_deref().unwrap_or("false")));}
         // the MTP KV depends on which head wrote it: its weight cache name carries the source sha
         Some(format!("oxe-state-v1 {} mtp={}", self.eng.state_layout(), self.mtp_id.as_deref().unwrap_or("false")))
+    }
+    fn kv_row_bytes(&self) -> usize {
+        self.eng.kv_row_bytes()
+    }
+    fn kv_rows_save(&mut self, a: usize, b: usize, w: &mut dyn std::io::Write) -> Result<()> {
+        self.eng.write_kv_rows(a, b, w).map_err(|e| EngineError(format!("save kv rows: {e}")))
+    }
+    fn kv_rows_load(&mut self, a: usize, b: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        self.eng.read_kv_rows(a, b, r).map_err(|e| EngineError(format!("load kv rows: {e}")))
+    }
+    fn snap_save(&mut self, s: &OxeSnapshot, w: &mut dyn std::io::Write) -> Result<()> {
+        let e = |e: std::io::Error| EngineError(format!("save snapshot: {e}"));
+        s.rec.write_to(w).map_err(e)?;
+        match &s.mtp {
+            Some(m) => {
+                w.write_all(&[SNAP_MTP_V2]).map_err(e)?;
+                m.write(w).map_err(e)
+            }
+            None => w.write_all(&[SNAP_NO_MTP]).map_err(e),
+        }
+    }
+    fn snap_save_live(&mut self, w: &mut dyn std::io::Write) -> Result<()> {
+        // straight from the live buffers: no 63 MiB snapshot copy (shutdown memory floor, M2)
+        let e = |e: std::io::Error| EngineError(format!("save snapshot: {e}"));
+        self.eng.write_recurrent(w).map_err(e)?;
+        match &self.mtp {
+            Some(d) => {
+                w.write_all(&[SNAP_MTP_V2]).map_err(e)?;
+                MtpState::of(d).write(w).map_err(e)
+            }
+            None => w.write_all(&[SNAP_NO_MTP]).map_err(e),
+        }
+    }
+    fn snap_load(&mut self, r: &mut dyn std::io::Read, n_pos: usize) -> Result<()> {
+        let e = |e: std::io::Error| EngineError(format!("load snapshot: {e}"));
+        let rec = model::engine::RecurrentSnapshot::read_from(r, self.eng.recurrent_lens()).map_err(e)?;
+        if rec.pos != n_pos {
+            return Err(EngineError("load snapshot: position does not match its rows".into()));
+        }
+        let mut b1 = [0u8; 1];
+        r.read_exact(&mut b1).map_err(e)?;
+        let mtp = match (b1[0], self.mtp.is_some()) {
+            (SNAP_NO_MTP, false) => None,
+            (SNAP_MTP_V2, true) => Some(MtpState::read(r, self.eng.plan.desc.n_embd, n_pos).map_err(e)?),
+            _ => return Err(EngineError("load snapshot: MTP state does not match this engine".into())),
+        };
+        self.eng.restore_recurrent(&rec);
+        self.restore_mtp(mtp.as_ref());
+        Ok(())
+    }
+    fn arith_id(&self) -> String {
+        // every env knob that selects an arithmetic path (attention, prefill tiling / grouping,
+        // fused kernels, padding): a superset of the effective mode, so a cache made under one
+        // path is never read under another (lossless knobs only cost hits)
+        // plus the kernel path (target, CPU features, libm): P2 review
+        format!("{} {}", crate::state_store::arith_env(), crate::state_store::kernel_path())
     }
     fn save_state(&mut self, w: &mut dyn std::io::Write) -> Result<()> {
         let e = |e: std::io::Error| EngineError(format!("save state: {e}"));
@@ -433,5 +593,26 @@ impl Engine for OxeEngine {
             return self.lookup_counts;
         }
         self.mtp.as_ref().map(|d| (d.stats.drafted, d.stats.accepted)).unwrap_or((0, 0))
+    }
+}
+
+#[cfg(all(test,feature="npu-prefill"))]
+mod npu_tests{
+    use super::*;
+    #[test]
+    #[ignore="requires an explicitly generated synthetic mini GGUF; no real model or NPU"]
+    fn mini_npu_emu_state_identity_and_teardown(){
+        let path=std::path::PathBuf::from(std::env::var("OXE_NPU_TEST_GGUF").expect("synthetic mini GGUF required"));
+        std::env::remove_var("OXE_MODEL_SHA256");
+        let mut e=OxeEngine::open_with(&path,&[0,1],None,64,512).unwrap();
+        let cpu_identity=e.state_id().unwrap();
+        e.enable_npu_prefill(&path,"emu",None,&[0,1]).unwrap();
+        let npu_identity=e.state_id().unwrap();assert_ne!(npu_identity,cpu_identity);
+        let tokens:Vec<u32>=(0..32).map(|i|i%64).collect();
+        assert!(e.prefill(&tokens).unwrap().iter().all(|v|v.is_finite()));
+        let calls=e.eng.npu_prefill_stats().unwrap().calls;assert!(calls>0);
+        e.prefill(&[3]).unwrap();assert_eq!(e.eng.npu_prefill_stats().unwrap().calls,calls);
+        e.release_accelerators();assert!(e.eng.npu_prefill_stats().is_none());
+        assert_eq!(e.state_id().unwrap(),npu_identity,"release must not relabel past NPU state as CPU");
     }
 }

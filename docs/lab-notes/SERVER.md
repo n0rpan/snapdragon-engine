@@ -1,5 +1,7 @@
 # oxe-server
 
+> **Historical.** This is the early oxe-server integration plan and status note. It is kept for the record. Its opening status ("the model is still a stub") is out of date: the production engine is wired. For how to run the server, see the [README](../../README.md).
+
 An OpenAI-compatible HTTP server shaped like llama-server, so the controller, OpenCode and
 dsh can talk to the Rust engine without changes. It is the M4b "standalone" route from
 `M3-M4-PLAN.md`, built early so it is ready when the engine is.

@@ -9,6 +9,12 @@ For each target model it records, from model_inspect.py (the reference):
   - the full tensor table from its built-in parser (name, type, shape, offset, bytes),
   - the qwen35moe scalar metadata.
 Only the file basename is stored, never the absolute path. Header-only: no tensor data is read.
+
+Where model_inspect.py is (N4, audit): it is not in either repository's main. The committed
+fixtures were made with the lab repository's commit fea4c56 (branch claude/model-onboarding);
+extract exactly that version to regenerate them:
+  git -C <lab checkout> show fea4c56:tools/model_inspect.py > /tmp/model_inspect.py
+  python3 tools/gen_fixtures.py /tmp/model_inspect.py
 """
 import importlib.util
 import json
@@ -18,7 +24,9 @@ import sys
 from pathlib import Path
 
 HOME = Path.home()
-INSPECT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ['MODEL_INSPECT'])  # the lab repository's tools/model_inspect.py
+if len(sys.argv) < 2 and not os.environ.get('MODEL_INSPECT'):
+    sys.exit('gen_fixtures: pass the path of model_inspect.py (or set MODEL_INSPECT); see the docstring for where it is')
+INSPECT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ['MODEL_INSPECT'])  # lab fea4c56:tools/model_inspect.py
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parent.parent / 'tests/fixtures'
 MODELS = {
     'ornith': HOME / '.local/share/ai-stack/models/llm/Ornith-1.5-35B-A3B-APEX-MTP-Compact.gguf',

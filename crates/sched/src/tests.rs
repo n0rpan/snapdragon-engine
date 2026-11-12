@@ -205,6 +205,10 @@ fn concurrent_run_is_refused() {
 #[test]
 fn panic_child() {
     let Ok(who) = std::env::var("OXE_SCHED_PANIC_CHILD") else { return };
+    // This child aborts on purpose: keep the SIGABRT but never write a core dump
+    // (a dump per CI run shows up as a "process crashed" notification on dev machines).
+    let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
     let pool = Pool::new(&test_cpus(3), Duration::from_millis(1)).unwrap();
     let victim = if who == "caller" { 0 } else { 1 };
     pool.run(|c| {

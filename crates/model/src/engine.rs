@@ -37,11 +37,55 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 
+pub mod fattn;
 mod kv8;
 mod prefill;
 pub use kv8::{KvType, PvMode};
 use kv8::Kv8Scratch;
 pub use prefill::{group_by_size, pf_group, pf_group_for, pf_group_unaligned, set_pf_group_unaligned, pf_group_thresholds, pf_tiles, set_pf_group_thresholds, PF_GROUP_T1_DEFAULT, PF_TILES_DEFAULT, prefill_rows_hist, reset_prefill_rows_hist, set_pf_group, set_pf_tiles, PfProfile, PF_ATTN_PAD, PF_ATTN_PB, PF_ATTN_TT8, PF_CONV_FUSE, PF_DYN_SPLIT, PF_F32_CU8, PF_GDN_X4, PF_MMID_GEMV1, PF_MMID_TILE, PF_PHASES, PF_Q6K_TILE, PF_SUBS, PF_TILE_DENSE, PF_WAIT_DIET, UBATCH};
+
+/// CACHE-PERFECT P2: the numerics epoch in the state cache's identity (server `state_store`).
+/// Bump by hand whenever the engine's numerics change (any kernel, accumulation order, rounding
+/// or default arithmetic path): every state cache of the previous epoch is then orphaned. The
+/// golden-state test `tests::longctx::numerics_epoch_golden_state` reads this constant and fails
+/// when the state changes without a bump (or after a bump without a new golden).
+pub const NUMERICS_EPOCH: u32 = 1;
+
+/// The kernel path this process computes on (P2 review): target, the CPU features the kernels
+/// are built for and the machine has, and a probe of the C library's math functions (the golden
+/// state differs per platform: toolchain, features and libm all reach the state bytes). In the
+/// identity, so a state made on one path is never read on another (a copied cache directory,
+/// another build target, a libm update).
+pub fn kernel_path() -> String {
+    #[cfg(target_arch = "aarch64")]
+    let feats = {
+        let mut f = Vec::new();
+        for (name, on) in [
+            ("dotprod", std::arch::is_aarch64_feature_detected!("dotprod")),
+            ("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")),
+            ("fp16", std::arch::is_aarch64_feature_detected!("fp16")),
+            ("bf16", std::arch::is_aarch64_feature_detected!("bf16")),
+            ("sve", std::arch::is_aarch64_feature_detected!("sve")),
+        ] {
+            if on {
+                f.push(name);
+            }
+        }
+        f.join("+")
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let feats = String::new();
+    let built: Vec<&str> = [("i8mm", cfg!(target_feature = "i8mm")), ("dotprod", cfg!(target_feature = "dotprod")), ("sve", cfg!(target_feature = "sve"))].iter().filter(|x| x.1).map(|x| x.0).collect();
+    // libm probe: bits of exp / ln / tanh / powf / sin over fixed inputs (black_box: no constant folding)
+    let mut h = crate::check::Check64::default();
+    for i in 0..64u32 {
+        let x = std::hint::black_box(0.037f32 * i as f32 - 1.1);
+        for y in [x.exp(), (x.abs() + 0.5).ln(), x.tanh(), (x.abs() + 0.25).powf(1.7), x.sin(), (x as f64).exp() as f32] {
+            h.update(&y.to_bits().to_le_bytes());
+        }
+    }
+    format!("kpath={}-{} cpu=[{feats}] built=[{}] libm={:016x}", std::env::consts::ARCH, std::env::consts::OS, built.join("+"), h.finish())
+}
 
 /// Default decode cutoff for the tiled attention (padded n_kv); below it the per-head path
 /// (fewer barriers) is faster at short context. Codex: Qwen3.6 1K decode -12 % tiled.
@@ -240,6 +284,8 @@ struct ThreadState {
     kq8: Vec<u8>,
     kv8s: Kv8Scratch,
     kv8acc: Vec<f32>,
+    /// O-70 fused attention scratch (grown on first use; lane 0's only)
+    fa: fattn::FaScratch,
     /// generic GEMV output scratch
     tmp: Vec<f32>,
     g: Vec<f32>,
@@ -325,10 +371,11 @@ struct Run<'r> {
 /// lines of f32), so the group's score / probability columns no longer alias one L1 set.
 pub const DEC_ATT_PAD: usize = 208;
 
-/// Test reference of one query head's attention: q (f32, roped), K / V of positions [0, n) as
-/// f32 [position][dim], scale; writes the head_dim outputs (before the sigmoid gate).
-#[cfg(test)]
-pub(crate) type AttnRef = fn(q: &[f32], k: &[f32], v: &[f32], n: usize, hd: usize, scale: f32, out: &mut [f32]);
+/// Test / bench reference of one query head's attention: q (f32, roped), K / V of positions
+/// [0, n) as f32 [position][dim], scale; writes the head_dim outputs (before the sigmoid gate).
+/// Compiled only for tests and the bench-only `f32-reference` feature (never production).
+#[cfg(any(test, feature = "f32-reference"))]
+pub type AttnRef = fn(q: &[f32], k: &[f32], v: &[f32], n: usize, hd: usize, scale: f32, out: &mut [f32]);
 
 pub struct Engine<'a> {
     pub plan: &'a Plan,
@@ -382,10 +429,24 @@ pub struct Engine<'a> {
     /// fused int8 V: per (KV head, 256-position chunk) partial outputs [col][dim], reduced in
     /// chunk order after a barrier (thread-count invariant)
     vpart: Raw<f32>,
+    /// O-70 fused decode / verify attention (f16 KV only; `OXE_ATTN=fused`, default off): per
+    /// (KV head, chunk) partial outputs and (max, sum) pairs, see [`fattn`]
+    attn_fused: bool,
+    attn_fused_ch: usize,
+    fpart: Raw<f32>,
+    fml: Raw<f32>,
     /// test hook: int8 decode attention through the straightforward f32 reference
-    #[cfg(test)]
+    #[cfg(any(test, feature = "f32-reference"))]
     attn_ref: Option<AttnRef>,
-    /// Tiled attention (M3-ATTN.md), columns in [kv head][lane][query head in group] order:
+    /// bench / tests: after each tiled or fused attention core, compare this thread's gated
+    /// outputs with the f32-attention reference over the same q / stored KV (sum of squared
+    /// errors, sum of squared reference values; `oxe fused-ref`'s attention-level check)
+    #[cfg(any(test, feature = "f32-reference"))]
+    attn_check: Option<Mutex<(f64, f64)>>,
+    /// tests: scale the fused attention output by (1 + this) (a deliberately degraded fused path)
+    #[cfg(test)]
+    fused_degrade: f32,
+    /// Tiled attention (docs/lab-notes/M3-ATTN.md), columns in [kv head][lane][query head in group] order:
     /// f16 q (col * head_dim), sigmoid gate (col * head_dim), scores and f16 probabilities
     /// (col * n_ctx).
     aq16: Raw<u16>,
@@ -433,6 +494,10 @@ pub struct Engine<'a> {
     /// prefill scratch: slot 0 for the decode team's thread count, slot 1 for any other team (the
     /// larger prefill team), so small turns on the decode team do not rebuild the big scratch
     pf: [Mutex<Option<Box<prefill::Pf>>>; 2],
+    #[cfg(feature = "npu-prefill")]
+    npu_prefill: Option<crate::npu_prefill::Prefill>,
+    #[cfg(feature="f32-reference")]
+    f32_reference: Option<crate::f32_reference::Reference>,
 }
 
 // SAFETY: see the module-level ownership invariants; ThreadState cells are per-thread.
@@ -464,6 +529,38 @@ pub struct RecurrentSnapshot {
 impl RecurrentSnapshot {
     pub fn bytes(&self) -> usize {
         4 * (self.conv.len() + self.ssm.len())
+    }
+
+    /// CACHE-PERFECT P2 snapshot file: u64 pos, u64 conv len, u64 ssm len, conv f32, ssm f32 (LE).
+    pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        for x in [self.pos, self.conv.len(), self.ssm.len()] {
+            w.write_all(&(x as u64).to_le_bytes())?;
+        }
+        for v in [&self.conv, &self.ssm] {
+            // SAFETY: f32 slice viewed as bytes (little-endian target).
+            w.write_all(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) })?;
+        }
+        Ok(())
+    }
+
+    /// Read [`RecurrentSnapshot::write_to`]; the lengths must be this engine's (`want`: conv, ssm).
+    pub fn read_from(r: &mut dyn std::io::Read, want: (usize, usize)) -> std::io::Result<RecurrentSnapshot> {
+        let mut u = [0u8; 8];
+        let mut get = |r: &mut dyn std::io::Read| -> std::io::Result<usize> {
+            r.read_exact(&mut u)?;
+            Ok(u64::from_le_bytes(u) as usize)
+        };
+        let (pos, nc, ns) = (get(r)?, get(r)?, get(r)?);
+        if (nc, ns) != want {
+            return Err(std::io::Error::other("snapshot of another recurrent layout"));
+        }
+        let mut conv = vec![0f32; nc];
+        let mut ssm = vec![0f32; ns];
+        for v in [&mut conv, &mut ssm] {
+            // SAFETY: f32 slice viewed as bytes.
+            r.read_exact(unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) })?;
+        }
+        Ok(RecurrentSnapshot { pos, conv, ssm })
     }
 }
 
@@ -533,6 +630,94 @@ pub fn padded_n_kv(pos: usize, n_ctx: usize) -> usize {
     n_ctx.min(256usize.max((pos + 1).div_ceil(256) * 256))
 }
 
+/// LONG-CTX: the context capacity (positions) an engine allocates for a requested `n_ctx`.
+/// At least 1 position; at most the model's trained context (GGUF `context_length`,
+/// `n_ctx_train`; oxe has no rope scaling / YaRN, so positions beyond it are out of
+/// distribution); rounded up to a multiple of 256 (attention tiles, int8 V chunks; the rounding
+/// may pad a few positions past `n_ctx_train`, which the caller never fills beyond `n_ctx`).
+/// Every context-sized buffer (K / V caches, decode scores, prefill scratch, int8 partials) is
+/// sized from the returned value, so this is the one bound on context length in the engine.
+pub fn validate_n_ctx(n_ctx: usize, n_ctx_train: usize) -> Result<usize, String> {
+    if n_ctx == 0 {
+        return Err("n_ctx 0: the context needs at least one position".into());
+    }
+    if n_ctx_train > 0 && n_ctx > n_ctx_train {
+        return Err(format!(
+            "n_ctx {n_ctx} exceeds the model's trained context {n_ctx_train} (GGUF context_length; oxe has no rope scaling)"
+        ));
+    }
+    // the C kernels take positions and per-layer row offsets as i32 (n_kv, rows): stay far below
+    if n_ctx > MAX_N_CTX {
+        return Err(format!("n_ctx {n_ctx} > the engine limit {MAX_N_CTX}"));
+    }
+    Ok(n_ctx.div_ceil(256) * 256)
+}
+
+/// Hard engine bound on n_ctx (the i32 position / n_kv arguments of the kernels; 4x the 256K
+/// trained context of Qwen3.6 / Ornith).
+pub const MAX_N_CTX: usize = 1 << 20;
+
+/// LONG-CTX memory of one engine at a context capacity, in bytes (see [`ctx_mem`]). `kv` and
+/// `recurrent` are the persistent sequence state; the scratch parts grow with the context in
+/// use (anonymous zero pages: only the positions a run touched become resident).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CtxMem {
+    /// rounded context capacity (positions)
+    pub n_ctx: usize,
+    /// K + V caches of every attention layer (MTP layer included), V^T row pad included
+    pub kv: usize,
+    /// KV bytes per position (without the fixed V^T pad)
+    pub kv_per_pos: usize,
+    /// recurrent (conv + delta-net) state of all slots: fixed, independent of the context
+    pub recurrent: usize,
+    /// decode / verify attention scratch in the state arena (scores, f16 probabilities, int8 V partials)
+    pub decode_scratch: usize,
+    /// per decode thread: score / mask / weight / probability rows
+    pub decode_per_thread: usize,
+    /// per prefill thread: tiled-attention score and probability tiles + rows (allocated at the
+    /// first batched prefill)
+    pub prefill_per_thread: usize,
+}
+
+impl CtxMem {
+    /// Everything context-dependent for `dec` decode threads and `pf` prefill threads (the
+    /// prefill scratch of the decode team is counted too when `pf` differs: the engine keeps both).
+    pub fn total(&self, dec: usize, pf: usize) -> usize {
+        let pf_all = if pf == dec { pf } else { pf + dec };
+        self.kv + self.recurrent + self.decode_scratch + dec * self.decode_per_thread + pf_all * self.prefill_per_thread
+    }
+}
+
+/// LONG-CTX: the bytes an engine allocates for context `n_ctx` (validated / rounded as
+/// [`validate_n_ctx`] does, without the trained-context bound), KV type `kv`, `n_att` attention
+/// layers with KV (the MTP layer included when on), `lanes` attention lanes (MTP engines:
+/// `MAX_LANES.max(verify_lanes + 1)`), `n_slots` recurrent slots (verify lanes, at least 1).
+/// Mirrors the allocation in [`Engine::with_options`] and `Pf::new`; the tests hold the two equal.
+pub fn ctx_mem(d: &ModelDesc, n_ctx: usize, kv: KvType, n_att: usize, lanes: usize, n_slots: usize) -> CtxMem {
+    let n_ctx = n_ctx.max(1).div_ceil(256) * 256;
+    let hd = d.head_dim;
+    let rb = kv8::row_bytes(hd);
+    let k_pos = if kv.k8() { rb } else { 2 * hd };
+    let v_pos = if kv.v8() { rb } else { 2 * hd };
+    let kv_per_pos = n_att * d.n_head_kv * (k_pos + v_pos);
+    let v_pad = if kv.v8() { 0 } else { n_att * d.n_head_kv * hd * kv_vpad() * 2 };
+    let conv = (d.ssm_conv_kernel - 1) * d.ssm_conv_channels();
+    let ssm = d.ssm_n_vheads * d.ssm_head_v_dim() * d.ssm_head_v_dim();
+    let group = d.n_head / d.n_head_kv;
+    let acs = if dec_attn_pad_default() { n_ctx + DEC_ATT_PAD } else { n_ctx };
+    let vpart = if kv.v8() { d.n_head_kv * (n_ctx / kv8::PV_CHUNK) * lanes * group * hd * 4 } else { 0 };
+    let att_tt = prefill::att_tt_want(d, pf_tiles());
+    CtxMem {
+        n_ctx,
+        kv: n_ctx * kv_per_pos + v_pad,
+        kv_per_pos,
+        recurrent: n_slots.max(1) * d.n_recurrent() * (conv + ssm) * 4,
+        decode_scratch: lanes * d.n_head * acs * (4 + 2) + vpart,
+        decode_per_thread: n_ctx * (4 + 4 + 4 + 2),
+        prefill_per_thread: prefill::pf_ctx_bytes(d, n_ctx, att_tt),
+    }
+}
+
 /// `OXE_VL` bit: lane GEMVs for the dense, router, shared-expert and routed-expert rows of a verify run.
 pub const VL_MV: u32 = 1;
 /// `OXE_VL` bit: lane GEMVs for the output head of a verify run.
@@ -553,6 +738,45 @@ fn lane_chunk(w: &WeightRef) -> usize {
 }
 
 impl<'a> Engine<'a> {
+    /// Experimental opt-in. The caller independently verifies `source_sha` for
+    /// `g.path`; it must match this engine's loaded CPU model. Exclusive access
+    /// prevents changing the work-unit registry while a team is running.
+    #[cfg(feature = "npu-prefill")]
+    pub fn enable_npu_prefill(&mut self,g:&gguf::Gguf,source_sha:&str,backend:Box<dyn oxn::Backend>,
+        cfg:crate::npu_prefill::Config,pack_cpus:&[usize])->Result<crate::npu_prefill::Stats,String>{
+        #[cfg(feature="f32-reference")]
+        if self.f32_reference.is_some(){return Err("f32 reference cannot offload to NPU".into());}
+        if self.npu_prefill.is_some(){return Err("npu prefill: already prepared".into());}
+        let p=crate::npu_prefill::Prefill::prepare(self.plan,self.ws,g,source_sha,backend,cfg,pack_cpus)?;
+        let stats=p.stats();self.npu_prefill=Some(p);Ok(stats)
+    }
+
+    /// Original-weight f32 proof engine, never a production precision setting.
+    /// Only fresh sequential reset/prefill/step is supported; state files and MTP
+    /// are rejected because the f32 shadow KV has no production serialization.
+    #[cfg(feature="f32-reference")]
+    pub fn enable_f32_reference(&mut self,g:gguf::Gguf,source_sha:&str)->Result<(),String>{
+        if self.f32_reference.is_some()||self.pos.load(Relaxed)!=0||self.mtp.is_some()||self.kv.any8()
+            ||self.pf.iter().any(|p|p.lock().unwrap().is_some()){
+            return Err("f32 reference needs a fresh f16-KV, non-MTP engine".into());
+        }
+        #[cfg(feature="npu-prefill")]
+        if self.npu_prefill.is_some(){return Err("f32 reference cannot own an NPU context".into());}
+        self.f32_reference=Some(crate::f32_reference::Reference::new(g,source_sha,self.plan,self.ws,self.n_ctx)?);Ok(())
+    }
+
+    #[cfg(feature = "npu-prefill")]
+    pub fn npu_prefill_stats(&self)->Option<crate::npu_prefill::Stats>{self.npu_prefill.as_ref().map(|p|p.stats())}
+
+    /// Exclusive owner-only quiescence. This joins with every borrow of Engine;
+    /// no job or checkpoint may be in flight. On a prior fault, the controller
+    /// must keep its NPU fault latch and perform the device-clean checks before
+    /// granting images; local destruction alone is not a hardware-health proof.
+    #[cfg(feature = "npu-prefill")]
+    pub fn release_npu_prefill(&mut self)->Option<crate::npu_prefill::Stats>{
+        self.npu_prefill.take().map(|p|{let s=p.stats();drop(p);s})
+    }
+
     pub fn new(plan: &'a Plan, ws: &'a WeightStore, cfg: EngineConfig) -> Result<Engine<'a>, String> {
         Self::with_options(plan, ws, cfg, EngineOptions::default())
     }
@@ -560,7 +784,7 @@ impl<'a> Engine<'a> {
     pub fn with_options(plan: &'a Plan, ws: &'a WeightStore, cfg: EngineConfig, opt: EngineOptions<'a>) -> Result<Engine<'a>, String> {
         let d = &plan.desc;
         let n = plan.nthreads;
-        let n_ctx = cfg.n_ctx.max(1).div_ceil(256) * 256;
+        let n_ctx = validate_n_ctx(cfg.n_ctx, d.n_ctx_train)?;
         let hd = d.head_dim;
         let att_width = d.n_head * hd;
         let hv = d.ssm_head_v_dim();
@@ -638,6 +862,9 @@ impl<'a> Engine<'a> {
         let group = d.n_head / d.n_head_kv;
         let aq8 = c.take::<u8>(if kv.k8() { lanes * d.n_head * kv8::row_bytes(hd) } else { 0 });
         let vpart = c.take::<f32>(if kv.v8() { d.n_head_kv * (n_ctx / kv8::PV_CHUNK) * lanes * group * hd } else { 0 });
+        // O-70 fused attention partials (after every other buffer; untouched pages unless fused runs)
+        let fpart = c.take::<f32>(if kv.any8() { 0 } else { fattn::part_len(n_ctx, d.n_head_kv, group, hd, lanes) });
+        let fml = c.take::<f32>(if kv.any8() { 0 } else { fattn::ml_len(n_ctx, d.n_head_kv, group, lanes) });
         let state = Mapping::anon(c.off, true).map_err(|e| format!("state arena: {e}"))?;
         let f = |p: (usize, usize)| Raw::<f32>::new(&state, p.0, p.1);
         let lf = |p: (usize, usize, usize)| LBuf { raw: Raw::<f32>::new(&state, p.0, p.1), stride: p.2 };
@@ -679,6 +906,7 @@ impl<'a> Engine<'a> {
             kq8: vec![0; if kv.any8() { d.n_head_kv * kv8::row_bytes(hd) } else { 0 }],
             kv8s: if kv.any8() { Kv8Scratch::new(hd, lanes * (d.n_head / d.n_head_kv)) } else { Kv8Scratch::empty() },
             kv8acc: vec![0.0; if kv.v8() { kv8::QK * lanes * (d.n_head / d.n_head_kv) } else { 0 }],
+            fa: fattn::FaScratch::default(),
             tmp: vec![0.0; d.n_embd.max(plan.head_chunk).max(2 * att_width).max(d.ssm_conv_channels())],
             g: vec![0.0; QK_K.max(d.ff_shexp)],
             u: vec![0.0; QK_K.max(d.ff_shexp)],
@@ -695,6 +923,10 @@ impl<'a> Engine<'a> {
             prof: Prof::default(),
         };
         let e = Engine {
+            #[cfg(feature="f32-reference")]
+            f32_reference: None,
+            #[cfg(feature = "npu-prefill")]
+            npu_prefill: None,
             plan,
             ws,
             n_ctx,
@@ -711,8 +943,16 @@ impl<'a> Engine<'a> {
             kv8_pv: kv8::pv_mode_from_env(),
             aq8: Raw::new(&state, aq8.0, aq8.1),
             vpart: f(vpart),
-            #[cfg(test)]
+            attn_fused: std::env::var("OXE_ATTN").map(|v| v == "fused").unwrap_or(false),
+            attn_fused_ch: fattn::chunk_from_env(),
+            fpart: f(fpart),
+            fml: f(fml),
+            #[cfg(any(test, feature = "f32-reference"))]
             attn_ref: None,
+            #[cfg(any(test, feature = "f32-reference"))]
+            attn_check: None,
+            #[cfg(test)]
+            fused_degrade: 0.0,
             x2: lf(x2),
             x1: lf(x1),
             o: lf(o),
@@ -765,6 +1005,31 @@ impl<'a> Engine<'a> {
     /// are bit-identical). Also selected by `OXE_ATTN=legacy` at construction.
     pub fn set_attn_legacy(&mut self, legacy: bool) {
         self.attn_tiled = !legacy;
+    }
+
+    /// O-70: decode / verify attention through the fused single-pass kernel ([`fattn`]) wherever
+    /// the tiled path would run with an f16 KV cache (int8 KV keeps its own kernels). NOT bitwise
+    /// equal to the tiled path (chunk-local softmax, f16 accumulation per chunk only, f32 merge);
+    /// thread-count invariant. Default off; `OXE_ATTN=fused` at construction.
+    pub fn set_attn_fused(&mut self, on: bool) {
+        self.attn_fused = on;
+        if on {
+            self.attn_tiled = true;
+        }
+    }
+
+    pub fn attn_fused(&self) -> bool {
+        self.attn_fused && !self.kv.any8()
+    }
+
+    /// O-70: positions per fused work item (multiple of 32 in [128, 4096]; `OXE_ATTN_FUSED_CH`,
+    /// default 256). Changes the summation order (results), not correctness.
+    pub fn set_attn_fused_chunk(&mut self, ch: usize) {
+        self.attn_fused_ch = fattn::chunk_from(ch);
+    }
+
+    pub fn attn_fused_chunk(&self) -> usize {
+        self.attn_fused_ch
     }
 
     /// OD-2: decode / verify delta-net step through the fused 4-row kernel (bit-identical).
@@ -828,15 +1093,36 @@ impl<'a> Engine<'a> {
         let n_att = self.plan.desc.n_attention();
         let tiled = self.tiled_at(self.pos());
         // fused int8 V: one more barrier before the chunk-ordered reduction
-        let per = 2 + (self.kv.v8() && self.kv8_fused) as usize;
+        // O-70 fused: one barrier between the chunk items and the merge
+        let per = if self.attn_fused() { 1 } else { 2 + (self.kv.v8() && self.kv8_fused) as usize };
         self.plan.barriers_per_token() + if tiled { per * n_att } else { 0 }
     }
 
     /// Test hook: run the int8 decode attention through `f` (a straightforward f32 reference
     /// over the stored, dequantised K / V values) instead of the tiled kernels.
-    #[cfg(test)]
-    pub(crate) fn set_attn_ref(&mut self, f: Option<AttnRef>) {
+    /// Bench (`f32-reference` feature, `oxe fused-ref`): the f32-attention reference step over
+    /// the stored KV. Takes precedence over the fused path while set.
+    #[cfg(any(test, feature = "f32-reference"))]
+    pub fn set_attn_ref(&mut self, f: Option<AttnRef>) {
         self.attn_ref = f;
+    }
+
+    /// Bench (`oxe fused-ref`): attention-output check on / off (see the `attn_check` field).
+    #[cfg(any(test, feature = "f32-reference"))]
+    pub fn set_attn_check(&mut self, on: bool) {
+        self.attn_check = if on { Some(Mutex::new((0.0, 0.0))) } else { None };
+    }
+
+    /// (sum of squared errors, sum of squared reference values) since the last call; resets.
+    #[cfg(any(test, feature = "f32-reference"))]
+    pub fn take_attn_check(&self) -> Option<(f64, f64)> {
+        self.attn_check.as_ref().map(|m| std::mem::take(&mut *m.lock().unwrap()))
+    }
+
+    /// Tests: degrade the fused path by scaling its output by (1 + eps).
+    #[cfg(test)]
+    pub(crate) fn set_fused_degrade(&mut self, eps: f32) {
+        self.fused_degrade = eps;
     }
 
     /// The stored K and V bytes of attention layer `ai` (MTP layer = the last) at positions
@@ -893,9 +1179,14 @@ impl<'a> Engine<'a> {
                 if self.kv.v8() {
                     let at = ai * self.v8_len + (kvh * self.n_ctx + p) * rb;
                     kv8::deq_f32(self.vcache8.at(at..at + rb), hd, &mut v[p * hd..(p + 1) * hd]);
-                } else {
-                    for j in 0..hd {
-                        v[p * hd + j] = kv8::h2f(*self.vcache.ptr_at(self.vrow(ai, kvh * hd + j) + p));
+                }
+            }
+            if !self.kv.v8() {
+                // f16 V^T: one contiguous row per dimension (read in storage order)
+                for j in 0..hd {
+                    let at = self.vrow(ai, kvh * hd + j);
+                    for (p, &x) in self.vcache.at(at..at + n).iter().enumerate() {
+                        v[p * hd + j] = kv8::h2f(x);
                     }
                 }
             }
@@ -1020,15 +1311,41 @@ impl<'a> Engine<'a> {
     /// Save the recurrent state (conv + delta-net S of every layer) and the position. The KV
     /// cache is not copied: attention only reads positions < pos, so restoring a snapshot is
     /// valid as long as KV positions below its `pos` were not rewritten since.
+    /// (conv, ssm) element counts of a recurrent snapshot of this engine.
+    pub fn recurrent_lens(&self) -> (usize, usize) {
+        let (cr, sr) = self.slot_ranges();
+        (cr.len(), sr.len())
+    }
+
     pub fn save_recurrent(&self) -> RecurrentSnapshot {
+        #[cfg(feature="f32-reference")]
+        assert!(self.f32_reference.is_none(),"f32 reference snapshots are unsupported");
         let (cr, sr) = self.slot_ranges();
         // SAFETY: called between runs by the owner thread.
         unsafe { RecurrentSnapshot { pos: self.pos(), conv: self.conv_state.at(cr).to_vec(), ssm: self.ssm_state.at(sr).to_vec() } }
     }
 
+    /// CACHE-PERFECT P2b: write the LIVE recurrent state in the [`RecurrentSnapshot::write_to`]
+    /// format without copying it first (the shutdown write's memory floor: no 63 MiB buffer).
+    pub fn write_recurrent(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let (cr, sr) = self.slot_ranges();
+        for x in [self.pos(), cr.len(), sr.len()] {
+            w.write_all(&(x as u64).to_le_bytes())?;
+        }
+        // SAFETY: called between runs by the owner thread; f32 slices viewed as bytes (LE target).
+        unsafe {
+            for v in [self.conv_state.at(cr), self.ssm_state.at(sr)] {
+                w.write_all(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4))?;
+            }
+        }
+        Ok(())
+    }
+
     /// As [`Engine::save_recurrent`], reusing `old`'s buffers (an evicted checkpoint) so no
     /// 62.8 MiB allocation and page-fault pass is paid per checkpoint.
     pub fn save_recurrent_into(&self, old: RecurrentSnapshot) -> RecurrentSnapshot {
+        #[cfg(feature="f32-reference")]
+        assert!(self.f32_reference.is_none(),"f32 reference snapshots are unsupported");
         let (cr, sr) = self.slot_ranges();
         let RecurrentSnapshot { mut conv, mut ssm, .. } = old;
         conv.clear();
@@ -1041,12 +1358,48 @@ impl<'a> Engine<'a> {
         RecurrentSnapshot { pos: self.pos(), conv, ssm }
     }
 
-    /// Bytes [`Engine::write_state`] writes at the current position (capacity hint).
+    /// Bytes [`Engine::write_state`] writes at the current position (capacity hint). Per
+    /// position and attention layer: K and V rows of every KV head, f16 or Q8_0 by the KV type
+    /// (LONG-CTX fix: int8 K engines counted no KV at all, so the prefix store's memory floor
+    /// check saw a far too small entry).
     pub fn state_bytes(&self) -> usize {
         let d = &self.plan.desc;
-        let kv_len = d.n_head_kv * self.n_ctx * d.head_dim;
-        let att = self.kcache.len / kv_len;
-        att * 2 * d.n_head_kv * d.head_dim * self.pos() * 2 + 4 * (self.conv_len_all + self.ssm_len_all)
+        let rb = kv8::row_bytes(d.head_dim);
+        let k = if self.kv.k8() { rb } else { 2 * d.head_dim };
+        let v = if self.kv.v8() { rb } else { 2 * d.head_dim };
+        self.n_att * d.n_head_kv * (k + v) * self.pos() + 4 * (self.conv_len_all + self.ssm_len_all)
+    }
+
+    /// LONG-CTX: the context-dependent memory this engine allocated (from its buffers; the
+    /// per-thread and prefill parts by the same expressions as their allocation), for logs and
+    /// admission. Equal to [`ctx_mem`] of the same configuration (tests).
+    pub fn ctx_mem(&self) -> CtxMem {
+        let d = &self.plan.desc;
+        let ts = self.threads[0].get();
+        // SAFETY: lengths only; thread 0's lane 0 state exists for every engine.
+        let per_thread = unsafe { (*ts).first().map(|t| t.kq.len() * 4 + t.mask.len() * 4 + t.wp.len() * 4 + t.p16.len() * 2).unwrap_or(0) };
+        let rb = kv8::row_bytes(d.head_dim);
+        let k = if self.kv.k8() { rb } else { 2 * d.head_dim };
+        let v = if self.kv.v8() { rb } else { 2 * d.head_dim };
+        CtxMem {
+            n_ctx: self.n_ctx,
+            kv: self.kcache.len * 2 + self.vcache.len * 2 + self.kcache8.len + self.vcache8.len,
+            kv_per_pos: self.n_att * d.n_head_kv * (k + v),
+            recurrent: (self.conv_state.len + self.ssm_state.len) * 4,
+            decode_scratch: self.akq.len * 4 + self.ap16.len * 2 + self.vpart.len * 4,
+            decode_per_thread: per_thread,
+            prefill_per_thread: prefill::pf_ctx_bytes(d, self.n_ctx, prefill::att_tt_want(d, pf_tiles())),
+        }
+    }
+
+    /// Attention layers with KV (the MTP layer included when the engine has one).
+    pub fn n_att(&self) -> usize {
+        self.n_att
+    }
+
+    /// Attention lanes (verify lanes, plus the MTP catch-up lanes of an MTP engine).
+    pub fn lanes(&self) -> usize {
+        self.lanes
     }
 
     /// Note that KV positions < `end` are (about to be) written.
@@ -1083,6 +1436,8 @@ impl<'a> Engine<'a> {
     /// >= the snapshot's are zeroed: they get probability 0 in attention anyway, but zero
     /// keeps them finite, as a fresh cache is.
     pub fn restore_recurrent(&self, s: &RecurrentSnapshot) {
+        #[cfg(feature="f32-reference")]
+        assert!(self.f32_reference.is_none(),"f32 reference snapshots are unsupported");
         let (cr, sr) = self.slot_ranges();
         assert!(s.conv.len() == cr.len() && s.ssm.len() == sr.len(), "snapshot from another model");
         // SAFETY: called between runs by the owner thread.
@@ -1107,6 +1462,8 @@ impl<'a> Engine<'a> {
     }
 
     pub fn state_layout(&self) -> String {
+        #[cfg(feature="f32-reference")]
+        if self.f32_reference.is_some(){return "private-f32-reference-no-state-ABI".into();}
         let d = &self.plan.desc;
         // f16: the string of every earlier build (existing prefix stores and session files stay
         // valid); int8 types name themselves (kv=k8|v8|kv8), so no file is read across types
@@ -1118,6 +1475,8 @@ impl<'a> Engine<'a> {
     /// layer (MTP layer included when the engine has one) K rows then V^T rows, f16 bits, then
     /// the recurrent state (conv, S) of the current slot, f32; all little-endian, raw.
     pub fn write_state(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        #[cfg(feature="f32-reference")]
+        if self.f32_reference.is_some(){return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"f32 reference has no parked-state ABI"));}
         fn bytes<T>(s: &[T]) -> &[u8] {
             // SAFETY: plain-old-data slices (u16 / f32) viewed as bytes.
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
@@ -1157,10 +1516,104 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// CACHE-PERFECT P2: K / V rows of positions [a, b) only, per attention layer (MTP layer
+    /// included) in [`Engine::write_state`]'s order (K rows per KV head, then V: V^T rows per
+    /// (head, dim) for f16, Q8_0 rows per head for int8). A 256-position block of the state store.
+    pub fn write_kv_rows(&self, a: usize, b: usize, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        fn bytes<T>(s: &[T]) -> &[u8] {
+            // SAFETY: plain-old-data slices (u16 / f32) viewed as bytes.
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        }
+        if a > b || b > self.pos() {
+            return Err(std::io::Error::other("kv rows beyond the current position"));
+        }
+        let d = &self.plan.desc;
+        let (n, hd, kvw) = (b - a, d.head_dim, d.n_head_kv * d.head_dim);
+        let kv_len = d.n_head_kv * self.n_ctx * hd;
+        let rb = kv8::row_bytes(hd);
+        // SAFETY: called between runs by the owner thread; rows below pos.
+        unsafe {
+            for ai in 0..self.n_att {
+                for h in 0..d.n_head_kv {
+                    if self.kv.k8() {
+                        let at = self.k8row(ai, h, a);
+                        w.write_all(self.kcache8.at(at..at + n * rb))?;
+                    } else {
+                        let at = ai * kv_len + h * self.n_ctx * hd + a * hd;
+                        w.write_all(bytes(self.kcache.at(at..at + n * hd)))?;
+                    }
+                }
+                if self.kv.v8() {
+                    for h in 0..d.n_head_kv {
+                        let at = self.v8row(ai, h, a);
+                        w.write_all(self.vcache8.at(at..at + n * rb))?;
+                    }
+                } else {
+                    for j in 0..kvw {
+                        let at = self.vrow(ai, j) + a;
+                        w.write_all(bytes(self.vcache.at(at..at + n)))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read rows written by [`Engine::write_kv_rows`] for positions [a, b); the position does not
+    /// change (a recurrent snapshot, [`Engine::restore_recurrent`], sets it after the rows).
+    pub fn read_kv_rows(&self, a: usize, b: usize, r: &mut dyn std::io::Read) -> std::io::Result<()> {
+        fn bytes<T>(s: &mut [T]) -> &mut [u8] {
+            // SAFETY: plain-old-data slices (u16 / f32) viewed as bytes.
+            unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, std::mem::size_of_val(s)) }
+        }
+        if a > b || b > self.n_ctx {
+            return Err(std::io::Error::other("kv rows beyond the context"));
+        }
+        // rows < b may be written even if the read fails midway: reset must zero them (W4-4 d)
+        self.note_kv(b);
+        let d = &self.plan.desc;
+        let (n, hd, kvw) = (b - a, d.head_dim, d.n_head_kv * d.head_dim);
+        let kv_len = d.n_head_kv * self.n_ctx * hd;
+        let rb = kv8::row_bytes(hd);
+        // SAFETY: called between runs by the owner thread.
+        unsafe {
+            for ai in 0..self.n_att {
+                for h in 0..d.n_head_kv {
+                    if self.kv.k8() {
+                        let at = self.k8row(ai, h, a);
+                        r.read_exact(self.kcache8.at(at..at + n * rb))?;
+                    } else {
+                        let at = ai * kv_len + h * self.n_ctx * hd + a * hd;
+                        r.read_exact(bytes(self.kcache.at(at..at + n * hd)))?;
+                    }
+                }
+                if self.kv.v8() {
+                    for h in 0..d.n_head_kv {
+                        let at = self.v8row(ai, h, a);
+                        r.read_exact(self.vcache8.at(at..at + n * rb))?;
+                    }
+                } else {
+                    for j in 0..kvw {
+                        let at = self.vrow(ai, j) + a;
+                        r.read_exact(bytes(self.vcache.at(at..at + n)))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes [`Engine::write_kv_rows`] writes per position.
+    pub fn kv_row_bytes(&self) -> usize {
+        self.ctx_mem().kv_per_pos
+    }
+
     /// Read a state written by [`Engine::write_state`] at `n_pos` positions (same
     /// [`Engine::state_layout`]); the position becomes `n_pos`. On error the state is
     /// undefined: reset the engine.
     pub fn read_state(&self, r: &mut dyn std::io::Read, n_pos: usize) -> std::io::Result<()> {
+        #[cfg(feature="f32-reference")]
+        if self.f32_reference.is_some(){return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"f32 reference has no parked-state ABI"));}
         fn bytes<T>(s: &mut [T]) -> &mut [u8] {
             // SAFETY: plain-old-data slices (u16 / f32) viewed as bytes.
             unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, std::mem::size_of_val(s)) }
@@ -1215,6 +1668,8 @@ impl<'a> Engine<'a> {
     /// Copy of the sequence state (KV of positions < pos, recurrent state of the current
     /// slot) in llama.cpp's state-file order (see [`StateDump`]).
     pub fn dump_state(&self) -> StateDump {
+        #[cfg(feature="f32-reference")]
+        assert!(self.f32_reference.is_none(),"f32 reference cannot export rounded shadow KV");
         let d = &self.plan.desc;
         let n_pos = self.pos();
         let hd = d.head_dim;
@@ -1329,6 +1784,8 @@ impl<'a> Engine<'a> {
     /// Run one token at the current position on all workers; returns the greedy argmax
     /// (lowest index among equal maxima, like a first-max scan over the vocabulary).
     pub fn step<P: Team + ?Sized>(&self, pool: &P, token: u32) -> u32 {
+        #[cfg(feature="f32-reference")]
+        if self.f32_reference.is_some(){return self.prefill(pool,&[token],1).expect("nonempty f32 reference step");}
         let g = self.verify(pool, &[token]);
         self.commit(1);
         g[0]
@@ -1338,6 +1795,8 @@ impl<'a> Engine<'a> {
     /// exactly what a one-token `step` at its position would). Returns the argmax per lane.
     /// The position does not move until [`Engine::commit`].
     pub fn verify<P: Team + ?Sized>(&self, pool: &P, tokens: &[u32]) -> [u32; MAX_LANES] {
+        #[cfg(feature="f32-reference")]
+        assert!(self.f32_reference.is_none(),"f32 reference uses sequential prefill/step, not quantized verify");
         assert_eq!(pool.nthreads(), self.plan.nthreads);
         let n = tokens.len();
         assert!(n >= 1 && n <= self.n_slots, "verify of {n} tokens (engine has {} lanes)", self.n_slots);
@@ -1608,6 +2067,8 @@ impl<'a> Engine<'a> {
         if rows.is_empty() {
             return;
         }
+        #[cfg(feature="npu-prefill")]
+        if e==0&&self.npu_prefill.as_ref().is_some_and(|p|unsafe{p.cpu_f32(w.ptr,true,1,rows.start,rows.end,x,out,rows.len(),std::ptr::null())}){return;}
         if w.is_f32() {
             for (i, r) in rows.enumerate() {
                 // SAFETY: row r of expert e of a k-wide f32 tensor; x has k floats; out has rows.len() floats.
@@ -1638,6 +2099,10 @@ impl<'a> Engine<'a> {
         if n == 1 {
             self.mv(w, e, rows, outs[0], xs[0], acts[0]);
             return;
+        }
+        #[cfg(feature="npu-prefill")]
+        if e==0&&self.npu_prefill.as_ref().is_some_and(|p|p.cpu_f32_selected(w.ptr,true)){
+            for ln in 0..n{self.mv(w,e,rows.clone(),outs[ln],xs[ln],acts[ln]);}return;
         }
         let vl = self.dec_vl & VL_MV != 0 && !w.is_f32();
         if vl && n <= kernels_sys::VL_MAX_LANES {
@@ -2078,6 +2543,20 @@ impl<'a> Engine<'a> {
     fn attn_core(&self, ctx: &mut Ctx, tss: &mut [ThreadState], l: usize, pos0: usize, qheads: Range<usize>) {
         // the same decision on every thread (same run); both paths are bit-identical
         if self.tiled_at(pos0 + tss.len() - 1) {
+            #[cfg(any(test, feature = "f32-reference"))]
+            if self.attn_check.is_some() && self.attn_ref.is_none() {
+                self.attn_core_tiled(ctx, tss, l, pos0, qheads.clone());
+                #[cfg(test)]
+                if self.fused_degrade != 0.0 && self.attn_fused() {
+                    self.degrade_fused(ctx, tss.len(), qheads.clone());
+                }
+                return self.attn_check_ref(ctx, tss, l, pos0, qheads);
+            }
+            #[cfg(test)]
+            if self.fused_degrade != 0.0 && self.attn_fused() {
+                self.attn_core_tiled(ctx, tss, l, pos0, qheads.clone());
+                return self.degrade_fused(ctx, tss.len(), qheads);
+            }
             return self.attn_core_tiled(ctx, tss, l, pos0, qheads);
         }
         let d = &self.plan.desc;
@@ -2140,7 +2619,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Tiled attention (M3-ATTN.md): the same per-element arithmetic as [`Self::attn_head`]
+    /// Tiled attention (docs/lab-notes/M3-ATTN.md): the same per-element arithmetic as [`Self::attn_head`]
     /// (every score and every output is one `ggml_vec_dot_f16`, the softmax row is
     /// `soft_max_f32` over the padded n_kv), but split over ALL threads by KV position (scores)
     /// and by V^T row (outputs), with each K / V^T row loaded once for all query heads of its
@@ -2191,9 +2670,12 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "f32-reference"))]
         if let Some(f) = self.attn_ref {
             return self.attn_core_ref(ctx, tss, f, l, pos0, qheads);
+        }
+        if self.attn_fused() {
+            return self.attn_core_fused(ctx, tss, ai, pos0);
         }
         // [1] scores: rows (kvh, p) for p <= last, split evenly over the threads
         let rows = last + 1;
@@ -2481,9 +2963,118 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// O-70: the fused single-pass attention ([`fattn::Fa`]) after the tiled prologue (this run's
+    /// K rows normalised, roped and kept locally per lane; the designated writers stored them).
+    /// One barrier inside the phase (the phase's own barrier ends it).
+    fn attn_core_fused(&self, ctx: &mut Ctx, tss: &mut [ThreadState], ai: usize, pos0: usize) {
+        let d = &self.plan.desc;
+        let hd = d.head_dim;
+        let nkv = d.n_head_kv;
+        let group = d.n_head / nkv;
+        let nl = tss.len();
+        let mut k_local = [std::ptr::null::<u16>(); MAX_LANES];
+        for (i, ts) in tss.iter().enumerate() {
+            k_local[i] = ts.k16.as_ptr();
+        }
+        let fa = fattn::Fa {
+            hd,
+            nkv,
+            group,
+            nl,
+            pos0,
+            ch: self.attn_fused_ch,
+            scale: 1.0 / (hd as f32).sqrt(),
+            k: self.kcache.ptr_at(ai * nkv * self.n_ctx * hd),
+            n_ctx: self.n_ctx,
+            k_local,
+            vt: self.vcache.ptr_at(self.vrow(ai, 0)),
+            v_stride: self.v_stride,
+            q16: self.aq16.ptr_at(0),
+            gate: self.agate.ptr_at(0),
+            cpk: self.lanes * group,
+            part: self.fpart.ptr_at(0),
+            ml: self.fml.ptr_at(0),
+            out: self.o.ptr_at(0, 0),
+            out_ls: self.o.stride,
+        };
+        let (tid, nth) = (ctx.tid, ctx.nthreads);
+        let scr = &mut tss[0].fa;
+        // SAFETY: cache rows < pos0 complete and read-only; the local K rows are this thread's
+        // (k16 is not written in this phase); V^T rows of this run written before the AttnQkv
+        // barrier, rows beyond finite; q16 / gates complete (AttnQkv barrier); partial slots of an
+        // item are written only by its thread; after the barrier each O element of (kvh, dim) rows
+        // is written only by the owner of the row.
+        unsafe {
+            fa.chunks(tid, nth, scr);
+        }
+        self.ibar(ctx);
+        // SAFETY: as above; every partial complete (barrier).
+        unsafe {
+            fa.merge(tid, nth, scr);
+        }
+    }
+
+    /// Tests: scale this thread's query heads' fused outputs by (1 + fused_degrade).
+    #[cfg(test)]
+    fn degrade_fused(&self, ctx: &mut Ctx, nl: usize, qheads: Range<usize>) {
+        let hd = self.plan.desc.head_dim;
+        self.ibar(ctx); // every fused output row written (the merge owners differ from qheads)
+        for ln in 0..nl {
+            for h in qheads.clone() {
+                // SAFETY: O rows of our query heads; nobody else touches them until the next barrier.
+                let o = unsafe { self.o.at(ln, h * hd..(h + 1) * hd) };
+                for x in o.iter_mut() {
+                    *x *= 1.0 + self.fused_degrade;
+                }
+            }
+        }
+        self.ibar(ctx);
+    }
+
+    /// Bench / tests ([`Engine::set_attn_check`]): this thread's query heads, the gated output
+    /// the kernel wrote vs the f32-attention reference over the same roped f32 query and the
+    /// stored K / V; adds the squared error and the squared reference to the check.
+    #[cfg(any(test, feature = "f32-reference"))]
+    fn attn_check_ref(&self, ctx: &mut Ctx, tss: &mut [ThreadState], l: usize, pos0: usize, qheads: Range<usize>) {
+        let d = &self.plan.desc;
+        let hd = d.head_dim;
+        let group = d.n_head / d.n_head_kv;
+        let ai = self.att_index[l];
+        let scale = 1.0 / (hd as f32).sqrt();
+        self.ibar(ctx); // every output row and this run's K / V rows complete
+        let (mut e2, mut r2) = (0f64, 0f64);
+        let mut out = vec![0f32; hd];
+        let mut gate = vec![0f32; hd];
+        for (ln, ts) in tss.iter().enumerate() {
+            let pos = pos0 + ln;
+            let mut kv: Option<(usize, Vec<f32>, Vec<f32>)> = None;
+            for h in qheads.clone() {
+                if kv.as_ref().map_or(true, |c| c.0 != h / group) {
+                    let (k, v) = self.kv_head_f32(ai, h / group, pos + 1);
+                    kv = Some((h / group, k, v));
+                }
+                let (_, k, v) = kv.as_ref().unwrap();
+                crate::fused_ref::ref_attn_f64(&ts.q[h * hd..(h + 1) * hd], k, v, pos + 1, hd, scale, &mut out);
+                ops::sigmoid(&ts.qg[h * 2 * hd + hd..(h + 1) * 2 * hd], &mut gate);
+                // SAFETY: complete after the barrier; read only.
+                let o = unsafe { self.o.at(ln, h * hd..(h + 1) * hd) };
+                for j in 0..hd {
+                    let r = (out[j] * gate[j]) as f64;
+                    e2 += (o[j] as f64 - r).powi(2);
+                    r2 += r * r;
+                }
+            }
+        }
+        if let Some(m) = &self.attn_check {
+            let mut g = m.lock().unwrap();
+            g.0 += e2;
+            g.1 += r2;
+        }
+    }
+
     /// Test hook ([`Engine::set_attn_ref`]): every query head of this thread through the f32
     /// reference `f` over the stored K / V (dequantised), with the tiled path's barrier count.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "f32-reference"))]
     fn attn_core_ref(&self, ctx: &mut Ctx, tss: &mut [ThreadState], f: AttnRef, l: usize, pos0: usize, qheads: Range<usize>) {
         let d = &self.plan.desc;
         let hd = d.head_dim;
@@ -2493,8 +3084,14 @@ impl<'a> Engine<'a> {
         self.ibar(ctx); // this run's K / V rows complete
         for (ln, ts) in tss.iter_mut().enumerate() {
             let pos = pos0 + ln;
+            // the heads of one KV group share K / V: convert them once per (lane, KV head)
+            let mut kv: Option<(usize, Vec<f32>, Vec<f32>)> = None;
             for h in qheads.clone() {
-                let (k, v) = self.kv_head_f32(ai, h / group, pos + 1);
+                if kv.as_ref().map_or(true, |c| c.0 != h / group) {
+                    let (k, v) = self.kv_head_f32(ai, h / group, pos + 1);
+                    kv = Some((h / group, k, v));
+                }
+                let (_, k, v) = kv.as_ref().unwrap();
                 let mut q = ts.q[h * hd..(h + 1) * hd].to_vec();
                 if self.kv.k8() && self.kv8_fused {
                     // the fused scores use the query as Q8_0: the reference sees the same values
@@ -2502,7 +3099,7 @@ impl<'a> Engine<'a> {
                     kv8::quant_row(&q.clone(), &mut qq);
                     kv8::deq_f32(&qq, hd, &mut q);
                 }
-                f(&q, &k, &v, pos + 1, hd, scale, &mut ts.aout);
+                f(&q, k, v, pos + 1, hd, scale, &mut ts.aout);
                 ops::sigmoid(&ts.qg[h * 2 * hd + hd..(h + 1) * 2 * hd], &mut ts.gsig);
                 // SAFETY: O rows of our query heads.
                 let o = unsafe { self.o.at(ln, h * hd..(h + 1) * hd) };

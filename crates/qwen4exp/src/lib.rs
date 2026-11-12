@@ -1,4 +1,4 @@
-//! qwen4exp: Qwen3.8-Flash-Next in the oxe engine. M0 = timing prototype only (see M0-FLASH.md):
+//! qwen4exp: Qwen3.8-Flash-Next in the oxe engine. M0 = timing prototype only (see docs/lab-notes/M0-FLASH.md):
 //! real weights and kernels, static per-thread plan, expert streaming from an R4 sidecar
 //! through an io_uring cache, replayed routing; activations are dummy.
 pub mod cache;

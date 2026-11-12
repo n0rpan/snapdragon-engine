@@ -38,64 +38,8 @@ use std::time::SystemTime;
 const MAGIC: &[u8; 8] = b"OXEPFX01";
 const MAGIC2: &[u8; 8] = b"OXEPFX02";
 
-/// Streaming 64-bit checksum of an entry's state bytes (integrity against truncation and
-/// bit rot, not an adversary: the directory is 0700 on the encrypted home). One multiply-xor-
-/// rotate lane over little-endian u64 words, several GB/s, so ~60 ms for a 285 MB Flash state.
-#[derive(Clone)]
-pub struct Check64 {
-    h: u64,
-    tail: [u8; 8],
-    nt: usize,
-    len: u64,
-}
-
-impl Default for Check64 {
-    fn default() -> Self {
-        Check64 { h: 0x243f_6a88_85a3_08d3, tail: [0; 8], nt: 0, len: 0 }
-    }
-}
-
-impl Check64 {
-    #[inline]
-    fn word(&mut self, w: u64) {
-        self.h = (self.h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
-    }
-    pub fn update(&mut self, mut d: &[u8]) {
-        self.len += d.len() as u64;
-        if self.nt > 0 {
-            let n = (8 - self.nt).min(d.len());
-            self.tail[self.nt..self.nt + n].copy_from_slice(&d[..n]);
-            self.nt += n;
-            d = &d[n..];
-            if self.nt < 8 {
-                return;
-            }
-            let w = u64::from_le_bytes(self.tail);
-            self.word(w);
-            self.nt = 0;
-        }
-        let mut it = d.chunks_exact(8);
-        for c in &mut it {
-            self.word(u64::from_le_bytes(c.try_into().unwrap()));
-        }
-        let r = it.remainder();
-        self.tail[..r.len()].copy_from_slice(r);
-        self.nt = r.len();
-    }
-    pub fn finish(mut self) -> u64 {
-        if self.nt > 0 {
-            let mut t = [0u8; 8];
-            t[..self.nt].copy_from_slice(&self.tail[..self.nt]);
-            self.word(u64::from_le_bytes(t) ^ ((self.nt as u64) << 56));
-        }
-        let len = self.len;
-        self.word(len);
-        let mut h = self.h;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^ (h >> 33)
-    }
-}
+/// Streaming 64-bit checksum (moved to `model::check` so the kernel-path probe can use it).
+pub use model::check::Check64;
 
 pub fn check64(d: &[u8]) -> u64 {
     let mut c = Check64::default();
@@ -123,6 +67,55 @@ impl Read for CheckedReader<'_> {
     }
 }
 
+/// File writer that writes behind: every `DROP_BEHIND` bytes it waits for that window's writeback
+/// and drops its page cache, so a multi-GiB state never sits in the page cache (charged to the
+/// model's memory cgroup: reclaim pressure / PSI next to the weights). LONG-CTX.
+struct DropBehind {
+    f: fs::File,
+    off: u64,
+    done: u64,
+}
+
+const DROP_BEHIND: u64 = 64 << 20;
+
+impl Write for DropBehind {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.f.write(buf)?;
+        self.off += n as u64;
+        if self.off - self.done >= DROP_BEHIND {
+            use std::os::fd::AsRawFd;
+            let (fd, start, len) = (self.f.as_raw_fd(), self.done as i64, (self.off - self.done) as i64);
+            // SAFETY: valid fd, a range of this file; advisory calls (errors ignored: best effort).
+            unsafe {
+                libc::sync_file_range(fd, start, len, libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER);
+                libc::posix_fadvise(fd, start, len, libc::POSIX_FADV_DONTNEED);
+            }
+            self.done = self.off;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.f.flush()
+    }
+}
+
+/// Writer that checksums (and counts, `sum.len`) what the engine writes.
+struct CheckedWriter<'a> {
+    w: &'a mut dyn Write,
+    sum: Check64,
+}
+
+impl Write for CheckedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.w.write(buf)?;
+        self.sum.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
 /// MemAvailable from /proc/meminfo.
 pub fn proc_mem_available() -> Option<u64> {
     let s = fs::read_to_string("/proc/meminfo").ok()?;
@@ -140,6 +133,7 @@ fn drop_pages(f: &fs::File) {
 }
 
 /// Minimal SHA-256 (FIPS 180-4).
+#[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
     buf: Vec<u8>,
@@ -362,6 +356,23 @@ impl PrefixStore {
         gone
     }
 
+    /// Delete this store's entries whose tokens match `f` (cache clear / session clear across the
+    /// legacy stores, Codex P2/P3 review 1-3). Waits for pending writes first. Returns how many.
+    pub fn remove_where(&mut self, f: &dyn Fn(&[u32]) -> bool) -> usize {
+        self.flush();
+        let mut es = self.entries.lock().unwrap();
+        let before = es.len();
+        es.retain(|e| {
+            if f(&e.tokens) {
+                let _ = fs::remove_file(self.dir.join(format!("{}.bin", e.key)));
+                false
+            } else {
+                true
+            }
+        });
+        before - es.len()
+    }
+
     /// FLASH-PREFIX-2: may an entry of about `entry_bytes` be built and written now? False when a floor is set and
     /// MemAvailable (unknown = no) is below floor + 2 x entry, or while an earlier write still holds its buffer
     /// (never two ~285 MB Flash states in memory at once). A skipped save only costs the disk hit later.
@@ -492,6 +503,56 @@ impl PrefixStore {
             }
         });
         self.writers.push(h);
+    }
+
+    /// LONG-CTX: store an entry for `tokens` synchronously, streaming the state from `write` (the
+    /// engine's `save_state`) straight into the file: no state buffer in RAM (a 128K f16 state is
+    /// 2.75 GiB). Same file bytes as [`PrefixStore::save_async`] of the same state: the header is
+    /// written with a zero length / checksum, both patched after the stream. The page cache of the
+    /// file is dropped after the sync. Returns the state's length.
+    pub fn save_stream(&mut self, tokens: &[u32], write: &mut dyn FnMut(&mut dyn Write) -> Result<(), String>) -> Result<u64, String> {
+        use std::io::{Seek, SeekFrom};
+        let key = entry_key(&self.identity, tokens);
+        let pending = self.dir.join(format!("{key}.pending"));
+        let fin = self.dir.join(format!("{key}.bin"));
+        let hdr = header_len(&self.identity, tokens.len()).ok_or("header size overflow")?;
+        let r = (|| -> Result<u64, String> {
+            let io = |e: std::io::Error| e.to_string();
+            let f = fs::File::options().write(true).create(true).truncate(true).mode(0o600).open(&pending).map_err(io)?;
+            let mut w = BufWriter::with_capacity(4 << 20, DropBehind { f, off: 0, done: 0 });
+            w.write_all(MAGIC2).map_err(io)?;
+            w.write_all(&(self.identity.len() as u32).to_le_bytes()).map_err(io)?;
+            w.write_all(self.identity.as_bytes()).map_err(io)?;
+            w.write_all(&(tokens.len() as u64).to_le_bytes()).map_err(io)?;
+            w.write_all(&tokens_bytes(tokens)).map_err(io)?;
+            w.write_all(&[0u8; 16]).map_err(io)?;
+            let mut cw = CheckedWriter { w: &mut w, sum: Check64::default() };
+            write(&mut cw)?;
+            let (len, sum) = (cw.sum.len, cw.sum.finish());
+            let mut f = w.into_inner().map_err(|e| e.into_error().to_string())?.f;
+            f.seek(SeekFrom::Start(hdr - 16)).map_err(io)?;
+            f.write_all(&len.to_le_bytes()).map_err(io)?;
+            f.write_all(&sum.to_le_bytes()).map_err(io)?;
+            f.sync_all().map_err(io)?;
+            drop_pages(&f);
+            fs::rename(&pending, &fin).map_err(io)?;
+            Ok(len)
+        })();
+        match r {
+            Ok(len) => {
+                let mut es = self.entries.lock().unwrap();
+                if !es.iter().any(|e| e.key == key) {
+                    es.push(Entry { key: key.clone(), tokens: tokens.to_vec() });
+                }
+                drop(es);
+                prune(&self.dir, self.max_bytes, Some(&key), &self.entries);
+                Ok(len)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&pending);
+                Err(format!("prefix store stream write: {e}"))
+            }
+        }
     }
 
     /// Wait for background writes (tests, shutdown).
@@ -641,14 +702,20 @@ pub fn inside_dir_of(dir: &Path, file: Option<&Path>) -> Option<PathBuf> {
 
 /// Identity string for a model file and engine (see the module docs).
 pub fn identity(model: &Path, state_id: &str, ubatch: usize) -> String {
-    let model_id = match std::env::var("OXE_MODEL_SHA256") {
+    let model_id = model_id(model);
+    let exe = std::env::current_exe().ok().and_then(|p| sha256_file(&p).ok()).unwrap_or_else(|| "unknown".into());
+    format!("model={model_id} server=sha256:{exe} state={state_id} ubatch={ubatch}")
+}
+
+/// The model component of an identity: `sha256:<OXE_MODEL_SHA256>` (the controller sets it), else
+/// the file's canonical path, size and mtime.
+pub fn model_id(model: &Path) -> String {
+    match std::env::var("OXE_MODEL_SHA256") {
         Ok(s) if s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()) => format!("sha256:{}", s.to_ascii_lowercase()),
         _ => {
             let m = fs::metadata(model).ok();
             let mtime = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
             format!("file:{}:{}:{}", fs::canonicalize(model).unwrap_or(model.to_path_buf()).display(), m.map(|m| m.len()).unwrap_or(0), mtime)
         }
-    };
-    let exe = std::env::current_exe().ok().and_then(|p| sha256_file(&p).ok()).unwrap_or_else(|| "unknown".into());
-    format!("model={model_id} server=sha256:{exe} state={state_id} ubatch={ubatch}")
+    }
 }

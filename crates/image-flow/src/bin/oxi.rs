@@ -4,6 +4,20 @@
 //! oxi generate --gguf F --vae VAE.safetensors --handoff DIR --out OUT.png [--backend ref|fast] [--vae-conv f32|winograd|int8]
 //!      [--threads N] [--grid HxW] [--latent-out FILE] [--json FILE] [--chunk1 N --chunk2 N --key-chunk N]
 //!      [--attn-prec int8|f16|f32]   (fast backend: attention arithmetic, linears stay int8; F-IMG-ATTN)
+//!      [--npu off|emu|device] [--npu-budget-mib N] [--npu-kc N] [--npu-sessions N] [--npu-weights w8|fp16]
+//!      (fast backend: the big linears as oxn GEMMs.
+//!      `emu` is the CPU emulator of the oxn contract, `device` the DSP (only in a build with `--features npu-device`).
+//!      Linears are placed in model order while they fit the budget (default 2048 MiB of weights, split evenly over
+//!      the sessions); a K chunk is the largest multiple of 32 that divides K and is <= N (default 3072; N = 0: no K
+//!      chunking, each linear is one chunk). --npu-weights: W8 records (default) or fp16 tiles (same Q8_0 values, the
+//!      scale multiplied in before the rounding to half). Default off.
+//!      --npu-sessions N (1..4, default 1): DSP sessions; each linear lives whole on one session, so the weights of a
+//!      model larger than one session's address space spread over them.
+//!      --npu-cpu-rows PCT (0..90, default 0): token-row split. Each accelerator linear call also runs about PCT percent
+//!      of its token rows on the CPU int8 path, at the same time as the accelerator does the rest (fp16 vs int8 arithmetic).
+//!      OXI_NPU_STATS=1 also counts non-finite delivered values and the largest |value| (fp16 overflow check).
+//!      OXI_NPU_AUDIT=1 (with --npu): after a generation, per linear, the accelerator outputs against an exact f32
+//!      product of the same input rows (rel_rmse, the predicted fp16 K-chunk error, the cancellation); also in the JSON.)
 //! oxi verify   --gguf F --handoff DIR [--backend ref|fast] [--arith f32|sdcpp] [--threads N] [--json FILE]
 //! oxi drift-probe --gguf F --handoff DIR [--step 0] [--scope component|blocks] [--arith f32,sdcpp]
 //!      [--perturb-ulp N] [--max-single N] [--threads N] [--json FILE]   (W5-G: components on sd.cpp's own dumped inputs)
@@ -12,8 +26,15 @@
 //!      [--sigmas stored|computed --steps 4]   (computed: call-0-only hand-over, IMG-SHIP)
 //! oxi generate --gguf F --vae VAE --cond-prompt-file F --width W --height H --seed N [--steps 4]
 //!      [--cache DIR] [--sigmas stored|computed] [--noise own|sdcpp] --out OUT.png   (no sd.cpp run needed)
+//! oxi cond-put ... --te-gguf TE.gguf [--te-backend cpu-f32|cpu-q8|npu ...] | --te-ctx CTX.f32   (native text encoder:
+//!      the entry's context comes from the Rust encoder, pe/sigmas from the hand-over; the JSON also
+//!      reports the agreement with the hand-over's own context)
+//! oxi te-check --te-gguf TE.gguf --prompt-file F --handoff DIR [--te-backend ...] [--threads N]
+//!      [--gate-cos 0.999] [--gate-rel 0.05] [--te-ref REF.f32 [--gate-slack 1.0]] [--te-out CTX.f32] [--json FILE]
 //! ```
 //! Exit code 3 from `generate --cond-prompt-file`: no cached conditioning for the inputs.
+//! Exit code 4 from `cond-put --te-gguf` / `te-check`: the prompt needs sd.cpp's encoder (emphasis,
+//! escapes, BREAK, special-token or LoRA strings, not UTF-8); exit code 2 from `te-check`: gate FAIL.
 //! Output summaries are JSON on stdout (and in `--json FILE` when given).
 
 use image_dit::arith::Arith;
@@ -21,6 +42,7 @@ use image_dit::attn_float::AttnPrec;
 use image_dit::fast::FastConfig;
 use image_dit::fast_model::{FastModel, ModelTimes};
 use image_dit::model::{DitBackend, ModelInput};
+use image_dit::npu::{AuditLine, NpuConfig, NpuStats};
 use image_dit::types::rel_rmse;
 use image_flow::cond_cache::{self, Conditioning, KeyInputs};
 use image_flow::handoff::Handoff;
@@ -57,6 +79,7 @@ fn real_main() -> Result<(), String> {
         "txt-stats" => cmd_txt_stats(&args),
         "vae-decode" => cmd_vae_decode(&args),
         "compare" => cmd_compare(&args),
+        "te-check" => cmd_te_check(&args),
         _ => Err(usage()),
     }
 }
@@ -124,6 +147,15 @@ enum Backend<'p> {
 struct Timed<'p> {
     inner: Backend<'p>,
     times: Vec<ModelTimes>,
+    /// name of the accelerator (`--npu`) when one is in use
+    npu_name: Option<&'static str>,
+    /// `--npu-cpu-rows` (0 = off)
+    npu_cpu_rows_pct: u32,
+    /// non-finite values and largest |value| over the generation (OXI_NPU_STATS=1)
+    npu_nonfinite: u64,
+    npu_max_abs: f32,
+    /// the accelerator counters of the last forward
+    npu_last: Option<NpuStats>,
 }
 
 impl DitBackend for Timed<'_> {
@@ -140,8 +172,33 @@ impl DitBackend for Timed<'_> {
             Backend::Fast(m) => {
                 let v = m.forward(input);
                 let t = m.last_times;
+                let mut npu_part = String::new();
+                if let (Some(name), Some(s)) = (self.npu_name, m.npu_stats()) {
+                    // shares of the GEMM DSP cycles of this forward: HMX compute and W8 expansion
+                    let pc = s.pcycles as f64;
+                    let share = |x: u64| if pc > 0.0 { 100.0 * x as f64 / pc } else { 0.0 };
+                    // token rows of this forward: the share the CPU computed in split calls
+                    let rows = s.npu_rows + s.cpu_rows;
+                    let cpu_share = if rows > 0 { 100.0 * s.cpu_rows as f64 / rows as f64 } else { 0.0 };
+                    npu_part = format!(
+                        " | npu {name}: {} calls, gemm {:.3} s, dsp {:.3} s, unpack {:.3} s, cycles {:.3e} (hmx {:.1}%, deq {:.1}%), rows npu {} cpu {} ({cpu_share:.1}% cpu, cpu phase {:.3} s)",
+                        t.npu_calls,
+                        t.npu_gemm,
+                        t.npu_dsp,
+                        t.npu_unpack,
+                        pc,
+                        share(s.hmx_pcycles),
+                        share(s.deq_cycles),
+                        s.npu_rows,
+                        s.cpu_rows,
+                        s.split_cpu_s
+                    );
+                    self.npu_nonfinite += s.nonfinite;
+                    self.npu_max_abs = self.npu_max_abs.max(s.max_abs);
+                    self.npu_last = Some(s);
+                }
                 eprintln!(
-                    "forward: total {:.3}s (embed {:.3} double {:.3} single {:.3} final {:.3} attention {:.3}) linears {:.3} (unit {:.3} plain {:.3}) quant {:.3}",
+                    "forward: total {:.3}s (embed {:.3} double {:.3} single {:.3} final {:.3} attention {:.3}) linears {:.3} (unit {:.3} plain {:.3}) quant {:.3}{npu_part}",
                     t.total,
                     t.embed,
                     t.double_blocks,
@@ -160,6 +217,82 @@ impl DitBackend for Timed<'_> {
     }
 }
 
+impl Timed<'_> {
+    /// The one-line accelerator summary of a generation (None on the CPU path).
+    fn npu_report(&self) -> Option<String> {
+        let name = self.npu_name?;
+        let s = self.npu_last?;
+        let mib = s.weights_bytes as f64 / (1u64 << 20) as f64;
+        let kc = if s.kc_max == 0 { "none".to_string() } else { s.kc_max.to_string() };
+        let mut line = format!(
+            "oxi: npu: {} linears, {} on the cpu, {mib:.1} MiB of {} weights on {name}, {} session(s), kc max {kc}, {} blobs in {} output parts, pack {:.3} s, cpu rows {}%",
+            s.linears,
+            s.cpu_linears,
+            s.weights.name(),
+            s.sessions,
+            s.blobs,
+            s.parts,
+            s.pack_s,
+            self.npu_cpu_rows_pct
+        );
+        line += &format!(", pack workers {}", s.pack_threads);
+        line += &format!(", allocated bytes {}, weight capacity bytes {}", s.allocated_bytes, s.weight_capacity_bytes);
+        if npu_stats_env() {
+            line += &format!(", non-finite values {}, max |value| {:e}", self.npu_nonfinite, self.npu_max_abs);
+        }
+        Some(line)
+    }
+
+    /// The accuracy audit of the last generation (None unless OXI_NPU_AUDIT=1 on the accelerator).
+    fn npu_audit(&self) -> Option<Vec<AuditLine>> {
+        match &self.inner {
+            Backend::Fast(m) => m.npu_audit(),
+            Backend::Ref(_) => None,
+        }
+    }
+}
+
+/// OXI_NPU_STATS=1: the accelerator also counts non-finite values and the largest |value|.
+fn npu_stats_env() -> bool {
+    std::env::var("OXI_NPU_STATS").ok().as_deref() == Some("1")
+}
+
+/// OXI_NPU_AUDIT=1: the accelerator keeps the accuracy audit (see `oxn`/`image_dit::npu`).
+fn npu_audit_env() -> bool {
+    std::env::var("OXI_NPU_AUDIT").ok().as_deref() == Some("1")
+}
+
+/// The audit table to stderr: one line per linear, then the worst one.
+fn print_npu_audit(lines: &[AuditLine]) {
+    for l in lines {
+        eprintln!(
+            "oxi: npu audit: {} samples {} rel_rmse {:.2e} chunk_pred {:.2e} max|x| {:.2e} max|y| {:.2e} cancel {:.2e} max_abs_err {:.2e}",
+            l.name, l.samples, l.rel_rmse, l.pred_rel_rmse_chunks, l.max_x, l.max_ref, l.cancel, l.max_abs_err
+        );
+    }
+    if let Some(w) = lines.iter().max_by(|a, b| a.rel_rmse.total_cmp(&b.rel_rmse)) {
+        eprintln!("oxi: npu audit: worst rel_rmse {:.2e} in {}", w.rel_rmse, w.name);
+    }
+}
+
+/// The audit table for the JSON report (null when the audit was off).
+fn audit_json(lines: Option<&[AuditLine]>) -> Value {
+    match lines {
+        None => Value::Null,
+        Some(ls) => Value::Array(
+            ls.iter()
+                .map(|l| {
+                    json!({
+                        "name": l.name, "samples": l.samples, "rel_rmse": l.rel_rmse,
+                        "chunk_pred_rel_rmse": l.pred_rel_rmse_chunks, "max_x": l.max_x, "max_y": l.max_ref,
+                        "cancel": l.cancel, "max_abs_err": l.max_abs_err,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// Builds the backend. `pool` must outlive the returned value when `fast` is chosen.
 /// `--arith` of the reference backend: f32 (default) or sdcpp (W5-G arithmetic parity).
 fn arith_of(s: Option<&str>) -> Result<Arith, String> {
@@ -173,6 +306,7 @@ fn build_backend<'p>(
     cfg: FastConfig,
     pool: &'p Option<sched::Pool>,
     arith: Option<&str>,
+    npu: Option<(Box<dyn oxn::Backend>, NpuConfig)>,
 ) -> Result<Timed<'p>, String> {
     if kind != "ref" && arith.is_some() {
         return Err("--arith applies to --backend ref only".into());
@@ -180,6 +314,11 @@ fn build_backend<'p>(
     if kind != "fast" && cfg.attn_prec != AttnPrec::Int8 {
         return Err("--attn-prec applies to --backend fast only".into());
     }
+    if kind != "fast" && npu.is_some() {
+        return Err("--npu applies to --backend fast only".into());
+    }
+    let npu_name = npu.as_ref().map(|(b, _)| b.name());
+    let npu_cpu_rows_pct = npu.as_ref().map_or(0, |(_, c)| c.cpu_rows_pct);
     let inner = match kind {
         "ref" => {
             let mut m = RefModel::open(gguf, threads)?;
@@ -193,11 +332,70 @@ fn build_backend<'p>(
         }
         "fast" => {
             let pool = pool.as_ref().ok_or("fast backend needs a pool")?;
-            Backend::Fast(FastModel::open(gguf, pool, cfg)?)
+            Backend::Fast(FastModel::open_npu(gguf, pool, cfg, npu)?)
         }
         other => return Err(format!("--backend must be ref or fast, got '{other}'")),
     };
-    Ok(Timed { inner, times: Vec::new() })
+    Ok(Timed { inner, times: Vec::new(), npu_name, npu_cpu_rows_pct, npu_nonfinite: 0, npu_max_abs: 0.0, npu_last: None })
+}
+
+/// `--npu off|emu|device` (default off), `--npu-budget-mib N` (default 2048), `--npu-kc N` (default 3072, 0 = no
+/// K chunking), `--npu-sessions N` (1..4, default 1), `--npu-cpu-rows PCT` (0..90, default 0: token-row split),
+/// `--npu-weights w8|fp16` (default w8). OXI_NPU_AUDIT=1 turns the accuracy audit on.
+fn npu_setup(a: &Args) -> Result<Option<(Box<dyn oxn::Backend>, NpuConfig)>, String> {
+    let mode = a.opt("npu").unwrap_or("off");
+    let cpu_rows_pct = a.usize_or("npu-cpu-rows", 0)?;
+    if cpu_rows_pct > 90 {
+        return Err(format!("--npu-cpu-rows must be 0..90, got {cpu_rows_pct}"));
+    }
+    if mode == "off" {
+        if cpu_rows_pct > 0 {
+            return Err("--npu-cpu-rows needs --npu emu or device".into());
+        }
+        return Ok(None);
+    }
+    let budget_mib = a.usize_or("npu-budget-mib", 2048)?;
+    let budget_bytes = budget_mib.checked_mul(1 << 20).ok_or("--npu-budget-mib is too large")?;
+    let kc_max = a.usize_or("npu-kc", 3072)?;
+    if kc_max != 0 && kc_max < 32 {
+        return Err("--npu-kc must be 0 (no K chunking) or at least 32".into());
+    }
+    let weights = match a.opt("npu-weights").unwrap_or("w8") {
+        "w8" => oxn::wfmt::WFmt::W8,
+        "fp16" => oxn::wfmt::WFmt::Fp16,
+        other => return Err(format!("--npu-weights must be w8 or fp16, got '{other}'")),
+    };
+    let sessions = a.usize_or("npu-sessions", 1)?;
+    if !(1..=4).contains(&sessions) {
+        return Err(format!("--npu-sessions must be 1..4, got {sessions}"));
+    }
+    let backend: Box<dyn oxn::Backend> = match mode {
+        "emu" => Box::new(oxn::emu::Emu::new(8 << 20, sessions)),
+        "device" => device_backend(sessions)?,
+        other => return Err(format!("--npu must be off, emu or device, got '{other}'")),
+    };
+    let cpu_rows_pct = cpu_rows_pct as u32;
+    let cfg = NpuConfig {
+        budget_bytes,
+        kc_max,
+        ycol: true,
+        pack_threads: 0,
+        cpu_rows_pct,
+        weights,
+        max_blob_bytes: 0,
+        audit: npu_audit_env(),
+    };
+    Ok(Some((backend, cfg)))
+}
+
+#[cfg(feature = "npu-device")]
+fn device_backend(sessions: usize) -> Result<Box<dyn oxn::Backend>, String> {
+    Ok(Box::new(oxn::device::Device::open(sessions)?))
+}
+
+#[cfg(not(feature = "npu-device"))]
+fn device_backend(_sessions: usize) -> Result<Box<dyn oxn::Backend>, String> {
+    Err("oxi was built without the npu-device feature".into())
 }
 
 fn make_pool(kind: &str, threads: usize) -> Result<Option<sched::Pool>, String> {
@@ -308,7 +506,7 @@ fn cmd_generate(a: &Args) -> Result<(), String> {
     let h = Handoff::load(&dir)?;
     let (gh, gw) = latent_grid(&h, a)?;
     let pool = make_pool(kind, threads)?;
-    let mut be = build_backend(&gguf, kind, threads, cfg, &pool, a.opt("arith"))?;
+    let mut be = build_backend(&gguf, kind, threads, cfg, &pool, a.opt("arith"), npu_setup(a)?)?;
 
     let mut step_secs = Vec::with_capacity(h.steps);
     let mut last = Instant::now();
@@ -330,6 +528,13 @@ fn cmd_generate(a: &Args) -> Result<(), String> {
     // the VAE's worker threads inherit this thread's mask (IMG-VAE: 12 VAE threads on one core,
     // 21.9 s instead of ~3 s). Dropping the pool restores the mask; it also frees the DiT weights.
     let backend_name = be.name();
+    if let Some(line) = be.npu_report() {
+        eprintln!("{line}");
+    }
+    let audit = be.npu_audit();
+    if let Some(lines) = &audit {
+        print_npu_audit(lines);
+    }
     let model_times = std::mem::take(&mut be.times);
     drop(be);
     drop(pool);
@@ -359,7 +564,9 @@ fn cmd_generate(a: &Args) -> Result<(), String> {
         "model_times": model_times.iter().map(|t| json!({
             "embed": t.embed, "double_blocks": t.double_blocks, "single_blocks": t.single_blocks,
             "final_layer": t.final_layer, "attention": t.attention, "total": t.total,
+            "npu_gemm": t.npu_gemm, "npu_unpack": t.npu_unpack, "npu_calls": t.npu_calls, "npu_dsp": t.npu_dsp,
         })).collect::<Vec<_>>(),
+        "npu_audit": audit_json(audit.as_deref()),
     });
     write_json(a, &report)
 }
@@ -419,7 +626,7 @@ fn cmd_verify(a: &Args) -> Result<(), String> {
 
     let h = Handoff::load(&dir)?;
     let pool = make_pool(kind, threads)?;
-    let mut be = build_backend(&gguf, kind, threads, cfg, &pool, a.opt("arith"))?;
+    let mut be = build_backend(&gguf, kind, threads, cfg, &pool, a.opt("arith"), None)?;
     let steps = h.steps;
     if a.opt("teacher-step").is_some() {
         let i = a.usize_or("teacher-step", 0)?;
@@ -610,7 +817,27 @@ fn cond_args(a: &Args, prompt_flag: &str) -> Result<CondArgs, String> {
 fn cmd_cond_put(a: &Args) -> Result<(), String> {
     let mut ca = cond_args(a, "prompt-file")?;
     let dir = PathBuf::from(a.req("handoff")?);
-    let h = Handoff::load(&dir)?;
+    let mut h = Handoff::load(&dir)?;
+    // --te-gguf: the context comes from the native encoder; the hand-over still supplies pe and
+    // sigmas (prompt-independent at a fixed size and n_txt) and is the agreement reference.
+    let te = match (a.opt("te-gguf"), a.opt("te-ctx")) {
+        (Some(_), Some(_)) => return Err("--te-gguf and --te-ctx exclude each other".into()),
+        (None, Some(p)) => {
+            // a context computed earlier (e.g. the f32 reference written by te-check --te-out)
+            let v = qwen3_te::read_f32(Path::new(p))?;
+            if v.len() != h.txt.len() {
+                return Err(format!("--te-ctx: {} values, the hand-over context has {}", v.len(), h.txt.len()));
+            }
+            h.txt = v;
+            Some(json!({"context_file": p}))
+        }
+        (Some(te), None) => {
+            let (out, rep) = native_context(a, Path::new(te), &ca.prompt, &h)?;
+            h.txt = out.ctx;
+            Some(json!({"summary": out.summary, "vs_handoff": rep}))
+        }
+        (None, None) => None,
+    };
     // --sigmas stored (default): the entry describes the hand-over's own steps.
     // --sigmas computed: a partial hand-over (sd-cli stopped after model call 0, IMG-SHIP); the entry
     // gets --steps (default 4) computed sigmas, checked against every dumped one.
@@ -646,8 +873,82 @@ fn cmd_cond_put(a: &Args) -> Result<(), String> {
             "steps": ca.steps,
             "n_txt": h.n_txt,
             "n_img": h.n_img,
+            "text_encoder": te,
         }),
     )
+}
+
+/// Exit with code 4 when the prompt is outside the native encoder's subset (the caller keeps sd-cli).
+fn needs_reference(why: &str) -> ! {
+    eprintln!("oxi: the prompt needs sd.cpp's text encoder: {why}");
+    std::process::exit(4);
+}
+
+/// Encode `prompt` natively and compare it with the hand-over's context (same n_txt and width required).
+fn native_context(a: &Args, te: &Path, prompt: &[u8], h: &Handoff) -> Result<(qwen3_te::TeOutput, Value), String> {
+    let text = match std::str::from_utf8(prompt) {
+        Ok(t) => t,
+        Err(_) => needs_reference("prompt is not UTF-8"),
+    };
+    let backend = qwen3_te::backend_from_opts(&|k| a.opt(k).map(str::to_string))?;
+    let threads = a.usize_or("threads", 12)?;
+    let out = match qwen3_te::encode_prompt(te, text, backend, threads) {
+        Ok(o) => o,
+        Err(qwen3_te::TeError::NeedsReference(s)) => needs_reference(&s),
+        Err(qwen3_te::TeError::Other(e)) => return Err(format!("text encoder: {e}")),
+    };
+    if out.n != h.n_txt || out.ctx_dim != h.ctx_dim {
+        return Err(format!(
+            "text encoder: {} tokens x {} differ from the hand-over's {} x {} (prompt over {} tokens, or another size)",
+            out.n, out.ctx_dim, h.n_txt, h.ctx_dim, qwen3_te::config::KleinSpec::klein().min_len
+        ));
+    }
+    let spec = qwen3_te::config::KleinSpec::klein();
+    let width = out.ctx_dim / spec.out_layers.len();
+    let rep = qwen3_te::metrics::report(&out.ctx, &h.txt, out.n, out.n_real, width, &spec.out_layers)?;
+    Ok((out, rep))
+}
+
+/// Hidden-state gate of TEXT-ENCODER-NPU-DESIGN.md.
+/// Without `--te-ref`: absolute gate of the native context vs the hand-over's `dump.flux.txt`
+/// (`--gate-cos`, `--gate-rel`). With `--te-ref CTX.f32` (the `cpu-f32` exact reference, written by an
+/// earlier `te-check --te-out`): O-46 gate, the native context must be at least as close to the
+/// reference as sd.cpp's context is (`--gate-slack`, default 1.0); sd.cpp stays the reported anchor.
+fn cmd_te_check(a: &Args) -> Result<(), String> {
+    let te = PathBuf::from(a.req("te-gguf")?);
+    let prompt = std::fs::read(a.req("prompt-file")?).map_err(|e| format!("--prompt-file: {e}"))?;
+    let h = Handoff::load(Path::new(a.req("handoff")?))?;
+    let min_cos: f64 = a.opt("gate-cos").unwrap_or("0.999").parse().map_err(|_| "--gate-cos")?;
+    let max_rel: f64 = a.opt("gate-rel").unwrap_or("0.05").parse().map_err(|_| "--gate-rel")?;
+    let slack: f64 = a.opt("gate-slack").unwrap_or("1.0").parse().map_err(|_| "--gate-slack")?;
+    let (out, rep) = native_context(a, &te, &prompt, &h)?;
+    if let Some(p) = a.opt("te-out") {
+        qwen3_te::write_f32(Path::new(p), &out.ctx)?;
+    }
+    let spec = qwen3_te::config::KleinSpec::klein();
+    let width = out.ctx_dim / spec.out_layers.len();
+    let (pass, why, vs_ref, gate) = match a.opt("te-ref") {
+        Some(p) => {
+            let r = qwen3_te::read_f32(Path::new(p))?;
+            let cand = qwen3_te::metrics::report(&out.ctx, &r, out.n, out.n_real, width, &spec.out_layers)?;
+            let inst = qwen3_te::metrics::report(&h.txt, &r, out.n, out.n_real, width, &spec.out_layers)?;
+            let (ok, why) = qwen3_te::metrics::gate_vs_installed(&cand, &inst, slack);
+            (ok, why, json!({"candidate": cand, "installed_sdcpp": inst}), json!({"kind": "O-46 vs installed", "slack": slack}))
+        }
+        None => {
+            let (ok, why) = qwen3_te::metrics::gate(&rep, min_cos, max_rel);
+            (ok, why, Value::Null, json!({"kind": "absolute vs hand-over", "min_cos": min_cos, "max_rel_rmse": max_rel}))
+        }
+    };
+    write_json(
+        a,
+        &json!({"verdict": if pass { "PASS" } else { "FAIL" }, "fail": why, "gate": gate,
+                "summary": out.summary, "vs_handoff": rep, "vs_ref": vs_ref}),
+    )?;
+    if !pass {
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn cmd_generate_cond(a: &Args) -> Result<(), String> {
@@ -702,7 +1003,7 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
     inp.sigma_end = sigma_end;
 
     let pool = make_pool(kind, threads)?;
-    let mut be = build_backend(&ca.gguf, kind, threads, cfg, &pool, a.opt("arith"))?;
+    let mut be = build_backend(&ca.gguf, kind, threads, cfg, &pool, a.opt("arith"), npu_setup(a)?)?;
     let (gh, gw) = cond.grid;
     let mut step_secs = Vec::with_capacity(steps);
     let mut last = Instant::now();
@@ -724,6 +1025,13 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
     // the VAE's worker threads inherit this thread's mask (IMG-VAE: 12 VAE threads on one core,
     // 21.9 s instead of ~3 s). Dropping the pool restores the mask; it also frees the DiT weights.
     let backend_name = be.name();
+    if let Some(line) = be.npu_report() {
+        eprintln!("{line}");
+    }
+    let audit = be.npu_audit();
+    if let Some(lines) = &audit {
+        print_npu_audit(lines);
+    }
     let model_times = std::mem::take(&mut be.times);
     drop(be);
     drop(pool);
@@ -753,7 +1061,9 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
         "model_times": model_times.iter().map(|t| json!({
             "embed": t.embed, "double_blocks": t.double_blocks, "single_blocks": t.single_blocks,
             "final_layer": t.final_layer, "attention": t.attention, "total": t.total,
+            "npu_gemm": t.npu_gemm, "npu_unpack": t.npu_unpack, "npu_calls": t.npu_calls, "npu_dsp": t.npu_dsp,
         })).collect::<Vec<_>>(),
+        "npu_audit": audit_json(audit.as_deref()),
     });
     write_json(a, &report)
 }

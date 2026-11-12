@@ -98,7 +98,7 @@ jobs:
             echo "## Binaries"
             echo
             echo "Built by GitHub Actions from \`$TAG\` (commit $GITHUB_SHA) in [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID); nobody uploads binaries by hand."
-            echo "Linux aarch64, for ARMv8.6-A cores with dotprod, i8mm, fp16 and bf16 (Snapdragon X Elite / X Plus); glibc requirement and toolchain in each tarball's README.txt."
+            echo "Linux aarch64, for ARMv8.6-A cores with dotprod, i8mm, fp16 and bf16 (measured on Snapdragon X Elite X1E80100 only); glibc requirement and toolchain in each tarball's README.txt."
             echo "CI builds pass the model-free tests and the Flash selftest; they have not been through the lab's model-based identity gates, and their outputs can differ from the measured laptop builds in the last floating-point bits (README, \"Download\")."
             echo
             echo "| File | Contents |"

@@ -91,6 +91,7 @@
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 2784 | fn | `quantize_row_q8_K_ref` |
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 889 | fn | `get_scale_min_k4` |
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 556 | fn | `dequantize_row_q8_0` |
+| `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 1315 | fn | `dequantize_row_q3_K` |
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 1539 | fn | `dequantize_row_q4_K` |
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 1741 | fn | `dequantize_row_q5_K` |
 | `generated/quants_base.c` | `ggml/src/ggml-quants.c` | 1949 | fn | `dequantize_row_q6_K` |
@@ -104,7 +105,7 @@
 ## Checksums of generated files
 
 - `ggml-common.h` sha256 `0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c`
-- `quants_base.c` sha256 `8f687b39aee89807429bef181ea6dc4d563b18d3ad37a2644231f38ae385fc1f`
+- `quants_base.c` sha256 `2d4f5301dac900b19f511928cb2a2a2a3a45665c0184fc9feeec6501fe4f5690`
 - `quants_subset.c` sha256 `b8d9f2993d86b3cf0be0a552c97fd9dc474b0f1d54052992d65bde093c1706b5`
 - `repack_subset.cpp` sha256 `0f5b081886863267c6cd455d1ee9f8d98fa6e6b03f60a8a90800350fbbd6b3a1`
 - `upstream/include/ggml-alloc.h` sha256 `d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d`

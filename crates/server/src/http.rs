@@ -9,7 +9,7 @@
 //! compared in constant time; else 401.
 
 use crate::engine::Engine;
-use crate::service::{handle, Reply, State};
+use crate::service::{handle_session, Reply, State};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
@@ -228,11 +228,13 @@ pub async fn serve_with<E: Engine>(st: Arc<State<E>>, listener: TcpListener, acc
                         let r = Response::builder().status(204).header("Allow", "GET, POST, OPTIONS").body(RBody::Full(None)).unwrap();
                         return Ok::<_, Infallible>(r);
                     }
+                    // CACHE-PERFECT: the controller's session hint (a hint, never a cache key)
+                    let session = req.headers().get("x-oxe-session").and_then(|v| v.to_str().ok()).map(|s| s.chars().take(128).collect::<String>()).filter(|s| !s.is_empty());
                     let body = match collect(req.into_body()).await {
                         Ok(b) => b,
                         Err(e) => return Ok(json_resp(400, &crate::api::error_json(400, &e))),
                     };
-                    let reply = handle(st, &method, &path, &query, &body).await;
+                    let reply = handle_session(st, &method, &path, &query, &body, session).await;
                     Ok(match reply {
                         Reply::Json(code, v) => json_resp(code, &v),
                         Reply::Stream(rx) => Response::builder()

@@ -748,6 +748,131 @@ void oxe_attn_softmax_row_f16(const float * kq, int pos, int n_kv, float scale, 
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// O-70: fused single-pass decode / verify attention (flash-decoding style). NOT bitwise to the
+// ggml FA-off path above: the scores are the same bits (oxe_dot_f16_tile per K row), but the
+// softmax is taken per position chunk against the chunk's own max, the f16 weights are
+// exp(x - m_chunk) (not normalised), V^T . p accumulates in f16 over ONE chunk only (the ggml
+// path accumulates over all n_kv positions in f16), and the chunks are combined in f32 with the
+// usual rescale exp(m_chunk - M). Fixed chunk boundaries and a chunk-ordered merge make the result
+// independent of the thread count.
+// ---------------------------------------------------------------------------------------------
+
+// One (KV head, position chunk) work item. s: unscaled scores [col][ss] (f32; overwritten).
+// nvalid[c]: column c's valid prefix of the chunk (0..len; masked positions are not read).
+// len % 32 == 0: V^T rows vt + d*v_stride are read on [0, len) (finite beyond the valid prefix;
+// those weights are +0). len_full (>= len, % 32 == 0): the dot length the result must equal
+// (oxe_dot_f16_tile's tail rule; V^T rows readable and finite up to it): the full chunk, so a
+// column's partial does not depend on how far the run's last lane reaches (batch invariance).
+// p16: ncol*len halves of scratch. Writes the partial
+// out[c*hd + d] = sum_p f16(exp(scale*s[c][p] - m_c)) * V[p][d] (f16 accumulation, one chunk),
+// m[c] = max_p scale*s[c][p] (-inf when nvalid[c] == 0) and l[c] = sum_p f16(...) in f32 (0 then):
+// ml[c] = m, ml[ncol + c] = l.
+void oxe_attn_fchunk_f16(float * s, int64_t ss, int ncol, const int * nvalid, int len, int len_full, float scale,
+                         const ggml_fp16_t * vt, int64_t v_stride, int hd, ggml_fp16_t * p16, float * out,
+                         float * ml) {
+    for (int c = 0; c < ncol; c++) {
+        float * x = s + (int64_t) c * ss;
+        ggml_fp16_t * p = p16 + (int64_t) c * len;
+        const int nv = std::min(std::max(nvalid[c], 0), len);
+        float m = -INFINITY;
+        float l = 0.0f;
+        int i = 0;
+        if (nv > 0) {
+            ggml_vec_scale_f32(nv, x, scale);
+            ggml_vec_max_f32(nv, &m, x);
+            ggml_vec_soft_max_f32(nv, x, x, m);  // in place: x[i] = exp(x[i] - m)
+            // the f16 weights and the f32 sum of exactly those weights (the normaliser)
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (; i + 3 < nv; i += 4) {
+                const float16x4_t h = vcvt_f16_f32(vld1q_f32(x + i));
+                vst1_f16((__fp16 *) (p + i), h);
+                acc = vaddq_f32(acc, vcvt_f32_f16(h));
+            }
+            l = vaddvq_f32(acc);
+            for (; i < nv; i++) {
+                const __fp16 h = (__fp16) x[i];
+                memcpy(p + i, &h, 2);
+                l += (float) h;
+            }
+        }
+        for (; i < len; i++) {
+            p[i] = 0;
+        }
+        ml[c] = m;
+        ml[ncol + c] = l;
+    }
+    int nf[256];
+    const bool tail = len_full > len && ncol <= 256;
+    for (int c = 0; tail && c < ncol; c++) {
+        nf[c] = len_full;
+    }
+    oxe_dot_f16_tile(len, vt, v_stride, hd, p16, len, ncol, out, 1, hd, tail ? nf : nullptr);
+}
+
+// Merge of one column's chunk partials for dims [d0, d1): with M = max over chunks of m,
+// w_ch = exp(m_ch - M) (0 for an empty chunk, l_ch == 0), L = sum w_ch * l_ch (chunk order),
+// out[d] = (sum_ch w_ch * part[ch*ps + d]) * (1/L) * gate[d] (fma chain in chunk order).
+// m / l of chunk ch at m[ch*mls] / l[ch*mls]. w: round_up(nch, 4) floats of scratch. The result
+// of every d depends only on the chunk data, not on [d0, d1) (vector and scalar steps are both one
+// fma), nor on trailing empty chunks (weight-0 chunks are skipped; every exp is the vector one).
+void oxe_attn_fmerge_f32(int nch, const float * part, int64_t ps, const float * m, const float * l, int64_t mls,
+                         int d0, int d1, const float * gate, float * out, float * w) {
+    float mx = -INFINITY;
+    for (int c = 0; c < nch; c++) {
+        if (l[c * mls] > 0.0f) {
+            mx = std::max(mx, m[c * mls]);
+        }
+    }
+    const int nc4 = (nch + 3) & ~3;
+    for (int c = 0; c < nc4; c++) {
+        w[c] = c < nch && l[c * mls] > 0.0f ? m[c * mls] : mx;
+    }
+    const float32x4_t vmx = vdupq_n_f32(mx);
+    for (int c = 0; c < nc4; c += 4) {
+        vst1q_f32(w + c, ggml_v_expf(vsubq_f32(vld1q_f32(w + c), vmx)));  // w = exp(m - M)
+    }
+    float lsum = 0.0f;
+    for (int c = 0; c < nch; c++) {
+        if (!(l[c * mls] > 0.0f)) {
+            w[c] = 0.0f;
+        }
+        if (w[c] != 0.0f) {
+            lsum = fmaf(w[c], l[c * mls], lsum);
+        }
+    }
+    const float inv = 1.0f / lsum;
+    int d = d0;
+    for (; d < d1 && (d & 3); d++) {
+        float acc = 0.0f;
+        for (int c = 0; c < nch; c++) {
+            if (w[c] != 0.0f) {
+                acc = fmaf(w[c], part[c * ps + d], acc);
+            }
+        }
+        out[d] = (acc * inv) * gate[d];
+    }
+    for (; d + 3 < d1; d += 4) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int c = 0; c < nch; c++) {
+            if (w[c] != 0.0f) {
+                acc = vfmaq_n_f32(acc, vld1q_f32(part + c * ps + d), w[c]);
+            }
+        }
+        vst1q_f32(out + d, vmulq_f32(vmulq_n_f32(acc, inv), vld1q_f32(gate + d)));
+    }
+    for (; d < d1; d++) {
+        float acc = 0.0f;
+        for (int c = 0; c < nch; c++) {
+            if (w[c] != 0.0f) {
+                acc = fmaf(w[c], part[c * ps + d], acc);
+            }
+        }
+        out[d] = (acc * inv) * gate[d];
+    }
+}
+
 }  // extern "C"
 
 // ---------------------------------------------------------------------------------------------

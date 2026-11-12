@@ -4,8 +4,8 @@
 #
 #   tools/run_prefill_verify.sh [--cpu-list 0-7] [fixture ...]
 # fixtures default to the six under ~/.cache/local-ai/snapdragon-engine/oracle/{ornith,qwen36}-pf{64,512,2048}
-# (made by tools/oracle/bin/dump_ref --batch --ubatch 256 --last-only --state ... --gen 8; see M3-PREFILL.md).
-# Long-context fixtures {ornith,qwen36}-lc8k (8180 tokens + 32 decode rows): tools/make_lc8k_fixtures.sh (M3-ATTN.md).
+# (made by tools/oracle/bin/dump_ref --batch --ubatch 256 --last-only --state ... --gen 8; see docs/lab-notes/M3-PREFILL.md).
+# Long-context fixtures {ornith,qwen36}-lc8k (8180 tokens + 32 decode rows): tools/make_lc8k_fixtures.sh (docs/lab-notes/M3-ATTN.md).
 set -uo pipefail
 MODELS="${OXE_MODEL_DIR:-$HOME/.local/share/ai-stack/models/llm}"
 cd "$(dirname "$0")/.."

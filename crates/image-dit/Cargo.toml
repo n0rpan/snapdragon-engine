@@ -10,6 +10,7 @@ description = "Image engine (FLUX.2 klein DiT): M0 single-stream block prototype
 gguf = { path = "../gguf" }
 sched = { path = "../sched" }
 int8-gemm = { path = "../int8-gemm" }
+oxn = { path = "../oxn" }
 serde_json.workspace = true
 
 [[bin]]

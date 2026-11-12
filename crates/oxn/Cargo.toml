@@ -1,0 +1,19 @@
+[package]
+name = "oxn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "oxn: host session API and CPU emulation of the NPU-1 oxn HMX GEMM contract (device backend behind the `device` feature)"
+build = "build.rs"
+
+[features]
+default = []
+# Device backend: compiles npu/oxn/host/oxn_host.c against the open-source FastRPC headers in $FASTRPC_INC.
+device = []
+
+[dependencies]
+sched = { path = "../sched" }
+
+[build-dependencies]
+cc.workspace = true

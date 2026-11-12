@@ -1,0 +1,151 @@
+name: ci-arm64
+# Build + model-free tests on the lab's own aarch64 helper (self-hosted, label lab-arm64: an Apple
+# M2 under Asahi Linux, user-level runner, no secrets, no models, no Qualcomm SDK). Frees the
+# Snapdragon laptop from builds and functional tests; timing and final gates stay on the laptop.
+# Same commands as build.yml (GitHub-hosted, unchanged). M2 has NEON/dotprod/i8mm/fp16/bf16 like
+# Oryon and no SVE; the production flags (target-cpu=oryon-1, ggml -march=armv8.6-a+...+nosve)
+# run there. The Hexagon/NPU paths are not built or tested here (no feature needs them by default).
+# Toolchain on the runner (user-level): rustup in ~/.rustup + ~/.cargo, cmake/ninja in ~/.local/bin.
+# Caches live outside the checkout under ~/.cache/oxe-ci and are wiped when they grow too large.
+on:
+  push:
+    branches: [main, claude/v012-candidate]  # other claude/* branches: gh workflow run --ref <branch>
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: "1.99.1"
+  RUSTUP_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "8"
+  CARGO_INCREMENTAL: "0"
+  # bounded caches (GiB) and the minimum free space the helper must keep (GiB)
+  TARGET_CACHE_MAX_GIB: "25"
+  MIN_FREE_GIB: "20"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  engine:
+    name: oxe-server (MoE) + oxi, model-free tests
+    runs-on: [self-hosted, lab-arm64]
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../oxe-ci-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and disk
+        run: tools/ci/selfhosted_prep.sh
+      - name: Build oxe-server and oxi
+        run: cargo build --release --locked -p server -p image-flow --bin oxe-server --bin oxi
+      - name: Smoke
+        run: |
+          "$CARGO_TARGET_DIR/release/oxe-server" --help > help.txt && head -n 3 help.txt
+      - name: Capability markers in the built binary (the controller's read-only probes, lab oxe_runtime)
+        # engine_has_state_cache: each flag name followed by a space; engine_has_state_preload: the
+        # literal capability marker. Checked on the compiled artifact (LTO), not on the source.
+        run: |
+          bin="$CARGO_TARGET_DIR/release/oxe-server"
+          for m in '--state-cache ' '--state-budget-bytes ' '--state-ttl-secs ' 'oxe-capability state-preload-v1'; do
+            if grep -aqF -- "$m" "$bin"; then echo "present: [$m]"; else echo "MISSING in the binary: [$m]"; exit 1; fi
+          done
+          grep -qF 'oxe-capability state-preload-v1' help.txt
+          "$CARGO_TARGET_DIR/release/oxi" > oxi.txt 2>&1 || true
+          head -n 3 oxi.txt
+      - name: Model-free tests (workspace without the Flash crate)
+        timeout-minutes: 40
+        run: |
+          ulimit -c 0  # no core dumps from the deliberate-abort tests (tests::panic_child)
+          cargo test --release --locked --no-fail-fast --workspace --exclude qwen4exp
+      - name: Bench-only f32-reference feature (oxe fused-ref) builds; its model-free tests pass
+        timeout-minutes: 20
+        run: |
+          cargo build --release --locked -p oxe-cli --features f32-reference --bin oxe
+          cargo test --release --locked --no-fail-fast -p model --features f32-reference --lib fused_ref
+
+  flash:
+    name: oxe-server --features flash, model-free tests
+    runs-on: [self-hosted, lab-arm64]
+    needs: engine
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../oxe-ci-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and disk
+        run: tools/ci/selfhosted_prep.sh
+      - name: Model-free Flash package licence fixtures
+        run: python3 -I tools/ci/test_flash_package.py
+      - name: Production ggml from the pinned public sources (cached by script + patch hash)
+        run: |
+          key=$(cat tools/ci/build_ggml_prod.sh patches/flash-demand-mapping.patch | sha256sum | cut -c1-16)
+          prod="$GITHUB_WORKSPACE/../oxe-ci-ggml-prod-$key"
+          if [ ! -f "$prod/.complete" ]; then
+            rm -rf "$GITHUB_WORKSPACE"/../oxe-ci-ggml-prod-* "$RUNNER_TEMP/flash-src"
+            OXF_GGML_PROD="$prod" GGML_PROD_JOBS=8 tools/ci/build_ggml_prod.sh "$RUNNER_TEMP/flash-src"
+            touch "$prod/.complete"
+            rm -rf "$RUNNER_TEMP/flash-src"
+          fi
+          echo "OXF_GGML_PROD=$(cd "$prod" && pwd)" >> "$GITHUB_ENV"
+      - name: Build oxe-server --features flash, flash-m0, flash-m3
+        run: >-
+          cargo build --release --locked -p server -p qwen4exp --features server/flash
+          --bin oxe-server --bin flash-m0 --bin flash-m3
+      - name: Model-free tests (Flash)
+        timeout-minutes: 40
+        run: |
+          ulimit -c 0  # no core dumps from the deliberate-abort tests (tests::panic_child)
+          cargo test --release --locked --no-fail-fast -p server --lib --features flash
+          cargo test --release --locked --no-fail-fast -p qwen4exp
+          "$CARGO_TARGET_DIR/release/flash-m3" selftest | tee selftest.txt
+          ! grep -q FAIL selftest.txt
+
+  cache-functional:
+    # CACHE-PERFECT Plan A: the real oxe-server over HTTP on a SYNTHETIC qwen35moe (no weights) that
+    # carries the real Qwen3.6 tokenizer and chat template (committed metadata fixture, Apache-2.0).
+    # Checks per-turn cache hits, ECHO (thinking on/off, tool calls, reasoning), restart resume with
+    # bitwise-equal output, budget/clear and compaction. See tools/ci/cache_functional.py.
+    name: cache functional (synthetic model, HTTP)
+    runs-on: [self-hosted, lab-arm64]
+    needs: engine
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../oxe-ci-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and disk
+        run: tools/ci/selfhosted_prep.sh
+      - name: Build oxe-server
+        run: cargo build --release --locked -p server --bin oxe-server
+      - name: Fixture check (committed tokenizer + chat template metadata, no weights)
+        run: python3 -I tools/ci/qwen36_tokenizer_fixture.py check tests/fixtures/qwen36-tokenizer.json.gz
+      - name: Synthetic model (fixture tokenizer, filler weights, scratch dir)
+        run: |
+          work="$RUNNER_TEMP/cache-functional"
+          rm -rf "$work"; mkdir -p "$work"
+          python3 -I tools/ci/synth_qwen36_model.py --fixture tests/fixtures/qwen36-tokenizer.json.gz \
+            --out "$work/synth-qwen36.gguf"
+      - name: Cache functional test (isolated HOME per scenario)
+        timeout-minutes: 40
+        run: |
+          work="$RUNNER_TEMP/cache-functional"
+          python3 -I tools/ci/cache_functional.py --binary "$CARGO_TARGET_DIR/release/oxe-server" \
+            --model "$work/synth-qwen36.gguf" --work "$work/run" --report "$work/report.json"
+      - name: Clean scratch
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/cache-functional"

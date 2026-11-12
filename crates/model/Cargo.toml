@@ -6,11 +6,19 @@ license.workspace = true
 publish.workspace = true
 description = "qwen35moe descriptor, load-time repack, static per-token plan and the M0 timing executor"
 
+[features]
+npu-prefill = []
+f32-reference = []
+npu-device = ["npu-prefill", "oxn/device"]
+# the synthetic mini GGUF writer for other crates' tests (server: OxeEngine state tests)
+testkit = []
+
 [dependencies]
 gguf = { path = "../gguf" }
 kernels-sys = { path = "../kernels-sys" }
 sched = { path = "../sched" }
 libc.workspace = true
+oxn = { path = "../oxn" }
 
 [dev-dependencies]
 serde_json.workspace = true

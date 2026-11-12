@@ -49,6 +49,10 @@ pub trait Engine: Send + 'static {
     /// (Flash) aborts it when the flag rises, rolls its state back to the call's start and returns an error whose
     /// text starts with [`CANCELLED_MARK`]; generate() then reports a cancel with engine and cache in step.
     fn set_cancel(&mut self, _flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {}
+    /// W2 opt-in backend teardown while the worker owns its engine exclusively.
+    /// Must complete before the process exits; ordinary engines own no devices.
+    #[cfg(feature="npu-prefill")]
+    fn release_accelerators(&mut self) {}
     /// Append one token and return the logits after it (the decode hot path).
     fn decode(&mut self, token: u32) -> Result<&[f32]> {
         self.prefill(&[token])
@@ -142,6 +146,45 @@ pub trait Engine: Send + 'static {
     /// becomes `n_pos`. On error the caller resets the engine.
     fn load_state(&mut self, _r: &mut dyn std::io::Read, _n_pos: usize) -> Result<()> {
         Err(EngineError("engine has no persistent state".into()))
+    }
+
+    // ---- CACHE-PERFECT P2 segmented state (crate::state_store). Engines without it keep the
+    // defaults (kv_row_bytes 0) and the state store stays off for them (Flash v1).
+
+    /// Bytes [`Engine::kv_rows_save`] writes per position; 0 = no segmented state.
+    fn kv_row_bytes(&self) -> usize {
+        0
+    }
+    /// Write the attention KV rows (every attention layer, the MTP layer included) of positions
+    /// [a, b), b <= n_past. Layout is the engine's; the same engine reads it back.
+    fn kv_rows_save(&mut self, _a: usize, _b: usize, _w: &mut dyn std::io::Write) -> Result<()> {
+        Err(EngineError("engine has no segmented state".into()))
+    }
+    /// Read rows of [`Engine::kv_rows_save`] into positions [a, b). `n_past` does not change; the
+    /// caller loads rows from position 0 up and finishes with [`Engine::snap_load`].
+    fn kv_rows_load(&mut self, _a: usize, _b: usize, _r: &mut dyn std::io::Read) -> Result<()> {
+        Err(EngineError("engine has no segmented state".into()))
+    }
+    /// Write the non-KV part of a checkpoint (recurrent + conv state, MTP driver state) taken at
+    /// some position p; its KV rows below p are written separately.
+    fn snap_save(&mut self, _s: &Self::Snapshot, _w: &mut dyn std::io::Write) -> Result<()> {
+        Err(EngineError("engine has no segmented state".into()))
+    }
+    /// [`Engine::snap_save`] of the LIVE state (as of [`Engine::snapshot`] now) without building
+    /// a snapshot copy first (CACHE-PERFECT P2b, M2: the shutdown write's memory floor).
+    fn snap_save_live(&mut self, w: &mut dyn std::io::Write) -> Result<()> {
+        let s = self.snapshot()?;
+        self.snap_save(&s, w)
+    }
+    /// Read a [`Engine::snap_save`] taken at `n_pos`, after the KV rows below `n_pos` were loaded:
+    /// the engine is then exactly at that checkpoint and `n_past == n_pos`.
+    fn snap_load(&mut self, _r: &mut dyn std::io::Read, _n_pos: usize) -> Result<()> {
+        Err(EngineError("engine has no segmented state".into()))
+    }
+    /// Numerics-relevant settings beyond the state layout (attention path, tiling, fused kernels):
+    /// part of the state-store identity (Codex P0 review: the EFFECTIVE arithmetic mode).
+    fn arith_id(&self) -> String {
+        String::new()
     }
 
     // ---- warm-up hint (`--flash-hotset`): engine caches worth refilling at process start.
@@ -282,6 +325,10 @@ impl Engine for StubEngine {
         self.calls.push(("snapshot", self.tokens.len(), 0));
         Ok(StubSnapshot { tokens: self.tokens.clone(), script_pos: self.script_pos })
     }
+    /// Exactly the bytes `save_state` writes (LONG-CTX disk-park threshold tests).
+    fn state_size_hint(&self) -> usize {
+        4 * self.tokens.len() + 8
+    }
     fn snapshot_bytes(s: &StubSnapshot) -> usize {
         4 * s.tokens.len() + 8
     }
@@ -310,6 +357,49 @@ impl Engine for StubEngine {
         self.tokens = b[..n_pos * 4].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         self.script_pos = u64::from_le_bytes(b[n_pos * 4..].try_into().unwrap()) as usize;
         self.fresh = true;
+        Ok(())
+    }
+    /// "KV rows" of the stub = the token ids at those positions.
+    fn kv_row_bytes(&self) -> usize {
+        4
+    }
+    fn kv_rows_save(&mut self, a: usize, b: usize, w: &mut dyn std::io::Write) -> Result<()> {
+        if a > b || b > self.tokens.len() {
+            return Err(EngineError("stub: rows beyond n_past".into()));
+        }
+        for &t in &self.tokens[a..b] {
+            w.write_all(&t.to_le_bytes()).map_err(|e| EngineError(e.to_string()))?;
+        }
+        Ok(())
+    }
+    fn kv_rows_load(&mut self, a: usize, b: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        if a > b || b > self.n_ctx {
+            return Err(EngineError("stub: rows beyond n_ctx".into()));
+        }
+        let mut buf = vec![0u8; (b - a) * 4];
+        r.read_exact(&mut buf).map_err(|e| EngineError(e.to_string()))?;
+        self.tokens.truncate(a);
+        self.tokens.extend(buf.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+        self.calls.push(("rows", a, b - a));
+        Ok(())
+    }
+    fn snap_save(&mut self, s: &StubSnapshot, w: &mut dyn std::io::Write) -> Result<()> {
+        let e = |e: std::io::Error| EngineError(e.to_string());
+        w.write_all(&(s.tokens.len() as u64).to_le_bytes()).map_err(e)?;
+        w.write_all(&(s.script_pos as u64).to_le_bytes()).map_err(e)
+    }
+    fn snap_load(&mut self, r: &mut dyn std::io::Read, n_pos: usize) -> Result<()> {
+        let e = |e: std::io::Error| EngineError(e.to_string());
+        let mut u = [0u8; 16];
+        r.read_exact(&mut u).map_err(e)?;
+        let pos = u64::from_le_bytes(u[..8].try_into().unwrap()) as usize;
+        if pos != n_pos || self.tokens.len() < n_pos {
+            return Err(EngineError("stub: snapshot position does not match its rows".into()));
+        }
+        self.tokens.truncate(n_pos);
+        self.script_pos = u64::from_le_bytes(u[8..].try_into().unwrap()) as usize;
+        self.fresh = true;
+        self.calls.push(("snap", n_pos, 0));
         Ok(())
     }
     fn restore(&mut self, s: &StubSnapshot) -> Result<()> {

@@ -3,3 +3,4 @@
 /results/
 tools/oracle/bin/
 __pycache__/
+/npu/oxn/build/

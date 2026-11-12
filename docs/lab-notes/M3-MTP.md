@@ -1,5 +1,7 @@
 # M3.1: MTP speculative decoding (exact)
 
+> **Historical working note.** The branches and worktrees named here were merged into `main` and then deleted; the commit hashes cited still resolve in `main`'s history. Current state: [README](README.md).
+
 **Update, 2026-11-10: rebased on M3.2 (batched prefill, 9833695, plus `prefill-mmid-pad`
 267bb7c/04c1667) and merged to main.**
 - **Codex's timing:** Qwen3.6 goes from 33.07 to **43.05 tok/s at depth 2 (+30 %)**, with depth 3

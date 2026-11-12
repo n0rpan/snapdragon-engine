@@ -37,6 +37,7 @@ fn main() {
         .flag(CPU_ARCH)
         .flag("-std=gnu++17")
         .file(csrc.join("oxe_shim.cpp"))
+        .file(csrc.join("oxe_native_quant.cpp"))
         .compile("oxe_ggml_cpp");
 
     // ggml-cpu C++: upstream vec.cpp verbatim + the ported ops (against the upstream headers)
@@ -59,6 +60,7 @@ fn main() {
     base(&mut c0);
     c0.include(&vendor).include(&generated).file(generated.join("quants_base.c")).flag("-std=gnu11").compile("oxe_ggml_base");
 
+    println!("cargo:rerun-if-changed={}", root.join("npu/oxn/common").display());
     println!("cargo:rerun-if-changed={}", vendor.display());
     println!("cargo:rerun-if-changed={}", csrc.display());
     println!("cargo:rustc-env=OXE_KERNEL_CFLAGS=ggml-cpu: -O3 -DNDEBUG {CPU_ARCH}; ggml-base: -O3 -DNDEBUG");

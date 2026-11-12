@@ -7,6 +7,7 @@
 //! - [`arith`]: activation rounding for the sd.cpp arithmetic-parity reference (W5-G).
 //! - [`attn_float`]: f32 / f16 attention option of the fast path (F-IMG-ATTN; linears stay int8).
 //! - [`fast`]: the int8 SMMLA path on a static per-thread plan (`int8-gemm` + `sched`).
+//! - [`npu`]: the accelerator path of the fast model (oxn GEMMs for a budgeted subset of the linears).
 //! - [`backend`]: the block-level backend trait the CPU path implements and an NPU path can implement later.
 //!
 //! Design: `IMAGE-ENGINE-DESIGN.md` at the repository root.
@@ -18,6 +19,7 @@ pub mod dump;
 pub mod fast;
 pub mod fast_model;
 pub mod model;
+pub mod npu;
 pub mod reference;
 pub mod types;
 pub mod weights;

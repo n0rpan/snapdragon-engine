@@ -10,6 +10,8 @@ use kernels_sys::{quantize_act, vec_dot_generic, QType};
 use serde_json::Value as J;
 use std::path::PathBuf;
 use std::time::Duration;
+#[allow(unused_imports)]
+use crate::testkit::*;
 
 fn fixture(name: &str) -> J {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(format!("{name}.json"));
@@ -79,34 +81,6 @@ fn check_budget(key: &str) {
         b.total() as f64 / 1e9,
         plan.barriers_per_token()
     );
-}
-
-fn rng_bytes(n: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..n)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
-
-
-fn fix_scales(q: QType, v: &mut [u8]) {
-    let one = [0x00u8, 0x20]; // f16 0.0078125
-    for blk in v.chunks_mut(q.block_bytes()) {
-        match q {
-            QType::Q4K | QType::Q5K => {
-                blk[0..2].copy_from_slice(&one);
-                blk[2..4].copy_from_slice(&one);
-            }
-            QType::Q3K => blk[108..110].copy_from_slice(&one),
-            QType::Q6K => blk[208..210].copy_from_slice(&one),
-            QType::Q8_0 => blk[0..2].copy_from_slice(&one),
-        }
-    }
 }
 
 #[test]
@@ -186,187 +160,6 @@ fn real_models_first_row_group_repack_matches() {
 }
 
 // ------------------------------------------------------------------ mini GGUF end to end
-
-struct GgufWriter {
-    kv: Vec<u8>,
-    n_kv: u64,
-    tensors: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)>,
-}
-
-impl GgufWriter {
-    fn key(&mut self, k: &str, vtype: u32) {
-        self.kv.extend((k.len() as u64).to_le_bytes());
-        self.kv.extend(k.as_bytes());
-        self.kv.extend(vtype.to_le_bytes());
-        self.n_kv += 1;
-    }
-    fn u32(&mut self, k: &str, v: u32) {
-        self.key(k, 4);
-        self.kv.extend(v.to_le_bytes());
-    }
-    fn f32(&mut self, k: &str, v: f32) {
-        self.key(k, 6);
-        self.kv.extend(v.to_le_bytes());
-    }
-    fn arr_i32(&mut self, k: &str, v: &[i32]) {
-        self.key(k, 9);
-        self.kv.extend(5u32.to_le_bytes());
-        self.kv.extend((v.len() as u64).to_le_bytes());
-        v.iter().for_each(|x| self.kv.extend(x.to_le_bytes()));
-    }
-    fn str(&mut self, k: &str, v: &str) {
-        self.key(k, 8);
-        self.kv.extend((v.len() as u64).to_le_bytes());
-        self.kv.extend(v.as_bytes());
-    }
-    fn tensor(&mut self, name: &str, shape: &[u64], ty: GgmlType, seed: u64) {
-        let t = TensorInfo { name: name.into(), shape: shape.to_vec(), ty, offset: 0 };
-        let n = t.bytes() as usize;
-        let data = if ty == GgmlType(30) {
-            // BF16: small finite values
-            (0..n / 2).flat_map(|i| ((((((i * 7 + seed as usize) % 19) as f32) * 0.01 - 0.09).to_bits() >> 16) as u16).to_le_bytes()).collect()
-        } else { match crate::desc::qtype(ty) {
-            Some(q) => {
-                let mut v = rng_bytes(n, seed);
-                fix_scales(q, &mut v);
-                v
-            }
-            None => (0..n / 4).flat_map(|i| (((i * 7 + seed as usize) % 19) as f32 * 0.01 - 0.09).to_le_bytes()).collect(),
-        } };
-        self.tensors.push((name.into(), shape.to_vec(), ty, data));
-    }
-    fn write(&self, path: &std::path::Path) {
-        let mut b = b"GGUF".to_vec();
-        b.extend(3u32.to_le_bytes());
-        b.extend((self.tensors.len() as u64).to_le_bytes());
-        b.extend(self.n_kv.to_le_bytes());
-        b.extend(&self.kv);
-        let mut off = 0u64;
-        let mut offs = Vec::new();
-        for (name, shape, ty, data) in &self.tensors {
-            b.extend((name.len() as u64).to_le_bytes());
-            b.extend(name.as_bytes());
-            b.extend((shape.len() as u32).to_le_bytes());
-            shape.iter().for_each(|d| b.extend(d.to_le_bytes()));
-            b.extend(ty.0.to_le_bytes());
-            b.extend(off.to_le_bytes());
-            offs.push(off);
-            off = (off + data.len() as u64).div_ceil(32) * 32;
-        }
-        b.resize(b.len().div_ceil(32) * 32, 0);
-        let base = b.len();
-        for ((_, _, _, data), o) in self.tensors.iter().zip(offs) {
-            b.resize(base + o as usize, 0);
-            b.extend(data);
-        }
-        std::fs::write(path, b).unwrap();
-    }
-}
-
-/// A 4-layer qwen35moe with tiny dims (3 delta-net + 1 attention, 8 experts top-2,
-/// Q3_K / Q4_K / Q5_K experts, Q6_K and Q8_0 shared experts, Q6_K head, F32 beta/alpha).
-fn mini_model(path: &std::path::Path) {
-    mini_model_ext(path, false)
-}
-
-/// The mini model (GQA: 4 query heads over 2 KV heads), optionally with an MTP block `blk.4` (attention + MoE with Q8_0 experts
-/// like Ornith's head, BF16 router like Qwen3.6's, nextn eh_proj/enorm/hnorm/shared_head_norm).
-fn mini_model_ext(path: &std::path::Path, mtp: bool) {
-    let mut w = GgufWriter { kv: vec![], n_kv: 0, tensors: vec![] };
-    let a = "qwen35moe";
-    w.str("general.architecture", a);
-    w.u32("general.alignment", 32);
-    for (k, v) in [
-        ("block_count", if mtp { 5 } else { 4 }),
-        ("nextn_predict_layers", mtp as u32),
-        ("full_attention_interval", 4),
-        ("embedding_length", 256),
-        ("attention.head_count", 4),
-        ("attention.head_count_kv", 2),
-        ("attention.key_length", 128),
-        ("attention.value_length", 128),
-        ("expert_count", 8),
-        ("expert_used_count", 2),
-        ("expert_feed_forward_length", 256),
-        ("expert_shared_feed_forward_length", 256),
-        ("ssm.conv_kernel", 4),
-        ("ssm.state_size", 128),
-        ("ssm.group_count", 1),
-        ("ssm.time_step_rank", 2),
-        ("ssm.inner_size", 256),
-    ] {
-        w.u32(&format!("{a}.{k}"), v);
-    }
-    w.f32(&format!("{a}.attention.layer_norm_rms_epsilon"), 1e-6);
-    w.u32(&format!("{a}.rope.dimension_count"), 64);
-    w.u32(&format!("{a}.context_length"), 4096);
-    w.f32(&format!("{a}.rope.freq_base"), 1e7);
-    w.arr_i32(&format!("{a}.rope.dimension_sections"), &[11, 11, 10, 0]);
-    let (e, f32_, q3, q4, q6) = (256u64, GgmlType::F32, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q6_K);
-    w.tensor("token_embd.weight", &[e, 64], q4, 1);
-    w.tensor("output_norm.weight", &[e], f32_, 2);
-    w.tensor("output.weight", &[e, 64], q6, 3);
-    for il in 0..4u64 {
-        let p = |s: &str| format!("blk.{il}.{s}");
-        let s = 100 * (il + 1);
-        w.tensor(&p("attn_norm.weight"), &[e], f32_, s);
-        w.tensor(&p("post_attention_norm.weight"), &[e], f32_, s + 1);
-        if il == 3 {
-            w.tensor(&p("attn_q.weight"), &[e, 1024], q4, s + 2);
-            w.tensor(&p("attn_k.weight"), &[e, 256], q4, s + 3);
-            w.tensor(&p("attn_v.weight"), &[e, 256], q4, s + 4);
-            w.tensor(&p("attn_q_norm.weight"), &[128], f32_, s + 5);
-            w.tensor(&p("attn_k_norm.weight"), &[128], f32_, s + 6);
-            w.tensor(&p("attn_output.weight"), &[512, e], q4, s + 7);
-        } else {
-            w.tensor(&p("attn_qkv.weight"), &[e, 512], q4, s + 2);
-            w.tensor(&p("attn_gate.weight"), &[e, 256], q4, s + 3);
-            w.tensor(&p("ssm_beta.weight"), &[e, 2], f32_, s + 4);
-            w.tensor(&p("ssm_alpha.weight"), &[e, 2], f32_, s + 5);
-            w.tensor(&p("ssm_conv1d.weight"), &[4, 512], f32_, s + 6);
-            w.tensor(&p("ssm_a"), &[2], f32_, s + 7);
-            w.tensor(&p("ssm_dt.bias"), &[2], f32_, s + 8);
-            w.tensor(&p("ssm_norm.weight"), &[128], f32_, s + 9);
-            w.tensor(&p("ssm_out.weight"), &[256, e], q4, s + 10);
-        }
-        let xt = [q3, q4, GgmlType::Q5_K, q4][il as usize];
-        w.tensor(&p("ffn_gate_inp.weight"), &[e, 8], f32_, s + 11);
-        w.tensor(&p("ffn_gate_inp_shexp.weight"), &[e], f32_, s + 12);
-        w.tensor(&p("ffn_gate_exps.weight"), &[e, 256, 8], xt, s + 13);
-        w.tensor(&p("ffn_up_exps.weight"), &[e, 256, 8], xt, s + 14);
-        w.tensor(&p("ffn_down_exps.weight"), &[256, e, 8], xt, s + 15);
-        let st = if il == 1 { GgmlType::Q8_0 } else { q6 };
-        w.tensor(&p("ffn_gate_shexp.weight"), &[e, 256], st, s + 16);
-        w.tensor(&p("ffn_up_shexp.weight"), &[e, 256], st, s + 17);
-        w.tensor(&p("ffn_down_shexp.weight"), &[256, e], q6, s + 18);
-    }
-    if mtp {
-        let p = |s: &str| format!("blk.4.{s}");
-        let (q8, bf) = (GgmlType::Q8_0, GgmlType(30));
-        w.tensor(&p("attn_norm.weight"), &[e], f32_, 901);
-        w.tensor(&p("post_attention_norm.weight"), &[e], f32_, 902);
-        w.tensor(&p("attn_q.weight"), &[e, 512], q8, 903);
-        w.tensor(&p("attn_k.weight"), &[e, 128], q8, 904);
-        w.tensor(&p("attn_v.weight"), &[e, 128], q8, 905);
-        w.tensor(&p("attn_q_norm.weight"), &[128], f32_, 906);
-        w.tensor(&p("attn_k_norm.weight"), &[128], f32_, 907);
-        w.tensor(&p("attn_output.weight"), &[256, e], q8, 908);
-        w.tensor(&p("ffn_gate_inp.weight"), &[e, 8], bf, 911);
-        w.tensor(&p("ffn_gate_inp_shexp.weight"), &[e], bf, 912);
-        w.tensor(&p("ffn_gate_exps.weight"), &[e, 256, 8], q8, 913);
-        w.tensor(&p("ffn_up_exps.weight"), &[e, 256, 8], q8, 914);
-        w.tensor(&p("ffn_down_exps.weight"), &[256, e, 8], q8, 915);
-        w.tensor(&p("ffn_gate_shexp.weight"), &[e, 256], q8, 916);
-        w.tensor(&p("ffn_up_shexp.weight"), &[e, 256], q8, 917);
-        w.tensor(&p("ffn_down_shexp.weight"), &[256, e], q8, 918);
-        w.tensor(&p("nextn.eh_proj.weight"), &[2 * e, e], q8, 919);
-        w.tensor(&p("nextn.enorm.weight"), &[e], f32_, 920);
-        w.tensor(&p("nextn.hnorm.weight"), &[e], f32_, 921);
-        w.tensor(&p("nextn.shared_head_norm.weight"), &[e], f32_, 922);
-    }
-    w.write(path);
-}
-
 
 fn mini_paths(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("oxe-mini-{tag}-{}", std::process::id()));
@@ -2389,4 +2182,404 @@ fn mtp_sidecar_head_sha_ignores_model_sha_env() {
     assert!(name.starts_with(&env_sha), "cache file {name} is not named by OXE_MODEL_SHA256");
     drop(m);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+mod longctx;
+mod fprec;
+
+fn run_mini_fused(path: &std::path::Path, opt: &LoadOptions, n: usize, steps: usize, fused: bool, ch: usize) -> (Vec<u32>, Vec<Vec<f32>>, u64) {
+    std::thread::scope(|scope| scope.spawn(move || {
+        let g = gguf::Gguf::open(path).unwrap();
+        let desc = ModelDesc::from_header(&g.header).unwrap();
+        let plan = Plan::build(&g.header, &desc, n, 512).unwrap();
+        let ws = WeightStore::load(g, &plan, opt).unwrap();
+        let cpus = test_cpus(n);
+        let pool = sched::Pool::new(&cpus, Duration::from_micros(100)).unwrap();
+        let mut eng = Engine::new(&plan, &ws, EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false }).unwrap();
+        eng.set_attn_tiled_min_kv(0);
+        eng.set_attn_fused(fused);
+        eng.set_attn_fused_chunk(ch);
+        assert_eq!(eng.attn_fused(), fused);
+        let mut ids = Vec::new();
+        let mut logits = Vec::new();
+        let b0 = pool.barrier_episodes();
+        let mut tok = 1u32;
+        for s in 0..steps {
+            let next = eng.step(&pool, tok);
+            tok = if s < steps / 2 { (s as u32 * 7 + 3) % 64 } else { next };
+            ids.push(next);
+            logits.push(eng.logits().to_vec());
+        }
+        let barriers = (pool.barrier_episodes() - b0) / steps as u64;
+        (ids, logits, barriers)
+    }).join().unwrap())
+}
+
+/// O-70: decode through the fused attention (300 steps: n_kv 1 -> 300, chunks of 128 so the run
+/// crosses chunk and 32-block boundaries) is bit-identical at 1, 3 and 4 threads, takes one
+/// barrier per attention phase instead of two, and stays close to the tiled path over the
+/// teacher-forced first half (the gap is f16 summation order only).
+#[test]
+fn mini_gguf_fused_attention_thread_invariant_and_close_to_tiled() {
+    let (dir, path) = mini_paths("fattn");
+    std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
+    let opt = mini_opts(&dir);
+    let steps = 300;
+    let (_, lg_t, b_t) = run_mini_fused(&path, &opt, 2, steps, false, 128);
+    let (ids1, lg1, b1) = run_mini_fused(&path, &opt, 1, steps, true, 128);
+    assert_eq!(b1 + 1, b_t, "fused: one barrier fewer per attention layer (mini: one layer)");
+    for n in [3usize, 4] {
+        let (ids, lg, b) = run_mini_fused(&path, &opt, n, steps, true, 128);
+        assert_eq!(b, b1);
+        assert_eq!(ids, ids1, "{n} threads: ids differ");
+        for (s, (a, b)) in lg.iter().zip(&lg1).enumerate() {
+            assert!(bits_eq(a, b), "{n} threads: fused logits of step {s} differ from 1 thread");
+        }
+    }
+    let mut worst = 0f64;
+    for (a, b) in lg1.iter().zip(&lg_t).take(steps / 2) {
+        assert!(a.iter().all(|v| v.is_finite()));
+        let scale = b.iter().fold(0f32, |m, v| m.max(v.abs())) as f64;
+        let d = a.iter().zip(b).fold(0f64, |m, (x, y)| m.max((x - y).abs() as f64));
+        worst = worst.max(d / scale.max(1e-30));
+    }
+    println!("fused vs tiled, teacher-forced steps: max |dlogit| / max |logit| = {worst:.3e}");
+    assert!(worst < 3e-2, "fused logits too far from the tiled path: {worst:.3e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// O-70: with the fused attention on both sides, verify(n) == n one-token steps bit for bit for
+/// every lane (lanes 1-4, partial commits / rollback, 1-3 threads), over 300 positions with
+/// 128-position chunks (lane runs straddle chunk and 32-block boundaries).
+#[test]
+fn mini_fused_verify_lanes_are_batch_invariant_with_rollback() {
+    for nt in [1usize, 2, 3] {
+        let (dir, _path, plan, ws, mw, pool) = mtp_setup(&format!("flanes{nt}"), nt);
+        let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
+        let seq: Vec<u32> = (0..300).map(|i| (i * 13 + 7) % 64).collect();
+        let mut r = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+        r.set_attn_tiled_min_kv(0);
+        r.set_attn_fused(true);
+        r.set_attn_fused_chunk(128);
+        let mut want = Vec::new();
+        for &t in &seq {
+            r.step(&pool, t);
+            want.push(r.logits().to_vec());
+        }
+        drop(r);
+        let mut e = Engine::with_options(&plan, &ws, cfg.clone(), crate::engine::EngineOptions { verify_lanes: 4, mtp: Some(&mw), kv_type: None }).unwrap();
+        e.set_attn_tiled_min_kv(0);
+        e.set_attn_fused(true);
+        e.set_attn_fused_chunk(128);
+        let mut p = 0usize;
+        let mut it = 0u32;
+        while p < seq.len() {
+            let n = (1 + (it as usize * 7) % 4).min(seq.len() - p);
+            let m = 1 + (it as usize * 5 + 3) % n;
+            let mut toks: Vec<u32> = seq[p..p + n].to_vec();
+            for (i, t) in toks.iter_mut().enumerate().skip(m) {
+                *t = (it * 31 + i as u32 * 17 + 1) % 64;
+            }
+            e.verify(&pool, &toks);
+            for ln in 0..m {
+                assert!(bits_eq(e.logits_lane(ln), &want[p + ln]), "{nt} threads: lane {ln} at pos {} differs", p + ln);
+            }
+            e.commit(m);
+            p += m;
+            it += 1;
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A full original-weight reference must not return to activation-quantized
+/// decode, rounded KV, or routed expert inputs as the sequence advances.
+#[cfg(feature = "f32-reference")]
+#[test]
+fn mini_f32_reference_batch_step_and_thread_invariant() {
+    let (dir, path) = mini_paths("f32ref");
+    std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
+    let opt = mini_opts(&dir);
+    let toks: Vec<u32> = (0..48).map(|i| ((i * 17 + 5) % 64) as u32).collect();
+    let mut reference_rows = Vec::new();
+    for n in [1, 2] {
+        let (plan, ws, pool) = mini_engine_parts(&path, &opt, n);
+        let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
+        let mut batch = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+        let mut single_token = Engine::new(&plan, &ws, cfg).unwrap();
+        for e in [&mut batch, &mut single_token] {
+            e.enable_f32_reference(gguf::Gguf::open(&path).unwrap(), &ws.info.model_sha256).unwrap();
+        }
+        batch.prefill(&pool, &toks, 64).unwrap();
+        for &t in &toks { single_token.step(&pool, t); }
+        assert!(batch.logits().iter().all(|x| x.is_finite()));
+        let quantized = Engine::new(&plan, &ws, EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false }).unwrap();
+        quantized.prefill(&pool, &toks, 64).unwrap();
+        assert!(!same_bits(batch.logits(), quantized.logits()), "fixture must distinguish f32 from activation-quantized math");
+        assert_eq!(batch.write_state(&mut Vec::new()).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(batch.read_state(&mut &[][..], 0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        assert!(same_bits(batch.logits(), single_token.logits()), "f32 prefix differs at {n} threads");
+        for t in [13, 7, 29] {
+            batch.step(&pool, t); single_token.step(&pool, t);
+            assert!(same_bits(batch.logits(), single_token.logits()), "f32 continuation differs");
+        }
+        if n == 1 { reference_rows = batch.logits().to_vec(); }
+        else { assert!(same_bits(batch.logits(), &reference_rows), "f32 thread count changes logits"); }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(feature="npu-prefill")]
+#[test]
+fn original_recurrent_float_rows_use_open_file_and_residual_stride(){
+    let(dir,path)=mini_paths("rec-f32");
+    std::env::set_var("OXE_MODEL_SHA256","0".repeat(64));
+    let opt=mini_opts(&dir);let(plan,ws,_pool)=mini_engine_parts(&path,&opt,2);
+    let g=gguf::Gguf::open(&path).unwrap();
+    let rows=crate::cpu_recurrent::Rows::new(&g,&plan,&ws,1).unwrap();
+    let crate::plan::Mixer::Recurrent{qkv,..}=plan.layers[0].mixer else{panic!("recurrent fixture");};
+    let w=ws.get(qkv);assert!(rows.contains(w.ptr));assert!(rows.count()>=3);
+    assert!(!rows.contains(ws.get(plan.layers[1].gate_shexp).ptr));
+    let source=crate::npu_rows::GgufRows::new(&g.header.tensors[qkv],g.tensor_data(&g.header.tensors[qkv])).unwrap();
+    let(n,c0,c1,os)=(3,7,13,19);let x:Vec<f32>=(0..n*w.k).map(|i|((i*7%103)as f32-51.)/127.).collect();
+    let mut out=vec![0.125;n*os];let before=out.clone();let mut row=vec![0.;w.k];
+    let mut expected=out.clone();
+    for c in c0..c1{oxn::linear::WeightRows::read_row(&source,c,&mut row).unwrap();for t in 0..n{
+        expected[t*os+c-c0]+=(row.iter().zip(&x[t*w.k..(t+1)*w.k]).map(|(&a,&b)|a as f64*b as f64).sum::<f64>())as f32;
+    }}
+    // Replace the path with a different inode. The helper must keep the same
+    // open source file, not silently reopen a path after its identity check.
+    std::fs::rename(&path,dir.join("source-original.gguf")).unwrap();std::fs::write(&path,b"different file").unwrap();
+    unsafe{assert!(rows.project(w.ptr,n,c0,c1,x.as_ptr(),out.as_mut_ptr(),os,out.as_ptr()));}
+    for i in 0..out.len(){if i%os<c1-c0{assert!((out[i]-expected[i]).abs()<2e-6,"{i}");}else{assert_eq!(out[i],before[i]);}}
+    std::fs::remove_dir_all(dir).ok();
+}
+
+
+/// Shared branch scheduling must preserve all arithmetic/state, including a
+/// partial tile and continuation. The injected post-write failure is discarded
+/// before commit; both serial and overlap use identical whole-projection fallback.
+#[cfg(feature="npu-prefill")]
+#[test]
+fn mini_npu_shared_overlap_is_bitwise_and_fault_stable(){
+    use oxn::{Backend,Buf,GemmArgs,GemmStats};
+    struct B{emu:oxn::emu::Emu,fail:bool}
+    impl Backend for B{
+        fn name(&self)->&'static str{"model-free-overlap"}
+        fn sessions(&self)->usize{1}
+        fn vtcm_bytes(&self)->u32{8<<20}
+        fn alloc(&mut self,s:usize,n:usize)->Result<Buf,String>{self.emu.alloc(s,n)}
+        fn gemm(&mut self,s:usize,a:&GemmArgs)->Result<GemmStats,String>{
+            let r=self.emu.gemm(s,a)?;
+            // Give another existing worker time to acquire an expert unit.
+            std::thread::sleep(Duration::from_micros(100));
+            if self.fail{Err("injected post-write overlap failure".into())}else{Ok(r)}
+        }
+    }
+    let(dir,path)=mini_paths("npu-overlap");
+    // This fixture's random shared weights otherwise overflow binary16 after
+    // SwiGLU. Scale only those synthetic tensors, not any real model weights.
+    let source=gguf::Gguf::open(&path).unwrap();let mut bytes=std::fs::read(&path).unwrap();
+    for t in &source.header.tensors{
+        if !t.name.contains("_shexp.weight"){continue;}
+        let(block,scale)=if t.ty==GgmlType::Q6_K{(210,208)}else if t.ty==GgmlType::Q8_0{(34,0)}else{continue;};
+        let start=(source.header.data_offset+t.offset)as usize;
+        for b in bytes[start..start+t.bytes()as usize].chunks_mut(block){
+            let h=u16::from_le_bytes(b[scale..scale+2].try_into().unwrap());
+            b[scale..scale+2].copy_from_slice(&oxn::tiles::f32_to_half(oxn::tiles::half_to_f32(h)/256.).to_le_bytes());
+        }
+    }
+    drop(source);std::fs::write(&path,bytes).unwrap();
+    std::env::set_var("OXE_MODEL_SHA256","0".repeat(64));
+    let opt=mini_opts(&dir);let mut witnessed=0;
+    for nth in [1,2,4]{
+        let(plan,ws,pool)=mini_engine_parts(&path,&opt,nth);
+        for fail in [false,true]{for n in [3,32,33,65,127]{
+            let mut engines=Vec::new();
+            for overlap in [false,true]{
+                let mut e=Engine::new(&plan,&ws,EngineConfig{n_ctx:512,logits:true,trace:false,profile:false}).unwrap();
+                let backend=Box::new(B{emu:oxn::emu::Emu::new(8<<20,1),fail});
+                e.enable_npu_prefill(&gguf::Gguf::open(&path).unwrap(),&ws.info.model_sha256,backend,
+                    crate::npu_prefill::Config{weight_budget:128<<20,pack_threads:1,overlap_shared:overlap,..Default::default()},pool.cpus()).unwrap();
+                engines.push(e);
+            }
+            let tokens:Vec<u32>=(0..n).map(|i|((i*17+5)%64)as u32).collect();
+            for e in &engines{e.prefill(&pool,&tokens,128).unwrap();}
+            assert!(same_bits(engines[0].logits(),engines[1].logits()),"prefix logits n{n} t{nth} fail{fail}");
+            assert!(same_state(&engines[0].dump_state(),&engines[1].dump_state()),"prefix state n{n} t{nth} fail{fail}");
+            let before=engines[1].npu_prefill_stats().unwrap();
+            if nth>1{witnessed+=before.expert_units_started_during_shared;}
+            if n>=32{
+                assert!(before.overlap_shared);assert_eq!(before.shared_chain_units,(plan.layers.len()-1)as u64,"final shared FFN crops to one output row");
+                if fail{assert!(before.first_error.is_some());}else{assert!(before.calls>0);assert!(before.first_error.is_none(),"unexpected overflow/fallback in overlap fixture");}
+            }else{assert_eq!(before.calls,0);assert_eq!(before.shared_chain_units,0);}
+            for t in [13,7,29]{
+                engines[0].step(&pool,t);engines[1].step(&pool,t);
+                assert!(same_bits(engines[0].logits(),engines[1].logits()),"decode n{n} t{nth} fail{fail}");
+            }
+            assert_eq!(engines[1].npu_prefill_stats().unwrap().calls,before.calls,"no decode NPU calls");
+            assert!(same_state(&engines[0].dump_state(),&engines[1].dump_state()));
+        }}
+    }
+    assert!(witnessed>0,"must witness actual expert progress during a shared branch");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// One `fused_ref::run` on the mini model per sample set (prefix 200, 250 teacher-forced
+/// positions); `degrade` scales the fused attention output by (1 + degrade) on both engines.
+fn fused_ref_mini(tag: &str, sample_sets: &[Vec<usize>], degrade: f32) -> Vec<crate::fused_ref::Report> {
+    use crate::fused_ref::{configure, run};
+    let (dir, path) = mini_paths(tag);
+    std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
+    let opt = mini_opts(&dir);
+    let g = gguf::Gguf::open(&path).unwrap();
+    let desc = ModelDesc::from_header(&g.header).unwrap();
+    let plan = Plan::build(&g.header, &desc, 2, 512).unwrap();
+    let ws = WeightStore::load(g, &plan, &opt).unwrap();
+    let pool = sched::Pool::new(&test_cpus(2), Duration::from_micros(100)).unwrap();
+    let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
+    let prefix: Vec<u32> = (0..200u32).map(|i| (i * 13 + 7) % 64).collect();
+    let cont: Vec<u32> = (0..250u32).map(|i| (i * 29 + 5) % 64).collect();
+    let out = sample_sets
+        .iter()
+        .map(|samples| {
+            let mut a = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+            let mut b = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+            a.prefill(&pool, &prefix, 64).unwrap();
+            let mut st = Vec::new();
+            a.write_state(&mut st).unwrap();
+            b.read_state(&mut &st[..], prefix.len()).unwrap();
+            configure(&mut a, &mut b);
+            a.set_fused_degrade(degrade);
+            b.set_fused_degrade(degrade);
+            let r = run(&mut a, &mut b, &pool, &cont, samples, &mut |_, _| {});
+            assert_eq!((r.positions.len(), r.positions[0].position), (cont.len(), prefix.len()));
+            r
+        })
+        .collect();
+    std::fs::remove_dir_all(&dir).ok();
+    out
+}
+
+fn print_verdict(name: &str, v: &crate::fused_ref::Verdict) {
+    println!(
+        "fused-ref mini {name}: kld mean {:.3e} top1 {:.4}; logit rms vs f32-attn p50/p90 tiled {:.2e}/{:.2e} fused {:.2e}/{:.2e}, jumps tiled {} fused {} (tol {}), attention rel-L2 tiled {:.2e} fused {:.2e}; mean tiled {:.2e} fused {:.2e}",
+        v.kld_mean, v.top1_agreement, v.tiled_rms_p50, v.tiled_rms_p90, v.fused_rms_p50, v.fused_rms_p90, v.tiled_jumps, v.fused_jumps,
+        v.jump_tolerance, v.tiled_attn_rel_l2, v.fused_attn_rel_l2, v.tiled_rms_mean, v.fused_rms_mean
+    );
+}
+
+/// `oxe fused-ref` core (model-free, mini model): the forked reference steps leave engine A's
+/// continuation bit-identical (every fork replays exactly; forking at 20, 200 or every position
+/// gives the same (a) numbers), and the CURRENT fused kernel passes the whole gate with 200
+/// samples: median / p90 logit error and jump count vs tiled, and the attention-level rel-L2
+/// (the logit error is heavy-tailed; the earlier 20-sample mean was an artefact, see fprec.rs).
+#[test]
+fn mini_fused_ref_fork_is_transparent_and_current_fused_passes() {
+    use crate::fused_ref::{sample_positions, Gate};
+    let few = sample_positions(250, 20);
+    let mid = sample_positions(250, 200);
+    assert_eq!((few.len(), mid.len()), (20, 200));
+    assert_eq!((few[0], *few.last().unwrap()), (0, 249));
+    let all: Vec<usize> = (0..250).collect();
+    let r = fused_ref_mini("fusedref", &[few, mid, all], 0.0);
+    assert!(r.iter().all(|x| x.refs.iter().all(|f| f.fork_replay_exact)), "a fork did not replay exactly");
+    for x in &r[1..] {
+        for (p, q) in r[0].positions.iter().zip(&x.positions) {
+            assert!(p.kld.to_bits() == q.kld.to_bits() && p.tiled_top1 == q.tiled_top1 && p.fused_top1 == q.fused_top1, "forking changed position {}", p.position);
+        }
+    }
+    for f in &r[2].refs {
+        assert!(f.tiled_rms.is_finite() && f.fused_rms.is_finite() && f.ref_absmax > 0.0);
+        assert!(f.tiled_rms / (f.ref_absmax as f64) < 3e-2 && f.fused_rms / (f.ref_absmax as f64) < 3e-2, "position {} far from the reference", f.position);
+        assert!(f.tiled_attn.1 > 0.0 && f.fused_attn.1 > 0.0);
+    }
+    let gate = Gate { min_positions: 250, ..Gate::default() };
+    let v = r[1].verdict(&gate);
+    print_verdict("current, 200 samples", &v);
+    assert_eq!(v.ref_samples, 200);
+    assert!(v.passed && v.pass_ref_p50 && v.pass_ref_p90 && v.pass_ref_jumps && v.pass_ref_attn, "{v:?}");
+    print_verdict("current, every position", &r[2].verdict(&gate));
+    // 20 samples do not meet the scope (>= 200)
+    let s = r[0].verdict(&gate);
+    assert!(!s.scope_met && !s.passed);
+    // the default gate also needs >= 1000 positions
+    assert!(!r[1].verdict(&Gate::default()).scope_met);
+    // a zero noise floor fails (a) unless the two arms are bit-identical
+    let z = r[1].verdict(&Gate { noise_floor_kld: 0.0, ..gate.clone() });
+    assert!(!z.pass_kld || v.kld_mean == 0.0);
+}
+
+/// `oxe fused-ref --control`: the tiled decode path vs the tiled batched-prefill path from one
+/// state; the chunk-end positions are compared and both engines end at the same position.
+#[test]
+fn mini_fused_ref_control_measures_decode_vs_batched_prefill() {
+    let (dir, path) = mini_paths("fusedrefctl");
+    std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
+    let opt = mini_opts(&dir);
+    let g = gguf::Gguf::open(&path).unwrap();
+    let desc = ModelDesc::from_header(&g.header).unwrap();
+    let plan = Plan::build(&g.header, &desc, 2, 512).unwrap();
+    let ws = WeightStore::load(g, &plan, &opt).unwrap();
+    let pool = sched::Pool::new(&test_cpus(2), Duration::from_micros(100)).unwrap();
+    let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
+    let prefix: Vec<u32> = (0..200u32).map(|i| (i * 13 + 7) % 64).collect();
+    let cont: Vec<u32> = (0..250u32).map(|i| (i * 29 + 5) % 64).collect();
+    let mut a = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+    let mut c = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+    a.prefill(&pool, &prefix, 64).unwrap();
+    let mut st = Vec::new();
+    a.write_state(&mut st).unwrap();
+    c.read_state(&mut &st[..], prefix.len()).unwrap();
+    crate::fused_ref::configure(&mut a, &mut c);
+    c.set_attn_fused(false);
+    let v = crate::fused_ref::control(&a, &c, &pool, &cont, 4, &mut |_| {});
+    assert_eq!(v.len(), 62);
+    assert_eq!((v[0].position, a.pos(), c.pos()), (203, 448, 448));
+    let (n, mean, _, _, _, max, top1) = crate::fused_ref::control_summary(&v);
+    println!("fused-ref mini control (decode vs prefill ubatch 4): n {n} kld mean {mean:.3e} max {max:.3e} top1 {top1:.4}");
+    assert!(mean.is_finite() && max < 1e-1 && top1 >= 0.9);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A deliberately degraded fused path (output scaled by 1 + 1e-2, ~100x the kernels' own
+/// attention error) fails (b): attention-level rel-L2 and the logit-error median / p90.
+#[test]
+fn mini_fused_ref_degraded_fused_fails_the_reference_gate() {
+    use crate::fused_ref::{sample_positions, Gate};
+    let r = fused_ref_mini("fusedrefbad", &[sample_positions(250, 200)], 1e-2);
+    let v = r[0].verdict(&Gate { min_positions: 250, noise_floor_kld: 1.0, min_top1: 0.0, ..Gate::default() });
+    print_verdict("degraded 1e-2", &v);
+    assert!(v.scope_met && v.fork_replay_exact);
+    assert!(!v.pass_ref_attn && !v.pass_ref_p50 && !v.pass_ref && !v.passed, "{v:?}");
+    assert!(v.fused_attn_rel_l2 > 10.0 * v.tiled_attn_rel_l2);
+}
+
+/// The f32-attention reference (f64 accumulation) agrees with a plain f32 attention and sees an
+/// off-by-one context (one position more or less) far above that gap.
+#[test]
+fn fused_ref_attention_reference_matches_f32_and_sees_off_by_one() {
+    let (n, hd) = (3000usize, 64usize);
+    let mut s = 12345u64;
+    let mut rnd = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    };
+    let q: Vec<f32> = (0..hd).map(|_| 4.0 * rnd()).collect();
+    let k: Vec<f32> = (0..(n + 1) * hd).map(|_| rnd()).collect();
+    let v: Vec<f32> = (0..(n + 1) * hd).map(|_| rnd()).collect();
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut a = vec![0f32; hd];
+    let mut b = vec![0f32; hd];
+    let mut c = vec![0f32; hd];
+    crate::fused_ref::ref_attn_f64(&q, &k, &v, n, hd, scale, &mut a);
+    ref_attn_f32(&q, &k, &v, n, hd, scale, &mut b);
+    crate::fused_ref::ref_attn_f64(&q, &k, &v, n + 1, hd, scale, &mut c);
+    let d = |x: &[f32], y: &[f32]| x.iter().zip(y).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+    let (gap, off) = (d(&a, &b), d(&a, &c));
+    assert!(gap < 1e-5, "f64-accumulated vs f32 reference: {gap}");
+    assert!(off > 100.0 * gap.max(1e-7), "off-by-one context not visible: {off} vs {gap}");
+    assert_eq!(crate::fused_ref::sample_positions(5, 0), Vec::<usize>::new());
+    assert_eq!(crate::fused_ref::sample_positions(5, 1), vec![0]);
+    assert_eq!(crate::fused_ref::sample_positions(3, 10), vec![0, 1, 2]);
 }

@@ -1,5 +1,5 @@
 // pf_attn (WORKSTREAM PREFILL, FP-1): the fixed-chunk attention part op of many-row ubatches (prefill) in register
-// tiles, after oxe's tiled attention (kernels-sys oxe_dot_f16_tile, M3-ATTN.md). Mode 1 (`--attn online`, the
+// tiles, after oxe's tiled attention (kernels-sys oxe_dot_f16_tile, docs/lab-notes/M3-ATTN.md). Mode 1 (`--attn online`, the
 // default) only. BITWISE equal to attn_part_tiled / the untiled unit in flash_graph.cpp: per (query, cell) the same
 // operations in the same order, only independent outputs are interleaved.
 //

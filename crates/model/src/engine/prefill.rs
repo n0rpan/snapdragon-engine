@@ -2,7 +2,7 @@
 //! KleidiAI off, repack on, FA off, f16 KV) with the same ubatch size.
 //!
 //! A prompt is processed in ubatches of `ubatch` tokens (production: 256). Per ubatch every op
-//! mirrors what llama.cpp's graph computes for `n_tokens = N` (see M3-PREFILL.md):
+//! mirrors what llama.cpp's graph computes for `n_tokens = N` (see docs/lab-notes/M3-PREFILL.md):
 //!
 //! - Dense projections (repack `forward_mul_mat`): the activation rows are quantised as
 //!   4-row interleaved groups (`ggml_quantize_mat_t`) for the first N - N%4 rows, which go
@@ -91,7 +91,7 @@ const ATT_PAD: usize = 208;
 
 /// Query tokens per tiled-attention unit under the current mask (at most 64 columns per unit:
 /// the f16 tile kernel's column chunk and the `nf` array).
-fn att_tt_want(d: &ModelDesc, mask: u32) -> usize {
+pub(super) fn att_tt_want(d: &ModelDesc, mask: u32) -> usize {
     let group = d.n_head / d.n_head_kv;
     if mask & PF_ATTN_TT8 != 0 && 8 * group <= 64 {
         8
@@ -266,7 +266,7 @@ const DOWN_CU: usize = 512;
 /// Query tokens per attention work unit.
 const ATT_TB: usize = 16;
 /// Query tokens per tiled-attention work unit (x 8 heads of a KV head = 32 columns that share
-/// every K / V^T row load; M3-ATTN.md).
+/// every K / V^T row load; docs/lab-notes/M3-ATTN.md).
 const ATT_TT: usize = 4;
 /// Extra floats between the routed down-projection output rows (`dn`): with n_embd 2048 the 8
 /// expert rows of a token would sit exactly 8 KB apart and share two L1 sets with the shared
@@ -478,6 +478,8 @@ pub(super) struct Pf {
     g: Sb<f32>,
     u: Sb<f32>,
     hq: Sb<u8>,
+    #[cfg(feature="f32-reference")]
+    href: Sb<f32>,
     dn: Sb<f32>,
     sdn: Sb<f32>,
     off: Sb<u32>,
@@ -554,12 +556,22 @@ fn split(n: usize, tid: usize, nth: usize) -> Range<usize> {
     n * tid / nth..n * (tid + 1) / nth
 }
 
+/// LONG-CTX: context-sized bytes of one prefill thread's scratch (`PfThread` akq / ap16 tiles
+/// and kq / p16 / wp / mask rows) at capacity `n_ctx` (>= head_chunk, ff_exp, n_expert, as at
+/// every real context); the same expressions as [`Pf::new`].
+pub(super) fn pf_ctx_bytes(d: &ModelDesc, n_ctx: usize, att_tt: usize) -> usize {
+    let tile = att_tt * (d.n_head / d.n_head_kv) * (n_ctx + ATT_PAD);
+    tile * (4 + 2) + n_ctx * 4 + (n_ctx + d.head_dim) * 2 + n_ctx * 4 + n_ctx * 4
+}
+
 fn max_act(k: usize) -> usize {
     ActType::Q8K.bytes(k.div_ceil(QK_K) * QK_K).max(ActType::Q8_0.bytes(k.div_ceil(32) * 32))
 }
 
 impl Pf {
-    fn new(d: &ModelDesc, ub: usize, nth: usize, n_ctx: usize, head_chunk: usize, mask: u32, kv: KvType) -> Pf {
+    fn new(d: &ModelDesc, ub: usize, nth: usize, n_ctx: usize, head_chunk: usize, mask: u32, kv: KvType, reference:bool) -> Pf {
+        #[cfg(not(feature="f32-reference"))]
+        let _=reference;
         let att_tt = att_tt_want(d, mask);
         let att_w = d.n_head * d.head_dim;
         let nch = d.ssm_conv_channels();
@@ -605,6 +617,8 @@ impl Pf {
             g: Sb::new(ub * ku * d.ff_exp),
             u: Sb::new(ub * ku * d.ff_exp),
             hq: Sb::new(ub * ku * max_act(d.ff_exp)),
+            #[cfg(feature="f32-reference")]
+            href: Sb::new(if reference {ub*ku*d.ff_exp}else{0}),
             dn: Sb::new(ub * ku * (d.n_embd + DN_PAD)),
             sdn: Sb::new(ub * d.n_embd),
             off: Sb::new(d.n_expert + 1),
@@ -651,6 +665,8 @@ impl Pf {
 #[derive(Clone, Copy)]
 struct Dense {
     w: WeightRef,
+    #[cfg(feature = "npu-prefill")]
+    npu: bool,
     /// f32 input rows (stride w.k) for F32 weights
     xin: *const f32,
     /// activation rows in the forward_mul_mat layout for quantised weights
@@ -676,7 +692,7 @@ fn d_qkv_units_ok_w(w: &WeightRef) -> bool {
 impl Dense {
     /// A copy of the op descriptor (raw pointers and a weight reference; no data).
     fn clone_op(&self) -> Dense {
-        Dense { w: self.w, xin: self.xin, act: self.act, out: self.out, os: self.os, add: self.add, tile: self.tile, cu: self.cu }
+        *self
     }
     fn units(&self) -> usize {
         self.w.rows.div_ceil(self.cu)
@@ -804,7 +820,11 @@ impl<'a> Engine<'a> {
         let mask = pf_tiles(); // one sample for the whole call
         let fits = matches!(&*guard, Some(p) if p.ub >= ub_cap && p.nth == nth && p.att_tt == att_tt_want(&self.plan.desc, mask));
         if !fits {
-            *guard = Some(Box::new(Pf::new(&self.plan.desc, ub_cap, nth, self.n_ctx, self.plan.head_chunk, mask, self.kv)));
+            #[cfg(feature="f32-reference")]
+            let reference=self.f32_reference.is_some();
+            #[cfg(not(feature="f32-reference"))]
+            let reference=false;
+            *guard = Some(Box::new(Pf::new(&self.plan.desc, ub_cap, nth, self.n_ctx, self.plan.head_chunk, mask, self.kv,reference)));
         }
         let pf: &Pf = guard.as_ref().unwrap();
         pf.mask.store(mask, Relaxed);
@@ -1043,6 +1063,33 @@ impl<'a> Engine<'a> {
     fn dense_unit(&self, op: &Dense, n: usize, c0: usize, c1: usize) {
         let w = &op.w;
         let k = w.k;
+        #[cfg(feature="npu-prefill")]
+        if self.npu_prefill.as_ref().is_some_and(|p|unsafe{p.cpu_f32(w.ptr,false,n,c0,c1,op.xin,op.out.add(c0),op.os,if op.add.is_null(){op.add}else{op.add.add(c0)})}){return;}
+        #[cfg(feature="f32-reference")]
+        if let Some(reference)=&self.f32_reference {
+            if !w.is_f32(){
+                for c in c0..c1 {reference.with_row(w.ptr,0,c,|row|{
+                    for t in 0..n{
+                        // SAFETY: the unit owns these complete output columns;
+                        // inputs are f32 and immutable after the norm barrier.
+                        unsafe{
+                            let mut y=ffi::oxe_vec_dot_f32(k as i32,row.as_ptr(),op.xin.add(t*k));
+                            if !op.add.is_null(){y+=*op.add.add(t*op.os+c);}
+                            *op.out.add(t*op.os+c)=y;
+                        }
+                    }
+                });}return;
+            }
+        }
+        #[cfg(feature = "npu-prefill")]
+        if op.npu {
+            debug_assert!(c0==0 && c1==w.rows);
+            // SAFETY: this op is one indivisible work unit; complete inputs are
+            // read-only until the phase barrier, and it alone owns all outputs.
+            if unsafe{self.npu_prefill.as_ref().expect("prepared registry").run(w.ptr,n,op.xin,op.out,op.os,op.add)} {return;}
+            // A latched/failed accelerator keeps this SAME one-unit shape.
+            // The CPU overwrites the entire projection before any consumer.
+        }
         // SAFETY: the unit owns out columns c0..c1 of all n rows; inputs are read-only.
         unsafe {
             if w.is_f32() {
@@ -1100,7 +1147,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn dense(&self, pf: &Pf, w: Tid, xin: *const f32, out: *mut f32, os: usize, add: *const f32) -> Dense {
+    fn dense(&self, pf: &Pf, n: usize, w: Tid, xin: *const f32, out: *mut f32, os: usize, add: *const f32) -> Dense {
         let w = *self.ws.get(w);
         let act = if w.is_f32() { std::ptr::null() } else { self.act_buf(pf, w.qtype().act()).p(0) as *const u8 };
         let mask = pf.mask.load(Relaxed);
@@ -1108,7 +1155,16 @@ impl<'a> Engine<'a> {
             && kernels_sys::gemm_tile_has(w.qtype())
             && if w.qtype() == kernels_sys::QType::Q6K { mask & PF_Q6K_TILE != 0 } else { mask & PF_TILE_DENSE != 0 };
         let cu = if w.is_f32() && mask & PF_F32_CU8 != 0 { 8 } else { CU };
-        Dense { w, xin, act, out, os, add, tile, cu }
+        #[cfg(feature = "npu-prefill")]
+        let npu=self.npu_prefill.as_ref().is_some_and(|p|p.selected(w.ptr,n));
+        #[cfg(feature = "npu-prefill")]
+        let cu=if npu {w.rows}else{cu};
+        #[cfg(not(feature = "npu-prefill"))]
+        let _=n;
+        Dense { w, xin, act, out, os, add, tile, cu,
+            #[cfg(feature = "npu-prefill")]
+            npu,
+        }
     }
 
     // ------------------------------------------------------------ delta-net layer
@@ -1133,7 +1189,7 @@ impl<'a> Engine<'a> {
         let diet = pmask & PF_WAIT_DIET != 0 && !trace;
         let fuse_conv = pmask & PF_CONV_FUSE != 0 && !trace;
         let xn = pf.xn.p(0) as *const f32;
-        let zop = self.dense(pf, z, xn, pf.z.p(0), di, std::ptr::null());
+        let zop = self.dense(pf, n, z, xn, pf.z.p(0), di, std::ptr::null());
         // causal conv (+ state) and SiLU of channels c0..c1 over the n tokens (phase [3], or inside
         // the qkv units with PF_CONV_FUSE)
         let ri = self.rec_index[l];
@@ -1158,10 +1214,10 @@ impl<'a> Engine<'a> {
             }
         };
         {
-            let d_qkv = self.dense(pf, qkv, xn, pf.qkv.p(0), nch, std::ptr::null());
-            let d_beta = self.dense(pf, beta, xn, pf.beta.p(0), nv, std::ptr::null());
-            let d_alpha = self.dense(pf, alpha, xn, pf.alpha.p(0), nv, std::ptr::null());
-            let d_z = self.dense(pf, z, xn, pf.z.p(0), di, std::ptr::null());
+            let d_qkv = self.dense(pf, n, qkv, xn, pf.qkv.p(0), nch, std::ptr::null());
+            let d_beta = self.dense(pf, n, beta, xn, pf.beta.p(0), nv, std::ptr::null());
+            let d_alpha = self.dense(pf, n, alpha, xn, pf.alpha.p(0), nv, std::ptr::null());
+            let d_z = self.dense(pf, n, z, xn, pf.z.p(0), di, std::ptr::null());
             let with_z = [d_qkv, d_z, d_beta, d_alpha];
             let ops: &[Dense] = if diet { &with_z[..1] } else { &with_z[..2] };
             // (order: qkv first, then z unless it moved, then beta, alpha)
@@ -1381,7 +1437,7 @@ impl<'a> Engine<'a> {
             }
         }
         self.bar(ctx, pf, phq);
-        let op = self.dense(pf, wout, pf.o.p(0), pf.x1.p(0), de, pf.x.p(0));
+        let op = self.dense(pf, n, wout, pf.o.p(0), pf.x1.p(0), de, pf.x.p(0));
         self.pf_dense(pf, ts, &[op], n);
         self.bar(ctx, pf, phd);
         if self.trace.is_some() && ctx.tid == 0 {
@@ -1417,9 +1473,9 @@ impl<'a> Engine<'a> {
         // [2] Q(+gate), K, V projections
         let xn = pf.xn.p(0) as *const f32;
         let ops = [
-            self.dense(pf, q, xn, pf.qkv.p(0), 2 * att_w, std::ptr::null()),
-            self.dense(pf, k, xn, pf.kr.p(0), kvw, std::ptr::null()),
-            self.dense(pf, v, xn, pf.vr.p(0), kvw, std::ptr::null()),
+            self.dense(pf, n, q, xn, pf.qkv.p(0), 2 * att_w, std::ptr::null()),
+            self.dense(pf, n, k, xn, pf.kr.p(0), kvw, std::ptr::null()),
+            self.dense(pf, n, v, xn, pf.vr.p(0), kvw, std::ptr::null()),
         ];
         self.pf_dense(pf, ts, &ops, n);
         self.bar(ctx, pf, PH_ATT_PROJ_DENSE);
@@ -1461,6 +1517,8 @@ impl<'a> Engine<'a> {
                         self.ptr(l, "Kcur_normed", n * kvw, t * kvw + kvh * hd, kn);
                     }
                     ffi::oxe_rope_neox_inplace(kn.as_mut_ptr(), d.n_rot as i32, cache.as_ptr());
+                    #[cfg(feature="f32-reference")]
+                    if let Some(reference)=&self.f32_reference {reference.kv.put_k(ai,kvh,pos,kn);}
                     if trace {
                         self.ptr(l, "Kcur", n * kvw, t * kvw + kvh * hd, kn);
                     }
@@ -1496,6 +1554,8 @@ impl<'a> Engine<'a> {
                     unsafe {
                         let row = self.vcache.ptr_at(self.vrow(ai, r) + p0 + tr.start);
                         for (i, t) in tr.clone().enumerate() {
+                            #[cfg(feature="f32-reference")]
+                            if let Some(reference)=&self.f32_reference {reference.kv.put_v(ai,r,p0+t,*pf.vr.p(t*kvw+r));}
                             ops::fp32_to_fp16(&[*pf.vr.p(t * kvw + r)], &mut h16);
                             *row.add(i) = h16[0];
                         }
@@ -1520,6 +1580,29 @@ impl<'a> Engine<'a> {
         //     probabilities to f16, vec_dot_f16 with V^T over n_kv)
         let n_kv = padded_n_kv(p0 + n - 1, self.n_ctx);
         let scale = 1.0 / (hd as f32).sqrt();
+        #[cfg(feature="f32-reference")]
+        if let Some(reference)=&self.f32_reference {
+            // Full f32 K/Q/V/probabilities. qf already holds normalized, roped
+            // f32 queries; do not read q16, p16 or either f16 KV cache here.
+            let ctr=step_ctr(pf,ts);
+            loop{
+                let u=ctr.fetch_add(1,Relaxed);if u>=n*nh{break;}
+                let (t,h)=(u/nh,u%nh);let positions=p0+t+1;let kvh=h/group;
+                unsafe{
+                    for pos in 0..positions{
+                        ts.kq[pos]=ffi::oxe_vec_dot_f32(hd as i32,reference.kv.krow(ai,kvh,pos),pf.qf.p(t*att_w+h*hd))*scale;
+                    }
+                    ops::soft_max(&ts.kq[..positions],&mut ts.wp[..positions],&mut ts.mask[..positions]);
+                    for dd in 0..hd{ts.aout[dd]=ffi::oxe_vec_dot_f32(positions as i32,reference.kv.vcol(ai,kvh,dd),ts.wp.as_ptr());}
+                    let gsrc=pf.qkv.s(t*2*att_w+h*2*hd+hd..t*2*att_w+(h+1)*2*hd);
+                    ops::sigmoid(gsrc,&mut ts.gsig);
+                    let out=pf.o.s(t*att_w+h*hd..t*att_w+(h+1)*hd);
+                    for dd in 0..hd{out[dd]=ts.aout[dd]*ts.gsig[dd];}
+                }
+            }
+            self.bar(ctx,pf,PH_ATT_CORE);
+            return self.pf_mixer_out(ctx,pf,ts,l,n,out,att_w,"attn_output",PH_ATT_OUT_QUANT,PH_ATT_OUT_DENSE,None);
+        }
         if (self.attn_tiled && !trace) || self.kv.any8() {
             // n_kv of the llama.cpp ubatch (of `lub` tokens, from p0) that holds token t
             let lub = pf.lub.load(Relaxed).max(1);
@@ -1585,7 +1668,7 @@ impl<'a> Engine<'a> {
         self.pf_mixer_out(ctx, pf, ts, l, n, out, att_w, "attn_output", PH_ATT_OUT_QUANT, PH_ATT_OUT_DENSE, None);
     }
 
-    /// Tiled prefill attention (M3-ATTN.md). Units = (KV head, block of ATT_TT tokens),
+    /// Tiled prefill attention (docs/lab-notes/M3-ATTN.md). Units = (KV head, block of ATT_TT tokens),
     /// dynamically scheduled; per unit the 8 x ATT_TT query columns share every K row (scores)
     /// and every V^T row (outputs). Each score / output is one `ggml_vec_dot_f16` with the
     /// reference's arithmetic, each softmax row is `soft_max_f32` over the token's padded n_kv
@@ -1771,11 +1854,16 @@ impl<'a> Engine<'a> {
         // [2] router logits, shared expert gate (vec_dot: 1 row), shared gate/up projections
         let xn = pf.xn.p(0) as *const f32;
         let ops = [
-            self.dense(pf, lt.router, xn, pf.router.p(0), ne, std::ptr::null()),
-            self.dense(pf, lt.gate_shexp, xn, pf.shg.p(0), ffs, std::ptr::null()),
-            self.dense(pf, lt.up_shexp, xn, pf.shu.p(0), ffs, std::ptr::null()),
+            self.dense(pf, n, lt.router, xn, pf.router.p(0), ne, std::ptr::null()),
+            self.dense(pf, n, lt.gate_shexp, xn, pf.shg.p(0), ffs, std::ptr::null()),
+            self.dense(pf, n, lt.up_shexp, xn, pf.shu.p(0), ffs, std::ptr::null()),
         ];
-        self.pf_dense(pf, ts, &ops, n);
+        #[cfg(feature="npu-prefill")]
+        let shared_overlap=!trace&&self.npu_prefill.as_ref().is_some_and(|p|p.shared_overlap([
+            self.ws.get(lt.gate_shexp).ptr,self.ws.get(lt.up_shexp).ptr,self.ws.get(lt.down_shexp).ptr],n));
+        #[cfg(not(feature="npu-prefill"))]
+        let shared_overlap=false;
+        self.pf_dense(pf, ts, if shared_overlap{&ops[..1]}else{&ops}, n);
         let gs = self.ws.get(lt.shexp_gate).f32_slice();
         for t in share(pf, ts, n, 8, tid) {
             // SAFETY: row t of xn read-only; sg[t] owned.
@@ -1804,13 +1892,13 @@ impl<'a> Engine<'a> {
                 for x in w.iter_mut() {
                     *x /= s;
                 }
-                ops::swiglu(pf.shg.s(t * ffs..(t + 1) * ffs), pf.shu.s(t * ffs..(t + 1) * ffs), pf.shh.s(t * ffs..(t + 1) * ffs));
+                if !shared_overlap{ops::swiglu(pf.shg.s(t * ffs..(t + 1) * ffs), pf.shu.s(t * ffs..(t + 1) * ffs), pf.shh.s(t * ffs..(t + 1) * ffs));}
             }
         }
         self.bar(ctx, pf, PH_MOE_ROUTE_SWIGLU);
         let wds = *self.ws.get(lt.down_shexp);
         let sh_at = if wds.is_f32() { None } else { Some(wds.qtype().act()) };
-        if let Some(at) = sh_at {
+        if let Some(at) = sh_at.filter(|_|!shared_overlap) {
             // shared down activations: forward_mul_mat layout over the n rows of shh
             let rb = at.bytes(ffs);
             let full = n - n % 4;
@@ -1898,20 +1986,27 @@ impl<'a> Engine<'a> {
 
         // [4] routed gate/up (MUL_MAT_ID), shared down projection
         let nu = pf.n_units[0].load(Relaxed);
-        let sd = self.dense(pf, lt.down_shexp, pf.shh.p(0), pf.sdn.p(0), de, std::ptr::null());
+        let sd = self.dense(pf, n, lt.down_shexp, pf.shh.p(0), pf.sdn.p(0), de, std::ptr::null());
         let sd = Dense { act: if sh_at.is_some() { pf.sh_act.p(0) as *const u8 } else { std::ptr::null() }, ..sd };
         {
             let ctr = step_ctr(pf, ts);
         let next = || ctr.fetch_add(1, Relaxed);
-            let total = nu + sd.units();
+            let shared_units=if shared_overlap{1}else{sd.units()};
+            let total = nu + shared_units;
             loop {
                 let u = next();
                 if u >= total {
                     break;
                 }
-                if u < nu {
+                if shared_overlap&&u==0 {
+                    #[cfg(feature="npu-prefill")]
+                    self.pf_shared_overlap(pf,n,&ops[1..],&sd,ffs,sh_at);
+                }else if u < nu+usize::from(shared_overlap) {
+                    #[cfg(feature="npu-prefill")]
+                    if shared_overlap{self.npu_prefill.as_ref().unwrap().note_expert_unit();}
                     // SAFETY: units read-only after the barrier.
-                    let (e, c0, c1) = unsafe { *pf.units.p(u) };
+                    let ei=u-usize::from(shared_overlap);
+                    let (e, c0, c1) = unsafe { *pf.units.p(ei) };
                     let rb = rat.bytes(de);
                     let t0 = if prof { ticks() } else { 0 };
                     self.mmid_unit(pf, ts, &[(&wge, pf.g.p(0)), (&wue, pf.u.p(0))], e as usize, c0 as usize, c1 as usize, pf.actr.p(0), rb, ffe, ku, false);
@@ -1940,6 +2035,8 @@ impl<'a> Engine<'a> {
             unsafe {
                 let h = &mut ts.kq[..ffe];
                 ops::swiglu(pf.g.s(s * ffe..(s + 1) * ffe), pf.u.s(s * ffe..(s + 1) * ffe), h);
+                    #[cfg(feature="f32-reference")]
+                    if self.f32_reference.is_some(){pf.href.s(s*ffe..(s+1)*ffe).copy_from_slice(h);}
                 quantize_row_raw(dat, h.as_ptr(), pf.hq.p(s * hrb), ffe);
             }
         }
@@ -2001,6 +2098,27 @@ impl<'a> Engine<'a> {
         self.bar(ctx, pf, PH_MOE_SUM_RESIDUAL);
     }
 
+    /// Independent shared FFN branch, owned by one existing worker while the
+    /// rest compute routed experts. All output consumers follow PH_MOE_GATE_UP.
+    #[cfg(feature="npu-prefill")]
+    fn pf_shared_overlap(&self,pf:&Pf,n:usize,gate_up:&[Dense],down:&Dense,ffs:usize,at:Option<ActType>){
+        let _activity=self.npu_prefill.as_ref().unwrap().begin_shared_overlap();
+        for op in gate_up{self.dense_unit(op,n,0,op.w.rows);}
+        // SAFETY: this indivisible unit exclusively owns shared scratch. xn and
+        // original dense activation buffers remain immutable through this layer.
+        unsafe{
+            for t in 0..n{ops::swiglu(pf.shg.s(t*ffs..(t+1)*ffs),pf.shu.s(t*ffs..(t+1)*ffs),pf.shh.s(t*ffs..(t+1)*ffs));}
+            // Keep the exact native activation layout for a latched CPU fallback.
+            // Experts use actr/hq, never this private shared-down buffer.
+            if let Some(at)=at{
+                let rb=at.bytes(ffs);let full=n-n%4;
+                for a in (0..full).step_by(4){quantize_mat4_raw(at,pf.shh.p(a*ffs),pf.sh_act.p(a*rb),ffs);}
+                for a in full..n{quantize_row_raw(at,pf.shh.p(a*ffs),pf.sh_act.p(a*rb),ffs);}
+            }
+        }
+        self.dense_unit(down,n,0,down.w.rows);
+    }
+
     /// One MUL_MAT_ID unit: expert `e`, weight rows c0..c1, for every routed row of the expert.
     /// `mats` are (weight, output base); output row of routed row s is at `s * out_w` (`per_row`
     /// false: s = token*ku + slot indexes the routed act rows by token; true: by s).
@@ -2011,6 +2129,17 @@ impl<'a> Engine<'a> {
         unsafe {
             let off = pf.off.s(0..pf.off.len);
             let list = pf.order.s(off[e] as usize..off[e + 1] as usize);
+            #[cfg(feature="f32-reference")]
+            if let Some(reference)=&self.f32_reference {
+                for &(w,out) in mats{for c in c0..c1{
+                    reference.with_row(w.ptr,e,c,|row|{
+                        for &s in list.iter(){
+                            let input=if per_row {pf.href.p(s as usize*w.k)}else{pf.xn.p((s as usize/ku)*w.k)};
+                            *out.add(s as usize*out_w+c)=ffi::oxe_vec_dot_f32(w.k as i32,row.as_ptr(),input);
+                        }
+                    });
+                }}return;
+            }
             let cnt = list.len();
             let row_of = |s: u32| -> usize { if per_row { s as usize } else { s as usize / ku } };
             let k = mats[0].0.k;
@@ -2121,7 +2250,16 @@ impl<'a> Engine<'a> {
             let nn = chunk.min(rows.end - r0);
             let out = &mut ts.kq[..nn];
             // SAFETY: rows r0..r0+nn of the head; activation complete after the barrier.
-            unsafe { gemv_raw(w.qtype(), de, out.as_mut_ptr(), w.rows_ptr(0, r0), pf.act_k.p(0), nn) };
+            #[cfg(feature="f32-reference")]
+            let is_reference=if let Some(reference)=&self.f32_reference{
+                for i in 0..nn{reference.with_row(w.ptr,0,r0+i,|row|{
+                    // SAFETY: normalized f32 row complete; this worker owns head rows.
+                    out[i]=unsafe{ffi::oxe_vec_dot_f32(de as i32,row.as_ptr(),pf.xn.p(0))};
+                });}true
+            }else{false};
+            #[cfg(not(feature="f32-reference"))]
+            let is_reference=false;
+            if !is_reference{unsafe { gemv_raw(w.qtype(), de, out.as_mut_ptr(), w.rows_ptr(0, r0), pf.act_k.p(0), nn) }};
             for i in 0..nn {
                 if best.1 == u32::MAX || out[i] > best.0 {
                     best = (out[i], (r0 + i) as u32);

@@ -1,0 +1,23 @@
+[package]
+name = "qwen3-te"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native Qwen3 dense text encoder for FLUX.2 klein conditioning (CPU reference graph, oxn NPU linears behind a flag)"
+
+[features]
+default = []
+# --npu device: the DSP backend of oxn (the build needs FASTRPC_INC; the SDK is BYO)
+npu-device = ["oxn/device"]
+
+[dependencies]
+gguf = { path = "../gguf" }
+kernels-sys = { path = "../kernels-sys" }
+tokenizer = { path = "../tokenizer" }
+oxn = { path = "../oxn" }
+serde_json.workspace = true
+
+[[bin]]
+name = "qwen3-te"
+path = "src/bin/qwen3-te.rs"

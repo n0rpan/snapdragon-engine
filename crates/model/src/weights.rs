@@ -166,18 +166,24 @@ impl WeightRef {
     #[inline]
     pub fn rows_ptr(&self, e: usize, row: usize) -> *const u8 {
         let q = self.qtype();
+        // Stays a debug_assert (N1 audit, deliberately): this runs per GEMM tile in prefill;
+        // promoting it needs a timing window. Layout and k are checked at load (layout_for).
         debug_assert!(matches!(self.layout, Layout::Packed(_)) && row % q.nr() == 0);
         (self.ptr + e * self.expert_bytes() + q.group_offset(row, self.k)) as *const u8
     }
     #[inline]
     pub fn f32(&self) -> *const f32 {
-        debug_assert!(self.layout == Layout::F32);
+        // N1 (audit): a real check; a wrong layout here reads quantised bytes as floats.
+        assert!(self.layout == Layout::F32, "f32() on a {:?} tensor", self.layout);
         self.ptr as *const f32
     }
     /// F32 tensor as a slice (all experts).
     pub fn f32_slice(&self) -> &[f32] {
-        assert!(self.layout == Layout::F32);
-        // SAFETY: the tensor's own read-only arena range.
+        assert!(self.layout == Layout::F32, "f32_slice() on a {:?} tensor", self.layout);
+        // N1 (audit): from_raw_parts needs an aligned pointer and a whole number of floats.
+        assert!(self.ptr % std::mem::align_of::<f32>() == 0, "F32 tensor at unaligned offset {:#x}", self.ptr);
+        assert!(self.bytes % 4 == 0, "F32 tensor of {} bytes is not a whole number of floats", self.bytes);
+        // SAFETY: the tensor's own read-only arena range, checked aligned and sized above.
         unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.bytes / 4) }
     }
 }
@@ -524,6 +530,9 @@ pub struct WeightStore {
     pub load_seconds: f64,
     pub repacked_bytes: u64,
     pub info: LoadInfo,
+    // CPU allocations own native expert bytes independently of any DSP session.
+    // No pointer is published until every selected tensor has been staged.
+    shared_experts: Vec<(Tid, oxn::shared_memory::SharedMemory)>,
 }
 
 impl WeightStore {
@@ -680,7 +689,85 @@ impl WeightStore {
             load_seconds: t0.elapsed().as_secs_f64(),
             repacked_bytes: total as u64,
             info,
+            shared_experts: Vec::new(),
         })
+    }
+
+    /// Exact CPU-owned DMA bytes. Imported DSP views must NOT add these again.
+    pub fn shared_expert_bytes(&self) -> usize {
+        self.shared_experts.iter().map(|(_, m)| m.len()).sum()
+    }
+
+    /// Borrow a sealed native-layout tensor for a bounded DSP window. CPU decode
+    /// retains the same object through this WeightStore even after DSP teardown.
+    pub fn shared_expert(&self, id: Tid) -> Option<&oxn::shared_memory::SharedMemory> {
+        self.shared_experts.binary_search_by_key(&id, |(i, _)| *i).ok().map(|i| &self.shared_experts[i].1)
+    }
+
+    /// Experimental storage change only: no DSP session or arithmetic change.
+    /// Requires exclusive store access BEFORE constructing any Engine. Publish
+    /// all replacement pointers together; on error the original refs stay valid.
+    #[cfg(feature = "npu-device")]
+    pub fn relocate_experts(&mut self, plan: &Plan, allocator: &oxn::shared_memory::SharedAllocator) -> Result<usize, String> {
+        if self.info.backing != "file" || !self.shared_experts.is_empty() {
+            return Err("shared experts require an unmodified file-backed store".into());
+        }
+        let mut ids: Vec<_> = plan.layers.iter().flat_map(|l| [l.gate_exps, l.up_exps, l.down_exps]).collect();
+        ids.sort_unstable(); ids.dedup();
+        // Hold the already-validated cache inode while advising away source pages.
+        // fadvise is advisory and does not alter file contents or invalidate refs.
+        let cache = open_ro_nofollow(Path::new(&self.info.cache_path))?;
+        let staged = self.stage_shared_backings(&ids, |src| {
+            let mut m = allocator.allocate(src.len())?;
+            m.as_mut_bytes().copy_from_slice(src);
+            Ok(m.seal())
+        }, |ptr, bytes| {
+            let page = 4096usize;
+            let begin = (ptr + page - 1) & !(page - 1);
+            let end = (ptr + bytes) & !(page - 1);
+            if end > begin {
+                // SAFETY: aligned inward, wholly inside the live file mapping.
+                unsafe { libc::madvise(begin as *mut libc::c_void, end - begin, libc::MADV_DONTNEED); }
+                if let (Ok(off), Ok(len)) = (i64::try_from(begin - self.arena.base() as usize), i64::try_from(end - begin)) {
+                    fadvise_dontneed(&cache, off, len);
+                }
+            }
+        })?;
+        // Everything is validated and owned. No fallible action after publishing.
+        for (id, memory) in &staged {
+            self.refs[*id].as_mut().unwrap().ptr = memory.as_bytes().as_ptr() as usize;
+        }
+        self.shared_experts = staged;
+        self.info.backing = "file+shared-experts".into();
+        Ok(self.shared_expert_bytes())
+    }
+
+    #[cfg(any(feature = "npu-device", test))]
+    fn stage_shared_backings<B: AsRef<[u8]>>(&self, ids: &[Tid], mut allocate_copy: impl FnMut(&[u8]) -> Result<B, String>, mut copied: impl FnMut(usize, usize)) -> Result<Vec<(Tid, B)>, String> {
+        if ids.is_empty() || ids.windows(2).any(|p| p[0] >= p[1]) {
+            return Err("shared expert IDs must be nonempty, unique and sorted".into());
+        }
+        let start = self.arena.base() as usize;
+        let end = start.checked_add(self.arena.len()).ok_or("arena range overflow")?;
+        // Preflight ALL bounds/types before allocating or releasing source pages.
+        for &id in ids {
+            let r = self.refs.get(id).and_then(Option::as_ref).ok_or("expert tensor not loaded")?;
+            if r.n_expert < 2 || !matches!(r.layout, Layout::Packed(_)) || r.bytes == 0 || r.bytes % 4096 != 0 || r.bytes > 512 << 20
+                || r.ptr < start || r.ptr.checked_add(r.bytes).is_none_or(|e| e > end) {
+                return Err("shared expert layout/range/size is not supported".into());
+            }
+        }
+        let mut staged = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let r = self.refs[id].as_ref().unwrap();
+            // SAFETY: checked file arena range; exclusive store, no running engine.
+            let source = unsafe { std::slice::from_raw_parts(r.ptr as *const u8, r.bytes) };
+            let owned = allocate_copy(source)?;
+            if owned.as_ref() != source { return Err("native packed expert copy differs".into()); }
+            staged.push((id, owned));
+            copied(r.ptr, r.bytes);
+        }
+        Ok(staged)
     }
 
     #[inline]
@@ -992,5 +1079,120 @@ mod s1_tests {
             let ids: Vec<Tid> = (0..g.header.tensors.len()).collect();
             arena_layout(&g.header.tensors, &ids).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_expert_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    const BYTES: usize = 36 * 4096; // valid Q4_K [256,512,2], not fake geometry
+    fn store() -> WeightStore {
+        let arena = Mapping::anon(2*BYTES,false).unwrap();
+        unsafe { std::slice::from_raw_parts_mut(arena.base(),2*BYTES).iter_mut().enumerate().for_each(|(i,v)|*v=(i%251)as u8); }
+        let refs = (0..2).map(|i|Some(WeightRef{ptr:arena.base()as usize+i*BYTES,layout:Layout::Packed(QType::Q4K),k:256,rows:512,n_expert:2,bytes:BYTES})).collect();
+        WeightStore{refs,arena,data_off:0,embd_row_bytes:0,load_seconds:0.,repacked_bytes:(2*BYTES)as u64,info:LoadInfo::default(),shared_experts:vec![]}
+    }
+    struct Owned { data:Vec<u8>, live:Arc<AtomicUsize> }
+    impl Owned { fn new(src:&[u8],live:&Arc<AtomicUsize>)->Self{live.fetch_add(1,Ordering::Relaxed);Self{data:src.to_vec(),live:live.clone()}} }
+    impl AsRef<[u8]> for Owned { fn as_ref(&self)->&[u8]{&self.data} }
+    impl Drop for Owned {fn drop(&mut self){self.live.fetch_sub(1,Ordering::Relaxed);}}
+    #[test]
+    fn allocation_failure_rolls_back_all_staging_without_publishing_pointers() {
+        let ws=store();let old:Vec<_>=ws.refs.iter().map(|r|r.unwrap().ptr).collect();
+        let live=Arc::new(AtomicUsize::new(0));let mut calls=0;let mut advised=0;
+        let got=ws.stage_shared_backings(&[0,1],|src|{calls+=1;if calls==2{Err("injected allocation failure".into())}else{Ok(Owned::new(src,&live))}},|_,_|advised+=1);
+        assert!(got.is_err());assert_eq!(calls,2);assert_eq!(advised,1);assert_eq!(live.load(Ordering::Relaxed),0);
+        assert_eq!(old,ws.refs.iter().map(|r|r.unwrap().ptr).collect::<Vec<_>>());assert_eq!(ws.shared_expert_bytes(),0);
+        assert_eq!(ws.arena.slice(0,2*BYTES),(0..2*BYTES).map(|i|(i%251)as u8).collect::<Vec<_>>());
+    }
+    #[test]
+    fn all_ranges_preflight_before_first_allocation_or_advice() {
+        for ids in [vec![],vec![0,0],vec![1,0],vec![0,2]]{
+            let ws=store();let mut calls=0;
+            let got=ws.stage_shared_backings(&ids,|src|{calls+=1;Ok(src.to_vec())},|_,_|panic!("advice before preflight"));
+            assert!(got.is_err());assert_eq!(calls,0);
+        }
+        let mut ws=store();ws.refs[1].as_mut().unwrap().ptr=usize::MAX-4;
+        let got=ws.stage_shared_backings(&[0,1],|_:&[u8]|->Result<Vec<u8>,String>{panic!("allocation before range preflight")},|_,_|panic!("advice before preflight"));
+        assert!(got.is_err());
+    }
+    #[test]
+    fn wrong_copy_is_rejected_and_success_preserves_exact_native_bytes() {
+        let ws=store();let live=Arc::new(AtomicUsize::new(0));let mut advised=0;
+        let bad=ws.stage_shared_backings(&[0,1],|src|{let mut o=Owned::new(src,&live);o.data[9]^=1;Ok(o)},|_,_|advised+=1);
+        assert!(bad.is_err());assert_eq!(advised,0);assert_eq!(live.load(Ordering::Relaxed),0);
+        let good=ws.stage_shared_backings(&[0,1],|src|Ok(Owned::new(src,&live)),|_,bytes|{assert_eq!(bytes,BYTES);advised+=1;}).unwrap();
+        assert_eq!(advised,2);assert_eq!(live.load(Ordering::Relaxed),2);
+        for (id,m) in &good{assert_eq!(m.as_ref(),ws.arena.slice(id*BYTES,BYTES));}
+        drop(good);assert_eq!(live.load(Ordering::Relaxed),0);
+    }
+}
+
+#[cfg(test)]
+mod real_native_reader_tests {
+    use super::*;
+    #[test]
+    #[ignore = "explicit real-weight proof; requires canonical inference lease"]
+    fn native_expert_tiles_match_real_original_gguf() {
+        let home=PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(!crate::load::lease_free(&home.join(".local/state/local-ai/inference.lock")),"hold canonical inference lease before touching real weights");
+        let path=home.join(".local/share/ai-stack/models/llm/Ornith-1.5-35B-A3B-APEX-MTP-Compact.gguf");
+        let g=Gguf::open(&path).unwrap();let mut checked=0;
+        for (name,ty) in [("blk.0.ffn_gate_exps.weight",QType::Q4K),("blk.5.ffn_down_exps.weight",QType::Q3K)]{
+            let tensor=g.header.tensors.iter().find(|t|t.name==name).unwrap();
+            assert_eq!(qtype(tensor.ty),Some(ty));assert_eq!(tensor.shape.len(),3);
+            let (k,rows,experts)=(tensor.shape[0]as usize,tensor.shape[1]as usize,tensor.shape[2]as usize);
+            assert_eq!(experts,256);let raw=g.tensor_data(tensor);let rb=ty.row_bytes(k);let bb=ty.block_bytes();
+            for e in [0,1,127,255]{for row0 in [0,rows-32]{for kb in [0,k/512,k/256-1]{
+                let mut group=vec![0u8;32*bb];
+                for r in 0..32{let at=(e*rows+row0+r)*rb+kb*bb;group[r*bb..(r+1)*bb].copy_from_slice(&raw[at..at+bb]);}
+                let mut packed=vec![0u8;group.len()];kernels_sys::repack(ty,&group,&mut packed,32,256);
+                let mut floats=vec![0f32;32*256];
+                for r in 0..32{kernels_sys::dequantize_row(ty,&group[r*bb..(r+1)*bb],&mut floats[r*256..(r+1)*256]);}
+                let mut expected=vec![0u16;floats.len()];kernels_sys::f32_to_f16(&floats,&mut expected);
+                for c0 in (0..256).step_by(32){
+                    let mut tile=[0u16;1024];kernels_sys::native_expert_tile(ty,&packed,256,32,1,0,0,c0,&mut tile).unwrap();
+                    for r in 0..32{for c in 0..32{assert_eq!(tile[(c/2)*64+2*r+c%2],expected[r*256+c0+c],"{name} expert{e} row{} k{}",row0+r,kb*256+c0+c);checked+=1;}}
+                }
+            }}}
+        }
+        assert_eq!(checked,393216);println!("W2b native reader real-GGUF fp16 elements checked={checked}, all exact, no model graph/DSP session");
+    }
+}
+
+#[cfg(test)]
+mod n1_tests {
+    use super::*;
+
+    fn f32_ref(ptr: usize, bytes: usize) -> WeightRef {
+        WeightRef { ptr, layout: Layout::F32, k: bytes / 4, rows: 1, n_expert: 1, bytes }
+    }
+
+    #[test]
+    fn f32_slice_reads_an_aligned_whole_tensor() {
+        let v = [1.0f32, 2.0, 3.0];
+        assert_eq!(f32_ref(v.as_ptr() as usize, 12).f32_slice(), &v);
+    }
+
+    #[test]
+    #[should_panic(expected = "unaligned")]
+    fn f32_slice_refuses_an_unaligned_pointer() {
+        let v = [0u32; 4];
+        let _ = f32_ref(v.as_ptr() as usize + 1, 8).f32_slice();
+    }
+
+    #[test]
+    #[should_panic(expected = "whole number of floats")]
+    fn f32_slice_refuses_a_partial_float() {
+        let v = [0u32; 4];
+        let _ = f32_ref(v.as_ptr() as usize, 7).f32_slice();
+    }
+
+    #[test]
+    #[should_panic(expected = "f32() on a")]
+    fn f32_pointer_refuses_a_quantised_layout() {
+        let w = WeightRef { ptr: 0, layout: Layout::Raw(QType::Q8_0), k: 32, rows: 1, n_expert: 1, bytes: 34 };
+        let _ = w.f32();
     }
 }

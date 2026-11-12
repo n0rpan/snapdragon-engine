@@ -1,5 +1,7 @@
 # M3-FLASH-IO: the expert read path (F-IO team, 2026-11-10)
 
+> **Historical working note.** The branches and worktrees named here were merged into `main` and then deleted; the commit hashes cited still resolve in `main`'s history. Current state: [README](README.md).
+
 Branch `flash-io` (from flash-m3 a6b2afd = the 2fde61a tree + docs), worktree `<engine checkout>`.
 Tags: **[M]** measured here (model-free bench, real sidecar, real route trace), **[M engine]** measured by Codex on the
 model, **[D]** arithmetic from [M], **[E]** estimate. No model was run for this document.

@@ -56,11 +56,11 @@ Binaries (bin/):
 $sums
 
 CPU: ARMv8.6-A with dotprod, i8mm, fp16 and bf16, no SVE needed. Tuned for and measured
-on the Snapdragon X Elite / X Plus (Qualcomm Oryon, X1E/X1P). The Rust code is compiled with
+on the Snapdragon X Elite (X1E80100) only; the X Plus has not been tested. The Rust code is compiled with
 target-cpu=oryon-1 and the vendored ggml kernels with
 -march=armv8.6-a+dotprod+i8mm+fp16+bf16+nosve+nosme. Other cores with the same features
-(the CI tests run on an Arm Neoverse N2 class runner) should work; a core without i8mm or
-bf16 stops with "Illegal instruction".
+(the CI tests run on an Arm Neoverse N2 class runner) are untested. A core without i8mm or
+bf16 is reported to stop with "Illegal instruction"; this has not been tested.
 OS:  Linux aarch64 with glibc $glibc or newer.
 $flash_note
 Numerics: the published speed and quality numbers were measured with binaries built on the

@@ -27,6 +27,7 @@ fn flash_params() -> GenParams {
 /// request at 3*32 = 96. The retry resumes from there on the same cut grid, so its prefill calls
 /// from 96 on are exactly the uncancelled run's, and its reply is identical.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn flash_msg_split_cancel_resumes_on_schedule() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -70,6 +71,7 @@ fn flash_msg_split_cancel_resumes_on_schedule() {
 /// ubatch boundary and no call crosses a message start. The single-token call at 999 is the
 /// decode step for the last prompt token and is excluded.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn flash_msg_split_cancel_cut_never_moves_a_chunk_boundary() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -96,6 +98,7 @@ fn flash_msg_split_cancel_cut_never_moves_a_chunk_boundary() {
 /// `cancelled_partial_prefill_survives_another_request`, but under msg_split: the partial prefill
 /// is parked by the other request and the retry resumes it whole.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn flash_cancel_then_other_request_then_retry_msg_split() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -130,10 +133,11 @@ fn flash_cancel_then_other_request_then_retry_msg_split() {
 /// only. Line 2 shares a prefix with line 1 (same anchor as `msg_split_resident_second_question`),
 /// so its cache_n is positive. No key outside the ledger's documented set, so no prompt text.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn ledger_writes_one_numeric_line_per_generation() {
     const ALLOWED: &[&str] = &[
         "t", "n_prompt", "cache_n", "cache_src", "prompt_n", "prompt_ms", "predicted_n", "predicted_ms", "stop", "draft_n",
-        "draft_n_accepted", "parks", "unparks", "park_ms", "unpark_ms", "park_evictions", "checkpoints", "parked", "parked_mib",
+        "draft_n_accepted", "parks", "unparks", "park_ms", "unpark_ms", "park_evictions", "checkpoints", "parked", "parked_mib", "resume_src", "resume_ms",
     ];
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -174,6 +178,7 @@ fn flash_params_small() -> GenParams {
 /// A cancelled generation returns before the ledger write (the line is written only at the end of
 /// `generate`, on success), so a cancel leaves the ledger file empty.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn cancelled_generation_writes_no_ledger_line() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -249,6 +254,7 @@ impl crate::engine::Engine for FailStub {
 /// answered as a live continuation on top of the invalid chunk. Now the state is dropped: engine and
 /// cache are both empty after the error, the retry recomputes everything and equals an undisturbed run.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn engine_error_mid_prefill_drops_the_state_and_the_retry_starts_clean() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -283,6 +289,7 @@ fn engine_error_mid_prefill_drops_the_state_and_the_retry_starts_clean() {
 /// The same for an error in the decode loop: the state is dropped, the next request (the same
 /// prompt) is computed from scratch and equals the reference.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn engine_error_mid_decode_drops_the_state() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();

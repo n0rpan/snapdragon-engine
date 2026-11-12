@@ -145,6 +145,15 @@ pub fn timings_json(t: &Timings) -> Json {
         j["draft_n"] = json!(t.draft_n);
         j["draft_n_accepted"] = json!(t.draft_n_accepted);
     }
+    // CACHE-PERFECT P2b (design sec. 7): where the reused prefix came from (live/ram/disk/cold)
+    if !t.resume_src.is_empty() {
+        j["resume_src"] = json!(t.resume_src);
+        j["resume_ms"] = json!(t.resume_ms);
+    }
+    if let Some(ms) = t.preload_ms {
+        j["preload_src"] = json!("disk");
+        j["preload_ms"] = json!(ms);
+    }
     j
 }
 

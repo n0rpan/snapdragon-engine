@@ -12,6 +12,13 @@ sched = { path = "../sched" }
 int8-gemm = { path = "../int8-gemm" }
 image-dit = { path = "../image-dit" }
 image-vae = { path = "../image-vae" }
+oxn = { path = "../oxn" }
+qwen3-te = { path = "../qwen3-te" }
+
+[features]
+default = []
+# oxi --npu device: the DSP backend of oxn (the build needs FASTRPC_INC; the SDK is BYO)
+npu-device = ["oxn/device", "qwen3-te/npu-device"]
 
 [[bin]]
 name = "oxi"

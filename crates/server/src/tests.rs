@@ -9,15 +9,14 @@ use serde_json::{json, Value as Json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The Ornith GGUF for tokenizer/template tests. Every test that needs it is `#[ignore]`d, so a
+/// plain `cargo test` (CI) reports it as ignored instead of passing it vacuously; running one with
+/// `--include-ignored` where the model is missing fails instead of returning early.
 pub(crate) fn model() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".local/share/ai-stack/models/llm/Ornith-1.5-35B-A3B-APEX-MTP-Compact.gguf");
-    if p.exists() {
-        Some(p)
-    } else {
-        eprintln!("skip: no model gguf");
-        None
-    }
+    assert!(p.exists(), "model test run without its model: {} is missing", p.display());
+    Some(p)
 }
 
 pub(crate) fn greedy() -> GenParams {
@@ -83,6 +82,7 @@ const TOOLS: &str = r#"[{"type":"function","function":{"name":"read_file","descr
 const CALL: &str = "I'll look.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\n/tmp/a \"b\".txt\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call>";
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn chat_nonstream_shape() {
     let Some(st) = state(&["Hello there!"], 4096) else { return };
     let (c, j, _) = call(&st, "POST", "/v1/chat/completions", json!({"messages":[{"role":"user","content":"hi"}],"temperature":0})).await;
@@ -100,8 +100,10 @@ async fn chat_nonstream_shape() {
     assert_eq!(u["completion_tokens"], 4);
     assert_eq!(
         keys(&j["timings"]),
-        ["cache_n", "prompt_n", "prompt_ms", "prompt_per_token_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_token_ms", "predicted_per_second"]
+        // + the CACHE-PERFECT resume source (design sec. 7, P2b)
+        ["cache_n", "prompt_n", "prompt_ms", "prompt_per_token_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_token_ms", "predicted_per_second", "resume_src", "resume_ms"]
     );
+    assert_eq!(j["timings"]["resume_src"], "cold");
 }
 
 fn parse_frames(frames: &[String]) -> (Vec<Json>, bool) {
@@ -122,6 +124,7 @@ fn parse_frames(frames: &[String]) -> (Vec<Json>, bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn chat_stream_tool_call_roundtrip() {
     let Some(st) = state(&[CALL, "The file says hi."], 8192) else { return };
     let tools: Json = serde_json::from_str(TOOLS).unwrap();
@@ -194,6 +197,7 @@ async fn chat_stream_tool_call_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn stream_usage_chunk_and_done() {
     let Some(st) = state(&["ok"], 4096) else { return };
     let (_, _, frames) = call(
@@ -214,6 +218,7 @@ async fn stream_usage_chunk_and_done() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn completion_n_probs_and_limits() {
     let Some(st) = state(&["A B C D", "A", "x"], 4096) else { return };
     let (c, j, _) = call(&st, "POST", "/completion", json!({"prompt":"Answer: ","n_predict":1,"n_probs":3,"temperature":0})).await;
@@ -249,6 +254,7 @@ async fn completion_n_probs_and_limits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn helper_endpoints() {
     let Some(st) = state(&[], 4096) else { return };
     assert_eq!(call(&st, "GET", "/health", Json::Null).await.1, json!({"status":"ok"}));
@@ -275,6 +281,7 @@ async fn helper_endpoints() {
 }
 
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn stop_strings_and_limits() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -425,6 +432,7 @@ impl Engine for SpecStub {
 }
 
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn speculative_loop_matches_plain() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -479,6 +487,7 @@ fn speculative_loop_matches_plain() {
 /// (forced by n_probs > 0): the same streamed partials (text, token, count), the same result,
 /// and the same engine state, plain and speculative, with stop words, limits and cancels.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn greedy_fast_path_streams_identically() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -535,8 +544,7 @@ fn greedy_fast_path_streams_identically() {
 #[ignore]
 fn mtp_multiturn_greedy_is_identical_to_plain() {
     let Ok(model) = std::env::var("OXE_TEST_MODEL") else {
-        eprintln!("skip: OXE_TEST_MODEL not set");
-        return;
+        panic!("OXE_TEST_MODEL not set: this ignored test needs a real model");
     };
     let cpus = sched::parse_cpu_list(&std::env::var("OXE_TEST_CPUS").unwrap_or_else(|_| "0-7".into())).unwrap();
     let tok = tokenizer::Tokenizer::from_gguf(&model).unwrap();
@@ -611,8 +619,11 @@ const READ_CALL: &str = "<tool_call>\n<function=read>\n<parameter=filePath>\n/p/
 /// `<think>\n\n</think>\n\n` of the generation prompt). Before the query checkpoint this
 /// fell back to 0 cached tokens.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn multiturn_tool_calls_reuse_cache() {
     let Some(st) = state_with(&[READ_CALL, "Fixed: add() now returns a + b.", "Run pytest."], 16384, 4, 16, None) else { return };
+    // the query-checkpoint mechanism, measured without ECHO (with it turn 3 keeps every token)
+    st.echo.lock().unwrap().cfg.enabled = false;
     let tools = agent_tools();
     let sys = agent_system();
     let req = |msgs: &Json| json!({"messages": msgs, "tools": tools, "temperature": 0});
@@ -656,6 +667,7 @@ pub(crate) fn scratch_dir(name: &str) -> PathBuf {
 /// Save the system+tools prefix, "restart" (a new server over the same directory) and
 /// resume from it: the restored request gets cache_n = the anchor and the same reply.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn prefix_store_survives_restart() {
     let dir = scratch_dir("store");
     let tools = agent_tools();
@@ -712,8 +724,7 @@ async fn prefix_store_survives_restart() {
 #[ignore]
 fn prefix_store_real_model() {
     let Ok(model) = std::env::var("OXE_TEST_MODEL") else {
-        eprintln!("skip: OXE_TEST_MODEL not set");
-        return;
+        panic!("OXE_TEST_MODEL not set: this ignored test needs a real model");
     };
     let cpus = sched::parse_cpu_list(&std::env::var("OXE_TEST_CPUS").unwrap_or_else(|_| "0-7".into())).unwrap();
     let tok = tokenizer::Tokenizer::from_gguf(&model).unwrap();
@@ -871,6 +882,7 @@ fn parked_sessions_logic() {
 /// tools), then the build agent's next turn. Parked: the next turn re-evaluates only the
 /// tool result, not the whole conversation.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn agent_switch_resumes_parked_session() {
     let Some(st) = state_with(&[READ_CALL, "A title", "Fixed it."], 16384, 8, 16, None) else { return };
     let ledger = scratch_dir("ledger").with_extension("jsonl");
@@ -918,6 +930,7 @@ async fn agent_switch_resumes_parked_session() {
 /// the newest message starts; an edit of the last user message resumes at the floor of
 /// its start instead of the anchor.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn turn_checkpoints_resume_edit() {
     let Some(st) = state_with(&["Done.", "Done again."], 16384, 8, 16, None) else { return };
     let sys = agent_system();
@@ -949,6 +962,7 @@ async fn turn_checkpoints_resume_edit() {
 /// Session cache: the build agent's conversation is written at shutdown and a new server
 /// (unload, model switch) continues it from disk: only the new tool result is evaluated.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn session_cache_survives_restart() {
     let dir = scratch_dir("sessions");
     let open = |st: &Arc<State<StubEngine>>| {
@@ -998,8 +1012,7 @@ async fn session_cache_survives_restart() {
 #[ignore]
 fn parked_sessions_real_model() {
     let Ok(model) = std::env::var("OXE_TEST_MODEL") else {
-        eprintln!("skip: OXE_TEST_MODEL not set");
-        return;
+        panic!("OXE_TEST_MODEL not set: this ignored test needs a real model");
     };
     let cpus = sched::parse_cpu_list(&std::env::var("OXE_TEST_CPUS").unwrap_or_else(|_| "0-7".into())).unwrap();
     let depth: usize = std::env::var("OXE_TEST_MTP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1120,6 +1133,7 @@ fn msg_store(w: &Worker<StubEngine>, dir: &std::path::Path) -> crate::prefix_sto
 /// the first user message (17; the grid floor with a 4096-token ubatch would be 0). Without
 /// `msg_split` the same prompt is one unsplit prefill and gets no anchor.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn msg_split_anchor_is_first_user() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1147,6 +1161,7 @@ fn msg_split_anchor_is_first_user() {
 /// The anchor of request 1 is restored for a second question with the same system prompt; the
 /// prefill resumes at the anchor (cache_n 17) and keeps the message-boundary splits.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn msg_split_resident_second_question() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1168,6 +1183,7 @@ fn msg_split_resident_second_question() {
 /// A process that loads the anchor from the prefix store computes the same prefill schedule
 /// from 17 on as a cold process does for the same prompt (restored == computed).
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn msg_split_cold_and_store_loaded_schedules_match() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1205,6 +1221,7 @@ fn msg_split_cold_and_store_loaded_schedules_match() {
 /// Turn checkpoints: six message starts after the anchor are all split points, but only the two
 /// newest of the non-anchor, non-query ones keep a PRIO_TURN checkpoint.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn msg_split_turn_checkpoints_newest_win() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1231,6 +1248,7 @@ fn msg_split_turn_checkpoints_newest_win() {
 /// must come from a state prefilled on the schedule of a cold process). Only request 1's
 /// anchor is stored.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn msg_split_noncanonical_resume_saves_no_store_entry() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1259,6 +1277,7 @@ fn msg_split_noncanonical_resume_saves_no_store_entry() {
 /// handed to the engine by a new process with the same identity, invisible to another
 /// identity, and rejected when truncated or garbage. Mode 0600.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn warm_file_roundtrip() {
     use crate::generate::WarmFile;
     use std::os::unix::fs::PermissionsExt;
@@ -1423,6 +1442,7 @@ impl Engine for MidCallCancelStub {
 /// cache agree on a prompt prefix that ends at a call boundary, the flag is unregistered afterwards, and a retry
 /// resumes and replies as an uncancelled run.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn cancel_inside_a_prefill_call_rolls_back_to_the_call_start() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -1460,6 +1480,7 @@ fn cancel_inside_a_prefill_call_rolls_back_to_the_call_start() {
 /// on the grid); a retry resumes from it and gives the same reply as an uncancelled run.
 /// Cancel mid-decode: stops at once, state consistent.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn cancel_mid_prefill_and_decode() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -1503,6 +1524,7 @@ fn cancel_mid_prefill_and_decode() {
 
 /// F7: constrained output is refused with 400 instead of being ignored.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn structured_output_is_refused() {
     let Some(st) = state(&["x"], 4096) else { return };
     for extra in [json!({"response_format": {"type": "json_object"}}), json!({"json_schema": {"type": "object"}}), json!({"grammar": "root ::= \"a\""})] {
@@ -1527,6 +1549,7 @@ async fn structured_output_is_refused() {
 /// full-length entry is no prefix of it. The query checkpoint is now persisted too: reuse
 /// after the restart equals the uninterrupted session's.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn session_cache_resumes_after_user_message() {
     let tools = agent_tools();
     let _ = agent_system();
@@ -1552,6 +1575,8 @@ async fn session_cache_resumes_after_user_message() {
     };
     // reference: uninterrupted
     let Some(r) = state_with(&scripts, 16384, 8, 16, None) else { return };
+    // the session cache's checkpoints, measured without ECHO (its records are RAM only here)
+    r.echo.lock().unwrap().cfg.enabled = false;
     let msgs = run_two(r.clone()).await;
     let (_, jr, _) = call(&r, "POST", "/v1/chat/completions", req(&msgs)).await;
     let c_ref = jr["timings"]["cache_n"].as_u64().unwrap();
@@ -1559,6 +1584,7 @@ async fn session_cache_resumes_after_user_message() {
     // test: same turns, persist (idle unload), new process, turn 3
     let dir = scratch_dir("sessions-user");
     let Some(st) = state_with(&scripts, 16384, 8, 16, None) else { return };
+    st.echo.lock().unwrap().cfg.enabled = false;
     open(&st, &dir);
     // the same conversation (tool-call ids are random, and the template does not render them)
     let msgs2 = run_two(st.clone()).await;
@@ -1566,6 +1592,7 @@ async fn session_cache_resumes_after_user_message() {
     assert!(n >= 2, "full state + its query checkpoint: {n} entries");
     drop(st);
     let Some(st2) = state_with(&["Run pytest."], 16384, 8, 16, None) else { return };
+    st2.echo.lock().unwrap().cfg.enabled = false;
     open(&st2, &dir);
     let (_, j3, _) = call(&st2, "POST", "/v1/chat/completions", req(&msgs2)).await;
     let c3 = j3["timings"]["cache_n"].as_u64().unwrap();
@@ -1606,6 +1633,7 @@ fn repetition_watchdog_detects_loops_only() {
 /// Codex 039 A: cancel mid-prefill, then another (short) request, then the retry. The
 /// partial prefill must survive the intervening request (it is parked) and the retry resume it.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn cancelled_partial_prefill_survives_another_request() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -1637,6 +1665,7 @@ fn cancelled_partial_prefill_survives_another_request() {
 }
 
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn mtp_tune_table_and_per_request_off_switch() {
     use crate::generate::SpecTable;
     let dir = std::env::temp_dir().join(format!("oxe-tune-{}", std::process::id()));
@@ -1737,6 +1766,7 @@ impl Engine for LookupStub {
 /// Prompt lookup: identical tokens, text, stop and engine state as plain greedy decoding, with
 /// drafts actually verified (a repetitive script), stop words, limits and cancels.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn lookup_drafting_matches_plain() {
     let Some(p) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(p).unwrap();
@@ -1829,6 +1859,7 @@ impl Engine for SpecCancelStub {
 }
 
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn cancel_during_mtp_speculation_is_consistent() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -1872,6 +1903,7 @@ fn cancel_during_mtp_speculation_is_consistent() {
 /// form while idle; the next user turn then reuses everything before its new user message, where
 /// without it the request resumes at the previous query's checkpoint and re-prefills that query.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 async fn idle_reprefill_serves_the_next_user_turn() {
     let run = |idle: bool| async move {
         let st = state_with(&[READ_CALL, "Fixed it.", "Run pytest."], 16384, 8, 16, None).unwrap();
@@ -1883,6 +1915,8 @@ async fn idle_reprefill_serves_the_next_user_turn() {
             let tok = Arc::try_unwrap(w.tok).ok().unwrap();
             Arc::new(State::new(cfg, tok, w.worker.into_inner().unwrap()).unwrap())
         };
+        // SX-2 measured without ECHO (with it the next user turn hits without any idle work)
+        st.echo.lock().unwrap().cfg.enabled = false;
         let req = |msgs: &Json| json!({"messages": msgs, "tools": agent_tools(), "temperature": 0});
         let mut msgs = json!([{"role":"system","content":agent_system()},{"role":"user","content":"The add() function in calc.py is wrong."}]);
         let (_, j1, _) = call(&st, "POST", "/v1/chat/completions", req(&msgs)).await;
@@ -1890,7 +1924,6 @@ async fn idle_reprefill_serves_the_next_user_turn() {
         msgs.as_array_mut().unwrap().extend([j1["choices"][0]["message"].clone(), json!({"role":"tool","tool_call_id":tc["id"],"content":"def add(a, b):\n    return a - b\n"})]);
         let (_, j2, _) = call(&st, "POST", "/v1/chat/completions", req(&msgs)).await;
         assert_eq!(j2["choices"][0]["finish_reason"], "stop");
-        let calls0 = st.worker.lock().unwrap().engine.calls.len();
         if idle {
             // wait (bounded) for the idle job
             let t0 = std::time::Instant::now();
@@ -1899,6 +1932,10 @@ async fn idle_reprefill_serves_the_next_user_turn() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
+        // where turn 2 ended = after its last decode (the idle job only restores and prefills).
+        // `calls.len()` read right after the reply raced the idle job: under load the job had
+        // already run, its prefills fell before the mark and the boundary lists differed (P2 review).
+        let calls0 = st.worker.lock().unwrap().engine.calls.iter().rposition(|c| c.0 == "decode").map_or(0, |i| i + 1);
         msgs.as_array_mut().unwrap().extend([j2["choices"][0]["message"].clone(), json!({"role":"user","content":"Now write a test."})]);
         let (_, tk, _) = call(&st, "POST", "/apply-template", json!({"messages": msgs, "tools": agent_tools()})).await;
         let p3 = st.tok.encode(tk["prompt"].as_str().unwrap(), true, true);
@@ -1975,6 +2012,7 @@ fn store_prune_leaves_foreign_files_alone() {
 /// reply. Output, stop and engine state must equal plain decoding, and `decode_spec` may only
 /// run at the context positions the policy allows.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn ctx_adaptive_mtp_switch_mid_reply_matches_plain() {
     use crate::generate::SpecTable;
     let Some(m) = model() else { return };
@@ -2097,6 +2135,7 @@ impl Engine for FailAfterStub {
 /// the server stays up, and the retry of the same prompt is treated as a live continuation: it
 /// prefills on top of the failed chunk (wrong positions, invalid KV rows) and answers 200.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn engine_error_mid_prefill_leaves_engine_and_cache_in_step() {
     let Some(m) = model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -2141,4 +2180,138 @@ fn flash_switch_defaults_and_flags() {
     assert!(s.parse_flag("--flash-warmup", "yes").is_err());
     assert!(s.parse_flag("--flash-dense-gemm", "").is_err());
     assert!(s.warmup && !s.dense_gemm, "a rejected value must not change the switch");
+}
+
+// ------------------------------------------------------------------ LONG-CTX: no full-state RAM copies
+
+/// `save_stream` writes the same file bytes as `save_async` of the buffered state (40,002
+/// tokens: beyond 32K), and the entry loads back exactly; nothing buffers the state.
+#[test]
+fn long_ctx_stream_save_equals_buffered_save() {
+    let toks: Vec<u32> = (0..40_002u32).map(|i| (i * 7 + 3) % 400).collect();
+    let mut eng = StubEngine::new(100_000, 400, 399, vec![]);
+    eng.prefill(&toks).unwrap();
+    let (d1, d2) = (scratch_dir("lc-async"), scratch_dir("lc-stream"));
+    let mut a = crate::prefix_store::PrefixStore::open(&d1, "id".into(), 1 << 30, 16).unwrap();
+    let mut b = crate::prefix_store::PrefixStore::open(&d2, "id".into(), 1 << 30, 16).unwrap();
+    a.save_async(toks.clone(), eng.save_state_vec().unwrap());
+    a.flush();
+    let len = b.save_stream(&toks, &mut |w| eng.save_state(w).map_err(|e| e.0)).unwrap();
+    assert_eq!(len as usize, eng.state_size_hint());
+    let file = |d: &std::path::Path| {
+        let p = std::fs::read_dir(d).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "bin")).unwrap();
+        std::fs::read(p).unwrap()
+    };
+    assert!(file(&d1) == file(&d2), "streamed entry differs from the buffered one");
+    assert!(b.contains(&toks));
+    // a reopened store indexes it, and it loads into a fresh engine
+    let b2 = crate::prefix_store::PrefixStore::open(&d2, "id".into(), 1 << 30, 16).unwrap();
+    let mut e2 = StubEngine::new(100_000, 400, 399, vec![]);
+    let mut prompt = toks.clone();
+    prompt.push(5);
+    assert_eq!(b2.best(&prompt, prompt.len() - 1), Some(toks.len()));
+    b2.load(&mut e2, &prompt, toks.len()).unwrap();
+    assert_eq!(e2.tokens, toks);
+    let _ = std::fs::remove_dir_all(&d1);
+    let _ = std::fs::remove_dir_all(&d2);
+}
+
+/// Disk parking (`--park-disk-min-bytes`): a 40K-token session that another agent's request
+/// displaces is streamed to the session cache with its checkpoint, never copied into RAM; a small
+/// session still parks in RAM; the long one resumes from disk with its full length; the engine and
+/// cache stay consistent. A RAM park whose state cannot fit the budget builds no copy.
+#[test]
+fn long_ctx_disk_park_streams_large_sessions() {
+    let dir = scratch_dir("lc-park");
+    let mut w = Worker::new(StubEngine::new(100_000, 400, 399, vec![]), 8);
+    w.sessions = Some(crate::prefix_store::PrefixStore::open(&dir, "id".into(), 1 << 30, 16).unwrap());
+    w.cache.park_budget = 1 << 30;
+    w.cache.park_min = 8;
+    w.cache.spill = true;
+    w.cache.park_disk_min = 100_000; // stub state = 4 B/token: 40K tokens park to disk, 31 to RAM
+    let run = |w: &mut Worker<StubEngine>, prompt: &[u32], gen: &[u32]| -> usize {
+        w.park_large(prompt);
+        let n = w.cache.prepare(&mut w.engine, prompt, true).unwrap();
+        let rest = &prompt[n..];
+        if rest.len() > 1 {
+            w.engine.prefill(&rest[..rest.len() - 1]).unwrap();
+            w.cache.appended(&rest[..rest.len() - 1]);
+            w.cache.checkpoint(&mut w.engine).unwrap();
+        }
+        w.engine.prefill(&rest[rest.len() - 1..]).unwrap();
+        w.cache.appended(&rest[rest.len() - 1..]);
+        w.cache.prompt_len = prompt.len();
+        for &g in gen {
+            w.engine.decode(g).unwrap();
+            w.cache.appended(&[g]);
+        }
+        w.cache.checkpoint(&mut w.engine).unwrap();
+        assert_eq!(w.engine.tokens, w.cache.tokens);
+        n
+    };
+    let a1: Vec<u32> = (0..40_000u32).map(|i| (i * 13 + 1) % 300).collect();
+    run(&mut w, &a1, &[310, 311]);
+    let a_full: Vec<u32> = w.cache.tokens.clone();
+    // agent B displaces A: A goes to disk (full state + its prompt checkpoint), not to RAM
+    let b1: Vec<u32> = (320..=350).collect();
+    assert_eq!(run(&mut w, &b1, &[360]), 0);
+    assert_eq!(w.cache.stats.disk_parks, 1);
+    assert!(w.cache.parked_lengths().is_empty(), "the long session was copied into RAM");
+    let st = w.sessions.as_ref().unwrap();
+    assert!(st.contains(&a_full), "full session not on disk");
+    assert!(st.contains(&a1[..a1.len() - 1]), "prompt checkpoint not on disk");
+    // A continues: B (small) parks in RAM as before; A's whole state is on disk for the worker's
+    // session-cache lookup
+    let mut a2 = a_full.clone();
+    a2.extend([370, 371, 372]);
+    run(&mut w, &a2, &[]);
+    assert_eq!(w.cache.stats.disk_parks, 1);
+    assert_eq!(w.cache.parked_lengths(), vec![b1.len() + 1]);
+    let st = w.sessions.as_ref().unwrap();
+    assert_eq!(st.best(&a2, a2.len() - 1), Some(a_full.len()));
+    let mut e2 = StubEngine::new(100_000, 400, 399, vec![]);
+    st.load(&mut e2, &a2, a_full.len()).unwrap();
+    assert_eq!(e2.tokens, a_full);
+    // RAM parking with a budget below the state: no park (and no copy built for it)
+    let mut c: PrefixCache<<StubEngine as Engine>::Snapshot> = PrefixCache::new(8);
+    let mut eng = StubEngine::new(100_000, 400, 399, vec![]);
+    c.park_budget = 1000;
+    c.park_min = 8;
+    eng.prefill(&a1).unwrap();
+    c.appended(&a1);
+    c.prompt_len = a1.len();
+    c.prepare(&mut eng, &b1, true).unwrap();
+    assert_eq!((c.stats.parks, c.parked_bytes()), (0, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `save_stream` past the 64 MiB write-behind window: a 150 MiB state streams in odd-sized
+/// writes; the patched header length and checksum match the data that landed in the file.
+#[test]
+fn long_ctx_stream_save_write_behind_150mib() {
+    let dir = scratch_dir("lc-wb");
+    let mut st = crate::prefix_store::PrefixStore::open(&dir, "id".into(), 1 << 40, 1).unwrap();
+    let toks: Vec<u32> = (0..100).collect();
+    let total = 150usize << 20;
+    let chunk: Vec<u8> = (0..1_048_573usize).map(|i| (i * 31 % 251) as u8).collect();
+    let len = st
+        .save_stream(&toks, &mut |w| {
+            let mut left = total;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                w.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+                left -= n;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(len as usize, total);
+    let p = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "bin")).unwrap();
+    let f = std::fs::read(&p).unwrap();
+    let hdr = 8 + 4 + 2 + 8 + 4 * toks.len() + 16;
+    assert_eq!(f.len(), hdr + total);
+    let rd = |o: usize| u64::from_le_bytes(f[o..o + 8].try_into().unwrap());
+    assert_eq!(rd(hdr - 16), total as u64);
+    assert_eq!(rd(hdr - 8), crate::prefix_store::check64(&f[hdr..]));
+    let _ = std::fs::remove_dir_all(&dir);
 }

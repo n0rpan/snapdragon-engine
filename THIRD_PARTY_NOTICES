@@ -43,7 +43,7 @@ kept, unchanged, in the component's own directory.
    Files:     parts of our own crates re-implement or port llama.cpp code:
               crates/kernels-sys/csrc/oxe_ops.cpp (graph operations) and the
               chat, tokenizer and server crates (the table in
-              crates/server/SERVER.md names the upstream files and commit).
+              docs/lab-notes/SERVER.md names the upstream files and commit).
               These files are written by Oscar Nordström (n0rpan) and are
               MIT; the upstream notice above is kept because they follow
               upstream code closely.

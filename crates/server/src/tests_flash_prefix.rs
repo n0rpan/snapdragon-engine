@@ -189,7 +189,7 @@ impl Engine for HybridStub {
 const ID: &str = "model=sha256:aaaa server=sha256:bbbb state=hybrid-stub-v1 vocab=4096 rec=512 sched=messages ubatch=4096";
 
 fn prompt(n: usize, salt: u32) -> Vec<u32> {
-    (0..n as u32).map(|i| (i * 2654435761u32.wrapping_add(salt)) % 4000 + 10).collect()
+    (0..n as u32).map(|i| i.wrapping_mul(2654435761u32.wrapping_add(salt)) % 4000 + 10).collect()
 }
 
 /// Cold engine A computes the anchor and writes it; a new engine B (a restarted process) loads it.
@@ -467,6 +467,7 @@ fn flash_prefix_refuses_the_sidecar_directory() {
 /// the anchor at the first user message; a restarted process loads it for a new question and returns
 /// the same tokens and final logits as a cold process (needs only the tokenizer of a local GGUF).
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn flash_prefix_worker_restart_identical() {
     let Some(m) = crate::tests::model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();
@@ -605,6 +606,7 @@ fn flash_prefix_save_floor() {
 /// FLASH-PREFIX-2 through `Worker::generate`: under the floor the anchor is not saved (no state buffer, no file),
 /// the request itself is unchanged; with room the same request stores it.
 #[test]
+#[ignore = "needs the Ornith GGUF (tokenizer/template) in ~/.local/share/ai-stack/models/llm; run with --include-ignored where it exists"]
 fn flash_prefix_worker_skips_save_when_memory_is_short() {
     let Some(m) = crate::tests::model() else { return };
     let tok = tokenizer::Tokenizer::from_gguf(m).unwrap();

@@ -95,6 +95,7 @@ BASE_ITEMS = [
     # token embedding rows (get_rows -> to_float)
     ('ggml/src/ggml-quants.c', 'fn', 'get_scale_min_k4'),
     ('ggml/src/ggml-quants.c', 'fn', 'dequantize_row_q8_0'),
+    ('ggml/src/ggml-quants.c', 'fn', 'dequantize_row_q3_K'),
     ('ggml/src/ggml-quants.c', 'fn', 'dequantize_row_q4_K'),
     ('ggml/src/ggml-quants.c', 'fn', 'dequantize_row_q5_K'),
     ('ggml/src/ggml-quants.c', 'fn', 'dequantize_row_q6_K'),

@@ -11,6 +11,8 @@ name = "oxe-server"
 path = "src/main.rs"
 
 [dependencies]
+gguf = { path = "../gguf" }
+oxn = { path = "../oxn", optional = true }
 tokenizer = { path = "../tokenizer" }
 model = { path = "../model" }
 sched = { path = "../sched" }
@@ -23,6 +25,11 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 bytes = "1.12.1"
 libc.workspace = true
 
+[dev-dependencies]
+model = { path = "../model", features = ["testkit"] }
+
 [features]
+npu-prefill = ["model/npu-prefill", "dep:oxn"]
+npu-device = ["npu-prefill", "model/npu-device", "oxn/device"]
 # --engine flash: Qwen3.8-Flash-Next (links the production ggml objects, see crates/qwen4exp)
 flash = ["dep:qwen4exp"]

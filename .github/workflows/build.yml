@@ -56,6 +56,10 @@ jobs:
           head -n 3 oxi.txt
       - name: Model-free tests (workspace without the Flash crate)
         timeout-minutes: 40
+        # the numerics golden is recorded for the laptop and the lab-arm64 helper (ci-arm64.yml), not
+        # for this hosted runner's kernel path: print its hash instead of failing (P2b, M3)
+        env:
+          OXE_NUMERICS_GOLDEN_UNLISTED: print
         run: cargo test --release --locked --no-fail-fast --workspace --exclude qwen4exp
       - name: Package
         if: inputs.package

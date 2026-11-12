@@ -8,7 +8,7 @@
 // 4-token group: 256 SMMLA per 8192 multiply-accumulates plus ~3x that in decode work. Here a
 // chunk of weight rows is decoded ONCE into int8 codes and then multiplied with every token in
 // 8-token x 4-row tiles whose 16 accumulators stay in registers (the shape the Flash prefill
-// team measured, PROGRESS-PF.md), with the loops blocked so that the activations of one
+// team measured, docs/lab-notes/PROGRESS-PF.md), with the loops blocked so that the activations of one
 // 256-weight block for 64 tokens, the codes and the float accumulators all stay in L1.
 //
 // Exactness contract (Q4_K dense, reference `ggml_gemm_q4_K_8x8_q8_K`, i8mm branch).

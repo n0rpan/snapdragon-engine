@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/kernels-sys", "crates/int8-gemm", "crates/image-dit", "crates/image-flow", "crates/image-vae", "crates/image-npu", "crates/gguf", "crates/sched", "crates/model", "crates/oxe-cli", "crates/tokenizer", "crates/chat", "crates/server", "crates/qwen4exp", "crates/flash-iobench"]
+members = ["crates/kernels-sys", "crates/int8-gemm", "crates/image-dit", "crates/image-flow", "crates/image-vae", "crates/image-npu", "crates/gguf", "crates/sched", "crates/model", "crates/oxe-cli", "crates/tokenizer", "crates/chat", "crates/server", "crates/qwen4exp", "crates/flash-iobench", "crates/oxn", "crates/qwen3-te"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 publish = false

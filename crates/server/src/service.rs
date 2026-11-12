@@ -43,6 +43,26 @@ pub struct State<E: Engine> {
     /// S8: a stream whose client takes no frame for this long is dropped and its generation
     /// cancelled (`--stream-stall-timeout`, env `OXE_STREAM_STALL_SECS`, default 30 s)
     pub stream_stall: std::time::Duration,
+    /// CACHE-PERFECT ECHO records (see `echo.rs`); config from `OXE_ECHO*` (the `--echo*` flags)
+    pub echo: Mutex<crate::echo::EchoStore>,
+    /// token ids that open an assistant turn (`<|im_start|>assistant`), None if the template has none
+    pub asst_delim: Option<Vec<Token>>,
+    /// the turn end id (`<|im_end|>`)
+    pub im_end: Option<Token>,
+    /// CACHE-PERFECT P2: the worker has a state store (writes after each reply)
+    pub state_cache: bool,
+    /// cancel flag of the pending/running state-store write
+    pub persist: Mutex<Option<Arc<AtomicBool>>>,
+    /// state-store writes finished (tests)
+    pub persist_done: std::sync::atomic::AtomicU64,
+    /// cancel flag of the running generation (SIGTERM cancels it so the bounded shutdown write runs)
+    pub running: Mutex<Option<Arc<AtomicBool>>>,
+    /// cancel flag of the pending/running preload (P2b; any request raises it)
+    pub preload: Mutex<Option<Arc<AtomicBool>>>,
+    /// the echo records' disk directory while the disk budget is 0 (Codex P2/P3 review 2)
+    pub echo_dir_off: Mutex<Option<std::path::PathBuf>>,
+    /// the last preload's status for `GET /state-cache` (idle|running|done|cancelled|failed|used|none|live)
+    pub preload_status: Mutex<Json>,
 }
 
 pub enum Reply {
@@ -64,8 +84,11 @@ impl<E: Engine> State<E> {
             None => None,
         };
         let n_ctx = worker.engine.n_ctx();
+        let state_cache = worker.states.is_some();
         let n_vocab = worker.engine.n_vocab();
         let user_delim = tok.chat_template.as_deref().filter(|t| t.contains("<|im_start|>")).map(|_| tok.encode("<|im_start|>user", false, true)).filter(|d| d.len() >= 2);
+        let asst_delim = tok.chat_template.as_deref().filter(|t| t.contains("<|im_start|>")).map(|_| tok.encode("<|im_start|>assistant", false, true)).filter(|d| d.len() >= 2);
+        let im_end = tok.token_id("<|im_end|>");
         Ok(State {
             cfg,
             tok: Arc::new(tok),
@@ -80,6 +103,16 @@ impl<E: Engine> State<E> {
             stream_stall: std::time::Duration::from_secs_f64(
                 std::env::var("OXE_STREAM_STALL_SECS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(30.0),
             ),
+            echo: Mutex::new(crate::echo::EchoStore::new(crate::echo::EchoConfig::from_env())),
+            asst_delim,
+            im_end,
+            state_cache,
+            persist: Mutex::new(None),
+            persist_done: Default::default(),
+            running: Mutex::new(None),
+            preload: Mutex::new(None),
+            preload_status: Mutex::new(json!({"status": "idle"})),
+            echo_dir_off: Mutex::new(None),
         })
     }
 
@@ -87,6 +120,12 @@ impl<E: Engine> State<E> {
     /// state is a prefix of the conversation and stays reusable) or does not start at all.
     pub fn preempt_idle(&self) -> u64 {
         if let Some(f) = self.idle.lock().unwrap().take() {
+            f.store(true, Ordering::Relaxed);
+        }
+        if let Some(f) = self.persist.lock().unwrap().take() {
+            f.store(true, Ordering::Relaxed);
+        }
+        if let Some(f) = self.preload.lock().unwrap().take() {
             f.store(true, Ordering::Relaxed);
         }
         self.reqs.fetch_add(1, Ordering::SeqCst) + 1
@@ -149,6 +188,69 @@ impl<E: Engine> State<E> {
         }
     }
 
+    /// Tokenize a rendered chat prompt and find its message starts and assistant turn spans from
+    /// the template's own delimiter offsets (CACHE-PERFECT M1, `chat::request::template_marks`):
+    /// delimiter text inside a message becomes delimiter tokens too, so it is never counted. The
+    /// tokens are exactly `encode(prompt, true, true)`.
+    fn render(&self, pc: &PreparedChat) -> Rendered {
+        let text = &pc.applied.prompt;
+        let marks = match (&self.tmpl, &self.asst_delim) {
+            (Some(t), Some(_)) => chat::request::template_marks(t, &pc.inputs, text).ok().flatten(),
+            _ => None,
+        };
+        let Some((starts, ends)) = marks else {
+            let tokens = self.tok.encode(text, true, true);
+            let (msg_starts, first_user) = match &self.user_delim {
+                Some(d) => (tokens.iter().enumerate().filter(|(_, &t)| t == d[0]).map(|(i, _)| i).collect(), tokens.windows(d.len()).position(|w| w == &d[..])),
+                None => (Vec::new(), None),
+            };
+            let last_user = self.user_delim.as_ref().and_then(|d| tokens.windows(d.len()).rposition(|w| w == &d[..]));
+            return Rendered { tokens, asst: None, msg_starts, first_user, last_user };
+        };
+        let mut cuts: Vec<usize> = starts.iter().chain(&ends).copied().collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let (tokens, at) = self.tok.encode_cuts(text, true, true, &cuts);
+        let tok_at = |b: usize| cuts.binary_search(&b).ok().and_then(|i| at[i]);
+        let is = |b: usize, role: &str| text[b + chat::request::IM_START.len()..].starts_with(role);
+        let msg_starts: Vec<usize> = starts.iter().filter_map(|&b| tok_at(b)).collect();
+        let first_user = starts.iter().find(|&&b| is(b, "user")).and_then(|&b| tok_at(b));
+        let last_user = starts.iter().rev().find(|&&b| is(b, "user")).and_then(|&b| tok_at(b));
+        let mut asst = Some(Vec::new());
+        let n_starts = starts.len();
+        for (k, &b) in starts.iter().enumerate().filter(|(_, &b)| is(b, "assistant")) {
+            let next = starts.get(k + 1).copied().unwrap_or(text.len());
+            match ends.iter().find(|&&e| e > b).filter(|&&e| e < next) {
+                Some(&e) => match (tok_at(b), tok_at(e), asst.as_mut()) {
+                    (Some(s), Some(t), Some(v)) => v.push((s, t)),
+                    _ => asst = None,
+                },
+                // the generation prompt: the last opener, no turn end after it
+                None if k + 1 == n_starts && pc.inputs.add_generation_prompt => {}
+                None => asst = None,
+            }
+        }
+        if starts.len() != msg_starts.len() {
+            asst = None;
+        }
+        Rendered { tokens, asst, msg_starts, first_user, last_user }
+    }
+
+    /// ECHO: the prompt to feed for a rendered chat prompt (see `echo.rs`).
+    fn splice(&self, r: &Rendered, inputs: &chat::ChatInputs) -> (Vec<Token>, crate::echo::SpliceReport) {
+        match (&self.asst_delim, self.im_end) {
+            (Some(_), Some(_)) => self.echo.lock().unwrap_or_else(|p| p.into_inner()).splice(&r.tokens, &inputs.messages, &inputs.reasoning_sent, r.asst.as_deref()),
+            _ => (r.tokens.clone(), Default::default()),
+        }
+    }
+
+    /// ECHO: keep a finished turn (see `echo.rs`).
+    fn echo_record(&self, prompt: &[Token], msg: &chat::ChatMsg, r: &GenResult, session: Option<&str>) {
+        let (Some(a), Some(e)) = (&self.asst_delim, self.im_end) else { return };
+        let eog = r.stop == crate::generate::StopType::Eos && r.tokens.last().is_some_and(|&t| self.tok.is_eog(t));
+        self.echo.lock().unwrap_or_else(|p| p.into_inner()).record(prompt, a, e, msg, &r.tokens, eog, session);
+    }
+
     fn check_tokens(&self, toks: &[Token]) -> Result<(), String> {
         if let Some(t) = toks.iter().find(|&&t| t as usize >= self.n_vocab) {
             return Err(format!("token id {t} out of vocab"));
@@ -162,6 +264,12 @@ impl<E: Engine> State<E> {
 
 /// Route a request. Blocking work (generation) is done in `spawn_blocking`.
 pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8]) -> Reply {
+    handle_session(st, method, path, query, body, None).await
+}
+
+/// [`handle`] with the conversation's session hint (`X-Oxe-Session`, forwarded by the
+/// controller). A hint only: echo records are found by their token chain, never by this id.
+pub async fn handle_session<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8], session: Option<String>) -> Reply {
     // exact paths like llama-server (REVIEW S4: a trimmed `/v1/chat/completions/` ran as a chat
     // completion while the controller did not treat it as inference)
     let parse = || -> Result<Json, Reply> {
@@ -225,13 +333,205 @@ pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, quer
             }
             Reply::Json(200, json!({"content": st.tok.decode(&toks, true)}))
         }
+        // CACHE-PERFECT P2 state store (the controller's /_local/cache routes forward here)
+        ("GET", "/state-cache") => {
+            let st2 = st.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                let w = st2.worker.lock().unwrap_or_else(|p| p.into_inner());
+                w.states.as_ref().map(|s| {
+                    let mut u = s.usage();
+                    u["preload"] = st2.preload_status.lock().unwrap().clone();
+                    u
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            match r {
+                Some(j) => Reply::Json(200, j),
+                None => Reply::Json(404, api::error_json(404, "state cache is off")),
+            }
+        }
+        // P2b preload (T1-WARM contract): restore a session's newest snapshot into the idle engine
+        // in the background; any request cancels it within one block (~5 ms) and it never queues
+        // ahead of one (it only runs when it gets the worker at once and no request came since)
+        ("POST", "/state-cache/preload") => {
+            let b = match parse() {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            if !st.state_cache {
+                return Reply::Json(404, api::error_json(404, "state cache is off"));
+            }
+            let hint = b.get("session").and_then(Json::as_str).map(str::to_string);
+            let req_no = st.reqs.load(Ordering::SeqCst);
+            let flag = Arc::new(AtomicBool::new(false));
+            {
+                let w = match st.worker.try_lock() {
+                    Ok(w) => w,
+                    Err(_) => return Reply::Json(200, json!({"status": "busy"})),
+                };
+                if !w.cache.tokens.is_empty() || w.preloaded.is_some() {
+                    return Reply::Json(200, json!({"status": "live"}));
+                }
+                if w.states.as_ref().is_none_or(|s| s.budget == 0 || s.newest_plan(None).is_none()) {
+                    return Reply::Json(200, json!({"status": "none"}));
+                }
+            }
+            *st.preload.lock().unwrap() = Some(flag.clone());
+            *st.preload_status.lock().unwrap() = json!({"status": "running"});
+            let st2 = st.clone();
+            tokio::task::spawn_blocking(move || {
+                let done = |status: &str, pos: usize, ms: f64| *st2.preload_status.lock().unwrap() = json!({"status": status, "pos": pos, "ms": ms});
+                // never wait for the worker: a request (or a write) holds it, so the preload yields
+                let Ok(mut w) = st2.worker.try_lock() else { return done("cancelled", 0, 0.0) };
+                if flag.load(Ordering::Relaxed) || st2.reqs.load(Ordering::SeqCst) != req_no {
+                    return done("cancelled", 0, 0.0);
+                }
+                let (status, pos, ms) = w.preload(hint.as_deref(), &flag);
+                done(status, pos, ms);
+            });
+            Reply::Json(202, json!({"status": "started"}))
+        }
+        ("POST", "/state-cache/budget") | ("POST", "/state-cache/clear") => {
+            let b = match parse() {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let clear = path.ends_with("/clear");
+            let st2 = st.clone();
+            let r = tokio::task::spawn_blocking(move || -> Result<Json, (u16, String)> {
+                // refused while a request runs (the worker is busy)
+                let mut w = st2.worker.try_lock().map_err(|_| (409, "a request is running".to_string()))?;
+                let w = &mut *w;
+                if w.states.is_none() {
+                    return Err((404, "state cache is off".into()));
+                }
+                let mut echo = st2.echo.lock().unwrap_or_else(|p| p.into_inner());
+                if !clear {
+                    let bytes = b.get("bytes").and_then(Json::as_u64).ok_or((400, "\"bytes\" must be a non-negative integer".to_string()))?;
+                    let s = w.states.as_mut().unwrap();
+                    let was_off = s.budget == 0;
+                    let freed = s.set_budget(bytes);
+                    // Codex P2/P3 review 2: budget 0 = no conversation state goes to disk at all: the
+                    // segmented store, the echo records' files and the legacy prefix / session stores
+                    // (parks fall back to RAM). Raising it again brings all of them back.
+                    if bytes == 0 && !was_off {
+                        *st2.echo_dir_off.lock().unwrap() = echo.set_disk(None);
+                        w.legacy_off = Some((w.store.take(), w.sessions.take()));
+                    } else if bytes > 0 && was_off {
+                        if let Some(d) = st2.echo_dir_off.lock().unwrap().take() {
+                            echo.set_disk(Some(d));
+                        }
+                        if let Some((p, se)) = w.legacy_off.take() {
+                            w.store = p;
+                            w.sessions = se;
+                        }
+                    }
+                    let s = w.states.as_ref().unwrap();
+                    return Ok(json!({"budget_bytes": s.budget, "used_bytes": s.used_bytes(), "freed_bytes": freed, "legacy_stores": if w.legacy_off.is_some() { "off" } else { "on" }}));
+                }
+                let scope = b.get("scope").and_then(Json::as_str).unwrap_or("all").to_string();
+                let s = w.states.as_mut().unwrap();
+                let other_model = b.get("model").and_then(Json::as_str).filter(|m| *m != s.ident.model_key());
+                if scope == "session" {
+                    // Codex P2/P3 review 1: purge the session from every tier, keep what others need
+                    let sid = b.get("session").and_then(Json::as_str).ok_or((400, "session scope needs a session id".to_string()))?.to_string();
+                    let m = s.session_match(&sid).ok_or((400, "unknown session".to_string()))?;
+                    let freed = s.clear("session", Some(&sid)).map_err(|e| (400, e))?;
+                    let owns = |t: &[u32]| m.owns(t);
+                    let mut ram = 0;
+                    let pre = w.preloaded.as_ref().is_some_and(|p| p.plan.sid == sid);
+                    if pre || (!w.cache.tokens.is_empty() && owns(&w.cache.tokens)) {
+                        w.cache.reset(&mut w.engine);
+                        w.live_blocks.clear();
+                        w.preloaded = None;
+                        ram += 1;
+                    }
+                    ram += w.cache.drop_parked_where(&owns);
+                    let mut legacy = 0;
+                    for ps in [w.store.as_mut(), w.sessions.as_mut()].into_iter().flatten() {
+                        legacy += ps.remove_where(&owns);
+                    }
+                    if let Some((p, se)) = w.legacy_off.as_mut() {
+                        for ps in [p.as_mut(), se.as_mut()].into_iter().flatten() {
+                            legacy += ps.remove_where(&owns);
+                        }
+                    }
+                    let s = w.states.as_ref().unwrap();
+                    // the echo records of its hint go when no fork of it (same hint) is left
+                    let echo_n = match &m.hint {
+                        Some(h) if !s.hint_in_use(h) => echo.drop_hint_hash(h),
+                        _ => 0,
+                    };
+                    return Ok(json!({"freed_bytes": freed, "used_bytes": s.used_bytes(), "ram_states": ram, "legacy_entries": legacy, "echo_records": echo_n}));
+                }
+                let freed = match (scope.as_str(), other_model) {
+                    ("model", Some(key)) => {
+                        // another model's directory under the root (only one in this store's format)
+                        if key.len() != 16 || !key.bytes().all(|c| c.is_ascii_hexdigit()) {
+                            return Err((400, "bad model key".into()));
+                        }
+                        let d = s.root.join(key);
+                        let n = crate::state_store::dir_bytes(&d);
+                        if d.join("identity.json").is_file() && std::fs::remove_dir_all(&d).is_ok() { n } else { 0 }
+                    }
+                    _ => s.clear(&scope, None).map_err(|e| (400, e))?,
+                };
+                let used = s.used_bytes();
+                let mut legacy = 0;
+                if other_model.is_none() {
+                    // the RAM side of the same scope: live state, parked sessions, echo records, and the
+                    // legacy disk stores' entries of this engine (Codex P2/P3 review 3)
+                    w.cache.reset(&mut w.engine);
+                    let _ = w.cache.drain_parked();
+                    w.live_blocks.clear();
+                    w.preloaded = None;
+                    echo.clear();
+                    let all = |_: &[u32]| true;
+                    for ps in [w.store.as_mut(), w.sessions.as_mut()].into_iter().flatten() {
+                        legacy += ps.remove_where(&all);
+                    }
+                    if let Some((p, se)) = w.legacy_off.as_mut() {
+                        for ps in [p.as_mut(), se.as_mut()].into_iter().flatten() {
+                            legacy += ps.remove_where(&all);
+                        }
+                    }
+                }
+                Ok(json!({"freed_bytes": freed, "used_bytes": used, "legacy_entries": legacy}))
+            })
+            .await
+            .unwrap_or_else(|_| Err((500, "state cache task failed".into())));
+            match r {
+                Ok(j) => Reply::Json(200, j),
+                Err((c, m)) => Reply::Json(c, api::error_json(c, &m)),
+            }
+        }
         ("POST", "/apply-template") => {
             let b = match parse() {
                 Ok(b) => b,
                 Err(r) => return r,
             };
             match prepare_chat(&st, &b) {
-                Ok(pc) => Reply::Json(200, json!({"prompt": pc.applied.prompt})),
+                // CACHE-PERFECT contract checks (tools/cache_contract.py): `"return_tokens": true` adds
+                // the prompt's token ids exactly as a chat request tokenizes it, `"echo": true` the ids
+                // after the echo splice and its report; with `--engine stub` no weights are loaded
+                Ok(pc) => {
+                    let mut out = json!({"prompt": pc.applied.prompt});
+                    if b.get("return_tokens").and_then(Json::as_bool).unwrap_or(false) {
+                        let r = st.render(&pc);
+                        out["generation_prompt"] = Json::String(pc.applied.generation_prompt.clone());
+                        out["msg_starts"] = json!(r.msg_starts);
+                        out["assistant_spans"] = json!(r.asst);
+                        if b.get("echo").and_then(Json::as_bool).unwrap_or(false) {
+                            let (sp, rep) = st.splice(&r, &pc.inputs);
+                            out["echo_tokens"] = json!(sp);
+                            out["echo"] = rep.to_json();
+                        }
+                        out["tokens"] = json!(r.tokens);
+                    }
+                    Reply::Json(200, out)
+                }
                 Err(r) => r,
             }
         }
@@ -247,10 +547,21 @@ pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, quer
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            chat_completion(st, b).await
+            chat_completion(st, b, session).await
         }
         _ => Reply::Json(404, json!({"error": {"message": "File Not Found", "type": "not_found_error", "code": 404}})),
     }
+}
+
+/// A rendered chat prompt: tokens and the message layout from the template's delimiter offsets.
+struct Rendered {
+    tokens: Vec<Token>,
+    /// token range [`<|im_start|>`, `<|im_end|>`) of each history assistant turn; None = unknown layout
+    asst: Option<Vec<(usize, usize)>>,
+    /// every message start (template `<|im_start|>`)
+    msg_starts: Vec<usize>,
+    first_user: Option<usize>,
+    last_user: Option<usize>,
 }
 
 struct PreparedChat {
@@ -265,6 +576,16 @@ fn prepare_chat<E: Engine>(st: &State<E>, body: &Json) -> Result<PreparedChat, R
     let inputs = chat::chat_inputs(body, &st.cfg.chat_opts, tmpl).map_err(|e| bad(e.0))?;
     let applied = chat::apply(tmpl, &inputs).map_err(|e| bad(format!("chat template error: {e:#}")))?;
     Ok(PreparedChat { applied, inputs })
+}
+
+/// Echo fields go into `timings` only for requests with assistant turns in their history (the
+/// llama-server shape of a first turn stays as it was).
+fn add_echo_timings(resp: &mut Json, echo: &Option<Json>) {
+    if let (Some(Json::Object(t)), Some(Json::Object(e))) = (resp.get_mut("timings"), echo) {
+        for (k, v) in e {
+            t.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 fn gen_error_reply(e: GenError) -> Reply {
@@ -305,7 +626,14 @@ where
         if gp.cancelled() {
             return Err(GenError::Cancelled); // the client left while queued for the worker
         }
-        w.generate(&st.tok, &prompt, &gp, &mut on_partial)
+        // SIGTERM cancels the running generation (the bounded shutdown write needs the worker)
+        *st.running.lock().unwrap() = gp.cancel.clone();
+        let r = w.generate(&st.tok, &prompt, &gp, &mut on_partial);
+        *st.running.lock().unwrap() = None;
+        if w.last_resume.0 != "cold" && r.as_ref().is_ok_and(|r| r.timings.preload_ms.is_some()) {
+            *st.preload_status.lock().unwrap() = json!({"status": "used"});
+        }
+        r
     })
     .await
     .unwrap_or_else(|e| Err(GenError::Engine(crate::engine::EngineError(format!("worker panicked: {e}")))));
@@ -324,18 +652,21 @@ fn spawn_idle_reprefill<E: Engine>(st: &Arc<State<E>>, b: &Json, reply: Json, re
     if !st.cfg.idle_reprefill {
         return;
     }
-    let Some(d) = st.user_delim.clone() else { return };
+    if st.user_delim.is_none() {
+        return;
+    }
     let mut body = b.clone();
     let Some(msgs) = body.get_mut("messages").and_then(Json::as_array_mut) else { return };
     msgs.push(reply);
     msgs.push(json!({"role": "user", "content": ""}));
     let Ok(pc) = prepare_chat(st, &body) else { return };
-    let toks = st.tok.encode(&pc.applied.prompt, true, true);
-    let Some(cut) = toks.windows(d.len()).rposition(|w| w == &d[..]) else { return };
-    let hist = toks[..cut].to_vec();
+    let r = st.render(&pc);
+    let (toks, rep) = st.splice(&r, &pc.inputs);
+    let Some(cut) = r.last_user.map(|c| rep.map_pos(c)) else { return };
+    let hist = toks[..cut.min(toks.len())].to_vec();
     let Ok(mut gp) = api::gen_params(&body, true) else { return };
-    gp.first_user = hist.windows(d.len()).position(|w| w == &d[..]);
-    gp.msg_starts = hist.iter().enumerate().filter(|(_, &t)| t == d[0]).map(|(i, _)| i).collect();
+    gp.first_user = r.first_user.map(|c| rep.map_pos(c)).filter(|&c| c < cut);
+    gp.msg_starts = r.msg_starts.iter().map(|&c| rep.map_pos(c)).filter(|&c| c < cut).collect();
     gp.query_start = false;
     let flag = Arc::new(AtomicBool::new(false));
     gp.cancel = Some(flag.clone());
@@ -357,6 +688,31 @@ fn spawn_idle_reprefill<E: Engine>(st: &Arc<State<E>>, b: &Json, reply: Json, re
             }
         }
         st2.idle_done.fetch_add(1, Ordering::SeqCst);
+    });
+}
+
+/// CACHE-PERFECT P2: write the live state to the state store after the reply (off the request
+/// path, in the client's idle gap). A newer request preempts it between blocks; what was written
+/// stays valid, the next reply writes the rest.
+fn spawn_persist<E: Engine>(st: &Arc<State<E>>, session: Option<String>, req_no: u64) {
+    if !st.state_cache {
+        return;
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    *st.persist.lock().unwrap() = Some(flag.clone());
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        {
+            let mut w = st2.worker.lock().unwrap_or_else(|p| p.into_inner());
+            if !flag.load(Ordering::Relaxed) && st2.reqs.load(Ordering::SeqCst) == req_no {
+                let t0 = std::time::Instant::now();
+                let n = w.persist_states(session.as_deref(), Some(&flag));
+                if n > 0 {
+                    eprintln!("oxe-server: state cache: {n} files written in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+        }
+        st2.persist_done.fetch_add(1, Ordering::SeqCst);
     });
 }
 
@@ -484,7 +840,7 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     Reply::Stream(rx)
 }
 
-async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
+async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<String>) -> Reply {
     let req_no = st.preempt_idle();
     if let Some(m) = unsupported_constraint(&b) {
         return bad(m);
@@ -498,18 +854,22 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
         Err(e) => return bad(e),
     };
     gp.special = false;
-    let prompt = st.tok.encode(&pc.applied.prompt, true, true);
+    let rendered = st.render(&pc);
+    // ECHO: earlier assistant turns as their exact generated ids (cache keeps every token)
+    let (prompt, echo) = st.splice(&rendered, &pc.inputs);
+    let echo_json = (echo.blocks > 0).then(|| echo.to_json());
+    gp.echo = echo_json.clone();
     if let Err(e) = st.check_tokens(&prompt) {
         return bad(e);
     }
     if prompt.len() >= st.n_ctx {
         return Reply::Json(400, api::exceed_context_json(prompt.len(), st.n_ctx));
     }
-    gp.first_user = st.user_delim.as_ref().and_then(|d| prompt.windows(d.len()).position(|w| w == &d[..]));
-    if let Some(d) = &st.user_delim {
-        gp.msg_starts = prompt.iter().enumerate().filter(|(_, &t)| t == d[0]).map(|(i, _)| i).collect();
-    }
+    gp.first_user = rendered.first_user.map(|c| echo.map_pos(c));
+    gp.msg_starts = rendered.msg_starts.iter().map(|&c| echo.map_pos(c)).collect();
+    drop(rendered);
     gp.query_start = b.get("messages").and_then(Json::as_array).and_then(|m| m.last()).and_then(|m| m.get("role")).and_then(Json::as_str) == Some("user");
+    gp.session = session.clone();
     let tmpl = st.tmpl.as_ref().unwrap();
     let pcfg = ParserConfig {
         format: pc.applied.format,
@@ -532,6 +892,7 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     let include_usage = b.pointer("/stream_options/include_usage").and_then(Json::as_bool).unwrap_or(false);
     let want_probs = gp.n_probs > 0;
     let gen_prompt = pc.applied.generation_prompt.clone();
+    let prompt_kept = prompt.clone();
     if !stream {
         let r = match run_blocking(st.clone(), prompt, gp, |_| true).await {
             Ok(r) => r,
@@ -542,10 +903,14 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
         if let Err(e) = sess.feed(&r.text, true) {
             return Reply::Json(500, api::error_json(500, &e));
         }
+        st.echo_record(&prompt_kept, sess.msg(), &r, session.as_deref());
+        spawn_persist(&st, session.clone(), req_no);
         if api::finish_reason(r.stop, !sess.msg().tool_calls.is_empty()) == "stop" {
             spawn_idle_reprefill(&st, &b, sess.msg().to_json(), req_no);
         }
-        return Reply::Json(200, api::chat_response(&meta, sess.msg(), &r, want_probs, false));
+        let mut resp = api::chat_response(&meta, sess.msg(), &r, want_probs, false);
+        add_echo_timings(&mut resp, &echo_json);
+        return Reply::Json(200, resp);
     }
     let (tx, rx) = mpsc::channel::<String>(256);
     cancel_on_close(&mut gp, &tx);
@@ -611,6 +976,11 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
             }
         }
         frames.push(api::chat_chunk(&meta, json!({}), Some(api::finish_reason(r.stop, has_calls))));
+        {
+            let msg = sess.lock().unwrap().msg().clone();
+            st.echo_record(&prompt_kept, &msg, &r, session.as_deref());
+        }
+        spawn_persist(&st, session.clone(), req_no);
         if api::finish_reason(r.stop, has_calls) == "stop" {
             let reply = sess.lock().unwrap().msg().to_json();
             spawn_idle_reprefill(&st, &b, reply, req_no);
@@ -620,6 +990,9 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
         }
         if let Some(Json::Object(last)) = frames.last_mut() {
             last.insert("timings".into(), api::timings_json(&r.timings));
+        }
+        if let Some(last) = frames.last_mut() {
+            add_echo_timings(last, &echo_json);
         }
         for f in frames {
             if !send_final(&tx, api::sse(&f), stall).await {

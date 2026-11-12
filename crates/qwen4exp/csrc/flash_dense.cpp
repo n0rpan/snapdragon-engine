@@ -1,4 +1,4 @@
-// flash_dense: multi-column dense matmul for the prefill (WORKSTREAM PREFILL, see PROGRESS-PF.md).
+// flash_dense: multi-column dense matmul for the prefill (WORKSTREAM PREFILL, see docs/lab-notes/PROGRESS-PF.md).
 //
 // fg_pf_mm(ctx, w, x, cache) is a drop-in for ggml_mul_mat(ctx, w, x). When the pair is eligible it builds
 //   pack = custom(x)        "pf_pack": x quantised per token by PRODUCTION from_float (Q8_K / Q8_0), codes

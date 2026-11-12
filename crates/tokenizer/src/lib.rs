@@ -280,7 +280,7 @@ impl Tokenizer {
             for frag in self.partition(text, parse_special) {
                 match frag {
                     Frag::Text(s) => self.bpe(s, &mut out),
-                    Frag::Tok(t) => out.push(t),
+                    Frag::Tok(t, _) => out.push(t),
                 }
             }
         }
@@ -290,6 +290,40 @@ impl Tokenizer {
             }
         }
         out
+    }
+
+    /// [`Tokenizer::encode`] that also maps byte offsets of `text` to token indexes (CACHE-PERFECT
+    /// M1: message spans from the renderer). `cuts[i]` maps to the index of the token that starts
+    /// there when a special token (parse_special) begins exactly at that byte, else None (the cut
+    /// lies inside ordinary text, where BPE could merge across it). `cuts` must be sorted and unique. The tokens are exactly
+    /// `encode(text, add_special, parse_special)`.
+    pub fn encode_cuts(&self, text: &str, add_special: bool, parse_special: bool, cuts: &[usize]) -> (Vec<Token>, Vec<Option<usize>>) {
+        let mut out = Vec::new();
+        let mut at: Vec<Option<usize>> = vec![None; cuts.len()];
+        if add_special && self.add_bos {
+            if let Some(b) = self.bos {
+                out.push(b);
+            }
+        }
+        if !text.is_empty() {
+            for frag in self.partition(text, parse_special) {
+                match frag {
+                    Frag::Text(s) => self.bpe(s, &mut out),
+                    Frag::Tok(t, off) => {
+                        if let Ok(i) = cuts.binary_search(&off) {
+                            at[i] = Some(out.len());
+                        }
+                        out.push(t)
+                    }
+                }
+            }
+        }
+        if add_special && self.add_eos {
+            if let Some(t) = self.eos {
+                out.push(t);
+            }
+        }
+        (out, at)
     }
 
     /// Port of `tokenizer_st_partition`.
@@ -315,7 +349,8 @@ impl Tokenizer {
                     if !left.is_empty() {
                         next.push(Frag::Text(left));
                     }
-                    next.push(Frag::Tok(sid));
+                    // byte offset of the special token's text in `text` (s is a subslice of it)
+                    next.push(Frag::Tok(sid, s.as_ptr() as usize - text.as_ptr() as usize + m));
                     s = &s[m + needle.len()..];
                     if a & attr::RSTRIP != 0 {
                         s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
@@ -504,7 +539,8 @@ impl Tokenizer {
 
 enum Frag<'a> {
     Text(&'a str),
-    Tok(Token),
+    /// special token and the byte offset of its text in the partitioned string
+    Tok(Token, usize),
 }
 
 /// Incremental detokenizer for streaming: holds back incomplete UTF-8 sequences

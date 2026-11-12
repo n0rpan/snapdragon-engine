@@ -363,6 +363,16 @@ impl Gguf {
         Ok(Gguf { path, header, file_bytes, mmap, file })
     }
 
+    /// Another read-only mapping of the same open file, not a reopen by path.
+    /// Used by bounded row-streaming reference helpers after a loader drops its view.
+    pub fn remap(&self) -> Result<Gguf> {
+        let file=self.file.try_clone().map_err(|e|Error(e.to_string()))?;
+        // SAFETY: same immutable file and bounds contract as the original mapping.
+        let mmap=unsafe{Mmap::map(&file)}.map_err(|e|Error(e.to_string()))?;
+        if mmap.len()as u64!=self.file_bytes{return err("source size changed before remap");}
+        Ok(Gguf{path:self.path.clone(),header:self.header.clone(),file_bytes:self.file_bytes,mmap,file})
+    }
+
     /// The raw bytes of a tensor (touches only the pages actually read by the caller).
     pub fn tensor_data(&self, t: &TensorInfo) -> &[u8] {
         let start = (self.header.data_offset + t.offset) as usize;

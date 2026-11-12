@@ -306,7 +306,7 @@ fn cmd_stream(a: &Args, model_dir: &Path) {
             // tensors: the streaming context's dumps against the PRODUCTION oracle's dumps of the same
             // ubatch (production numbering: decode step i = ubatch i+1), every name both have. The
             // mapped reference context's own dumps are also written (dr) but are not trusted: in a
-            // two-context process some of its expert-node dumps come out stale (see M1-FLASH.md).
+            // two-context process some of its expert-node dumps come out stale (see docs/lab-notes/M1-FLASH.md).
             let od = oracle.join(format!("u{}", i + 1));
             let (same, total, diff) = compare_common(&ds, &od.to_string_lossy());
             let ok = logits_same && same == total;

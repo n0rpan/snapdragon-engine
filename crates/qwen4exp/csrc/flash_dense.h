@@ -1,4 +1,4 @@
-// flash_dense: multi-column dense matmul for the prefill (see flash_dense.cpp, PROGRESS-PF.md).
+// flash_dense: multi-column dense matmul for the prefill (see flash_dense.cpp, docs/lab-notes/PROGRESS-PF.md).
 #pragma once
 
 #ifdef __cplusplus

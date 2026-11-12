@@ -70,6 +70,12 @@ pub struct ChatInputs {
     pub reasoning_format: ReasoningFormat,
     /// extra context: datetime/date_string + chat_template_kwargs
     pub extra: Map<String, Json>,
+    /// per message (same index as `messages`): the `reasoning_content` string exactly as the
+    /// client sent it, None when the field was absent or null. Normalization drops an empty
+    /// string; ECHO needs the difference (Codex P1 review 1): absent = not sent (the engine may
+    /// restore its own reasoning, O-96), an explicit string, the empty one included, is the
+    /// client's edit and must match.
+    pub reasoning_sent: Vec<Option<String>>,
 }
 
 /// Result of applying the template.
@@ -259,6 +265,7 @@ pub fn chat_inputs(body: &Json, opt: &ServerChatOptions, tmpl: &ChatTemplate) ->
         },
     };
     let mut msgs = normalize_messages(messages)?;
+    let reasoning_sent = messages.as_array().map(|a| a.iter().map(|m| m.get("reasoning_content").and_then(Json::as_str).map(str::to_string)).collect()).unwrap_or_default();
     // a system message after the first message (agents insert reminders mid-conversation): the
     // Qwen templates reject it, so it is passed on as a user message at the same position
     if let Json::Array(a) = &mut msgs {
@@ -321,6 +328,7 @@ pub fn chat_inputs(body: &Json, opt: &ServerChatOptions, tmpl: &ChatTemplate) ->
         enable_thinking,
         reasoning_format,
         extra,
+        reasoning_sent,
     })
 }
 
@@ -359,4 +367,72 @@ pub fn apply(tmpl: &ChatTemplate, inp: &ChatInputs) -> Result<Applied, minijinja
         (None, vec![])
     };
     Ok(Applied { prompt, generation_prompt, format: tmpl.format, thinking_start, thinking_end })
+}
+
+/// Turn delimiters of ChatML templates (Qwen3.x, Ornith).
+pub const IM_START: &str = "<|im_start|>";
+pub const IM_END: &str = "<|im_end|>";
+
+/// Byte offsets of the turn delimiters that the TEMPLATE wrote into `prompt` (CACHE-PERFECT M1).
+/// Message text that holds delimiter text (`<|im_start|>assistant` in a user message, a tool
+/// result that reads a chat template) becomes real delimiter tokens when the prompt is tokenized
+/// with special parsing, so counting delimiters in the tokens cannot find the message spans.
+/// When any string of the request holds delimiter text, the template is rendered once more with
+/// that text replaced by same-length look-alikes (`<|im_xtart|>`, `<|im_exd|>`): every delimiter
+/// left in that render is the template's own, at the same byte offset as in `prompt` (checked:
+/// equal length, and the delimiter text sits at each offset in `prompt` too). Returns
+/// (opener offsets, turn-end offsets), sorted; None when the check fails (the caller then treats
+/// the layout as unknown and never splices).
+pub fn template_marks(tmpl: &ChatTemplate, inp: &ChatInputs, prompt: &str) -> Result<Option<(Vec<usize>, Vec<usize>)>, minijinja::Error> {
+    fn dirty(v: &Json) -> bool {
+        match v {
+            Json::String(s) => s.contains(IM_START) || s.contains(IM_END),
+            Json::Array(a) => a.iter().any(dirty),
+            Json::Object(m) => m.iter().any(|(k, v)| k.contains(IM_START) || k.contains(IM_END) || dirty(v)),
+            _ => false,
+        }
+    }
+    fn clean(v: &mut Json) {
+        match v {
+            Json::String(s) => {
+                if s.contains(IM_START) || s.contains(IM_END) {
+                    *s = s.replace(IM_START, "<|im_xtart|>").replace(IM_END, "<|im_exd|>");
+                }
+            }
+            Json::Array(a) => a.iter_mut().for_each(clean),
+            // keys too (P2 review): `dirty` counts them, and a key left as it was would be read
+            // as a delimiter of the template
+            Json::Object(m) => {
+                *m = std::mem::take(m)
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        clean(&mut v);
+                        (k.replace(IM_START, "<|im_xtart|>").replace(IM_END, "<|im_exd|>"), v)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    let ctx = context(inp, inp.add_generation_prompt);
+    let owned;
+    let san: &str = if dirty(&ctx) {
+        let mut c = ctx;
+        clean(&mut c);
+        owned = tmpl.render_ctx(&c)?;
+        if owned.len() != prompt.len() {
+            return Ok(None);
+        }
+        &owned
+    } else {
+        prompt
+    };
+    let find = |pat: &str| -> Option<Vec<usize>> {
+        let v: Vec<usize> = san.match_indices(pat).map(|(i, _)| i).collect();
+        v.iter().all(|&i| prompt.get(i..i + pat.len()) == Some(pat)).then_some(v)
+    };
+    match (find(IM_START), find(IM_END)) {
+        (Some(s), Some(e)) => Ok(Some((s, e))),
+        _ => Ok(None),
+    }
 }

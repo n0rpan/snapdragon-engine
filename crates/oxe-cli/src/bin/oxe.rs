@@ -23,8 +23,34 @@
 //!    bench, gen, mtp-check: --mtp-from GGUF takes the MTP block from another GGUF of the same shape;
 //!    --draft-vocab RANKING [--draft-k K] restricts the draft head to the first K ids of RANKING)
 //!
+//!   LONG-CTX: bench (MTP, --batched-prompt) and prefill-bench (--prefix-len) take --state-file F: the
+//!   prompt / prefix state is built once (chunked batched prefill), written to F, and read back by
+//!   later runs whose engine layout, KV type and token ids match (a 128K context is ~40 min to build,
+//!   seconds to read). bench --plain-steps: depth-0 decode on that MTP engine / state. --prompt-ids-file / --prefix-ids-file F: ids separated by commas / whitespace
+//!   (a 128K-id --prompt-ids exceeds the 128 KiB argument limit). n_ctx is checked against the GGUF
+//!   context_length (262144 for Ornith / Qwen3.6).
+//!
+//!   oxe fused-ref --model M --prefix-len P (--prefix-ids-file F | --text-file F) --state-file S --noise-floor-kld X --out R
+//!               [--n 1000 --ref-samples 200 --continuation-file T --ref-ratio-max 1.1 --margin 5 --control [--control-ubatch 4] --dry-run]
+//!                                                                         (--features f32-reference, bench only) fused vs
+//!                                                                         tiled attention, teacher-forced from one saved
+//!                                                                         state, + f32-attention reference over the stored
+//!                                                                         KV (FUSED-REF.md; NOT a full-model f32 ref)
+//!
 //! Common: --cpu-list 0-7 (default) | --threads N (cpus 0..N), --ctx 4096, --weights file|anon,
 //! --verify sample|full|none, --cache-dir D, --thp-collapse, --profile, --out FILE (bench JSON).
+#[cfg(feature="f32-reference")]
+#[path="../f32_proof.rs"]
+mod f32_proof;
+#[cfg(feature="f32-reference")]
+#[path="../fused_ref_cmd.rs"]
+mod fused_ref_cmd;
+#[cfg(feature="npu-device")]
+#[path="../expert_dma.rs"]
+mod expert_dma;
+#[cfg(feature="npu-device")]
+#[path="../expert_price.rs"]
+mod expert_price;
 use model::engine::{tick_hz, Engine, EngineConfig, EngineOptions, StateDump};
 use model::mtp::{MtpDriver, MtpStats, MtpWeights};
 use model::load::{memory_report, open};
@@ -54,7 +80,7 @@ impl Args {
         while i < rest.len() {
             let a = &rest[i];
             let Some(k) = a.strip_prefix("--") else { die(&format!("unexpected argument {a}")) };
-            if ["profile", "thp-collapse", "all", "logits", "batched-prompt", "mlock", "state-hash", "check-args", "dry-run"].contains(&k) {
+            if ["profile", "thp-collapse", "all", "logits", "batched-prompt", "mlock", "state-hash", "check-args", "dry-run", "control"].contains(&k) {
                 flags.push(k.to_string());
                 i += 1;
             } else {
@@ -71,10 +97,11 @@ impl Args {
     /// mistyped `--weights anon` would run file-backed). Keep KNOWN in step with new options.
     fn check_known(&self) -> ! {
         const KNOWN: &[&str] = &[
-            "arms", "secs", "sets", "rows", "work", "cache-dir", "cpu-list", "ctx", "depths", "draft", "draft-k", "draft-vocab", "drop", "dump-pos", "files-from", "gen",
+            "layer", "shared-experts", "tensor", "npu-overlap", "npu-recurrent", "npu-recurrent-mask", "npu-audit", "teacher-ids", "split-last", "reference-mode", "f32-greedy", "npu-prefill", "npu-go-file", "arms", "secs", "sets", "rows", "work", "cache-dir", "cpu-list", "ctx", "depths", "draft", "draft-k", "draft-vocab", "drop", "dump-pos", "files-from", "gen",
             "idle-spin-us", "json", "kv", "lanes", "load-threads", "model", "mtp-from", "n", "ours", "out", "pf-group", "pf-tiles", "pos",
-            "prefill", "prefix-len", "prompt-ids", "prompt-len", "ref", "refs", "reps", "runs", "score", "spec-draft-n-max", "text-file",
+            "prefill", "prefix-len", "prefix-ids-file", "prompt-ids", "prompt-ids-file", "prompt-len", "state-file", "ref", "refs", "reps", "runs", "score", "spec-draft-n-max", "text-file",
             "threads", "tokens", "trace-out", "ubatch", "verify", "warmup", "weights", "cmd",
+            "continuation-file", "ref-samples", "noise-floor-kld", "ref-ratio-max", "margin", "fused-chunk", "jump-threshold", "control-ubatch", "control-factor",
         ];
         let mut unknown: Vec<&String> = self.kv.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect();
         unknown.sort();
@@ -131,8 +158,84 @@ impl Args {
     }
 }
 
+/// Every subcommand, in usage order. N3 (audit): main() dispatches from this table, so the usage
+/// line can no longer list fewer commands than the binary accepts.
+const COMMANDS: &[(&str, fn(&Args))] = &[
+    ("gen", cmd_gen),
+    ("trace", cmd_trace),
+    ("compare", cmd_compare),
+    ("verify", cmd_verify),
+    ("bench", cmd_bench),
+    ("verify-bench", cmd_verify_bench),
+    ("kv-kld", cmd_kv_kld),
+    ("kbench-mt", cmd_kbench_mt),
+    ("vocab-freq", cmd_vocab_freq),
+    ("cache", cmd_cache),
+    ("prefill-verify", cmd_prefill_verify),
+    ("prefill-bench", cmd_prefill_bench),
+    ("mtp-check", cmd_mtp_check),
+    ("expert-price", cmd_expert_price),
+    ("expert-dma-check", cmd_expert_dma_check),
+    ("f32-export", cmd_f32_export),
+    ("f32-inspect-text", cmd_f32_inspect_text),
+    ("f32-fixture-tokens", cmd_f32_fixture_tokens),
+    ("f32-tensor-map", cmd_f32_tensor_map),
+    ("f32-greedy-export", cmd_f32_greedy_export),
+    ("fused-ref", cmd_fused_ref),
+    ("npu-greedy-check", cmd_npu_greedy_check),
+    ("npu-f32-check", cmd_npu_f32_check),
+    ("npu-prefill-check", cmd_npu_prefill_check),
+];
+
+// Feature-gated subcommands (text-encoder/NPU lane), wrapped so the N3 table stays complete.
+fn cmd_expert_price(_a: &Args) {
+    #[cfg(feature="npu-device")] if let Err(e)=expert_price::run(_a){die(&e);}
+    #[cfg(not(feature="npu-device"))] die("npu-device feature required");
+}
+fn cmd_expert_dma_check(_a: &Args) {
+    #[cfg(feature="npu-device")] if let Err(e)=expert_dma::run(_a){die(&e);}
+    #[cfg(not(feature="npu-device"))] die("npu-device feature required");
+}
+fn cmd_f32_export(_a: &Args) {
+    #[cfg(feature="f32-reference")] f32_proof::export(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature");
+}
+fn cmd_f32_inspect_text(_a: &Args) {
+    #[cfg(feature="f32-reference")] f32_proof::inspect_text(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature");
+}
+fn cmd_f32_fixture_tokens(_a: &Args) {
+    #[cfg(feature="f32-reference")] f32_proof::fixture_tokens(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature");
+}
+fn cmd_f32_tensor_map(_a: &Args) {
+    #[cfg(feature="f32-reference")] f32_proof::tensor_map(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature");
+}
+fn cmd_f32_greedy_export(_a: &Args) {
+    #[cfg(feature="f32-reference")] f32_proof::greedy_export(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature");
+}
+fn cmd_fused_ref(_a: &Args) {
+    #[cfg(feature="f32-reference")] fused_ref_cmd::run(_a);
+    #[cfg(not(feature="f32-reference"))] die("build with f32-reference feature (bench only)");
+}
+fn cmd_npu_greedy_check(_a: &Args) {
+    #[cfg(all(feature="f32-reference",feature="npu-prefill"))] f32_proof::greedy(_a);
+    #[cfg(not(all(feature="f32-reference",feature="npu-prefill")))] die("build with f32-reference,npu-prefill features");
+}
+fn cmd_npu_f32_check(_a: &Args) {
+    #[cfg(all(feature="f32-reference",feature="npu-prefill"))] f32_proof::compare(_a);
+    #[cfg(not(all(feature="f32-reference",feature="npu-prefill")))] die("build with f32-reference,npu-prefill features");
+}
+
+fn usage_line() -> String {
+    let names: Vec<&str> = COMMANDS.iter().map(|(name, _)| *name).collect();
+    format!("usage: oxe {} [options]  (see the source header or docs/lab-notes/M2.md)", names.join("|"))
+}
+
 fn usage() -> ! {
-    eprintln!("usage: oxe gen|trace|compare|verify|bench|cache|mtp-check [options]  (see the source header or M2.md)");
+    eprintln!("{}", usage_line());
     std::process::exit(2)
 }
 
@@ -234,7 +337,29 @@ struct Setup {
 fn setup(a: &Args, n_ctx: usize) -> Setup {
     let cpus = a.cpus();
     let t0 = Instant::now();
-    let loaded = open(&a.model(), cpus.len(), n_ctx, &a.load_opts()).unwrap_or_else(|e| die(&e));
+    let mut loaded = open(&a.model(), cpus.len(), n_ctx, &a.load_opts()).unwrap_or_else(|e| die(&e));
+    if let Some(mode) = a.get("shared-experts") {
+        if mode != "dma" { die("--shared-experts only accepts dma; omit for normal file weights"); }
+        #[cfg(feature="npu-device")]
+        {
+            let go=a.get("npu-go-file").unwrap_or_else(||die("shared expert relocation requires --npu-go-file guard handshake"));
+            println!("{}",json!({"event":"ready_before_device","pid":std::process::id(),"kind":"CPU allocation only, no DSP session"}));
+            std::io::stdout().flush().unwrap();
+            let until=Instant::now()+Duration::from_secs(30);
+            while !Path::new(go).is_file() {
+                if Instant::now()>until {die("shared expert guard handshake timed out; no DMA allocated");}
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let allocator=oxn::shared_memory::SharedAllocator::open(24<<30).unwrap_or_else(|e|die(&e));
+            let start=Instant::now();
+            let bytes=loaded.ws.relocate_experts(&loaded.plan,&allocator).unwrap_or_else(|e|die(&e));
+            let seconds=start.elapsed().as_secs_f64();loaded.ws.load_seconds+=seconds;
+            assert_eq!(bytes,allocator.owned_bytes());
+            println!("{}",json!({"event":"shared_experts_ready","owned_dma_bytes":bytes,"dsp_mapped_bytes":0,"tensors":loaded.plan.layers.len()*3,"copy_seconds":seconds,"cpu_layout_unchanged":true}));
+            std::io::stdout().flush().unwrap();
+        }
+        #[cfg(not(feature="npu-device"))] die("shared expert weights need npu-device feature");
+    }
     let info = &loaded.ws.info;
     eprintln!(
         "load: {:.2} s ({} cache, {} backing, verified {} tensors in {:.2} s{}), {:.2} GiB weights, {} threads on cpus {:?}",
@@ -281,6 +406,87 @@ fn kld(r: &[f32], o: &[f32]) -> f64 {
 fn sha_ids(ids: &[u32]) -> String {
     format!("{:016x}", model::weights::hash_bytes(&ids.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()))
 }
+
+/// Token ids from a file: decimal ids separated by commas and / or whitespace.
+fn read_ids_file(path: &str) -> Vec<u32> {
+    let t = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    t.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(|x| x.parse().unwrap_or_else(|_| die(&format!("{path}: '{x}' is not a token id")))).collect()
+}
+
+/// The bench prompt: --prompt-ids-file, --prompt-ids, else `plen` fixed pseudo-random ids.
+fn bench_prompt(a: &Args, plen: usize) -> Vec<u32> {
+    if let Some(f) = a.get("prompt-ids-file") {
+        return read_ids_file(f);
+    }
+    match a.get("prompt-ids") {
+        Some(t) => parse_ids(t),
+        None => (0..plen as u32).map(|i| (i.wrapping_mul(2654435761) % 150_000) + 1000).collect(),
+    }
+}
+
+/// LONG-CTX `--state-file`: magic, header line (engine layout + KV type + what built it + the ids'
+/// hash), the token after the prompt, the engine state ([`Engine::write_state`]), then `extra`.
+const STATE_MAGIC: &[u8; 8] = b"OXEBST01";
+
+fn state_header(eng: &Engine, kind: &str, ids: &[u32]) -> String {
+    format!("{} kind={kind} n={} ids={}", eng.state_layout(), ids.len(), sha_ids(ids))
+}
+
+/// Read a state file into `eng` when its header equals `header`; returns (first token, reader at
+/// the extra part). None (with a note) when absent or for another configuration.
+fn state_file_load(path: &str, eng: &Engine, header: &str, n_pos: usize) -> Option<(u32, std::io::BufReader<std::fs::File>)> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::with_capacity(8 << 20, f);
+    let mut m = [0u8; 8];
+    let mut u = [0u8; 4];
+    r.read_exact(&mut m).ok()?;
+    r.read_exact(&mut u).ok()?;
+    let mut h = vec![0u8; u32::from_le_bytes(u) as usize];
+    r.read_exact(&mut h).ok()?;
+    if &m != STATE_MAGIC || h != header.as_bytes() {
+        eprintln!("state-file {path}: other configuration ({}); rebuilding", String::from_utf8_lossy(&h));
+        return None;
+    }
+    r.read_exact(&mut u).ok()?;
+    let first = u32::from_le_bytes(u);
+    let t0 = Instant::now();
+    eng.reset();
+    if let Err(e) = eng.read_state(&mut r, n_pos) {
+        eng.reset();
+        eprintln!("state-file {path}: read failed ({e}); rebuilding");
+        return None;
+    }
+    eprintln!("state-file {path}: {n_pos} positions read in {:.1} s", t0.elapsed().as_secs_f64());
+    Some((first, r))
+}
+
+/// Write `eng`'s state (+ `extra`) to `path` (via path.pending, then rename).
+fn state_file_save(path: &str, eng: &Engine, header: &str, first: u32, extra: &[u8]) {
+    let tmp = format!("{path}.pending");
+    let t0 = Instant::now();
+    let w = (|| -> std::io::Result<()> {
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
+        w.write_all(STATE_MAGIC)?;
+        w.write_all(&(header.len() as u32).to_le_bytes())?;
+        w.write_all(header.as_bytes())?;
+        w.write_all(&first.to_le_bytes())?;
+        eng.write_state(&mut w)?;
+        w.write_all(extra)?;
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    match w {
+        Ok(()) => eprintln!("state-file {path}: {} positions written in {:.1} s", eng.pos(), t0.elapsed().as_secs_f64()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("state-file {path}: write failed: {e}");
+        }
+    }
+}
+
+/// Positions per batched-prefill call when building a long state (the server prefills in chunks
+/// too; bounds the per-call hidden rows of the MTP seeding: 4096 x n_embd f32 = 32 MiB).
+const STATE_CHUNK: usize = 4096;
 
 /// MTP depth from --spec-draft-n-max / --draft (0 = off).
 fn mtp_depth(a: &Args) -> usize {
@@ -807,9 +1013,9 @@ fn cmd_prefill_bench(a: &Args) {
     if a.flag("check-args") {
         // model-free: show how the command line was understood and stop (run this on every ticket
         // command before filing it; a flag missing from the parser's list eats the next argument)
-        let known = ["model", "cpu-list", "threads", "ctx", "ubatch", "reps", "prefix-len", "prompt-len", "pf-tiles", "pf-group", "tokens", "out", "weights", "cache-dir", "verify"];
+        let known = ["model", "cpu-list", "threads", "ctx", "ubatch", "reps", "prefix-len", "prefix-ids-file", "prompt-len", "pf-tiles", "pf-group", "tokens", "out", "weights", "cache-dir", "verify", "state-file", "npu-prefill", "npu-go-file", "npu-recurrent", "npu-recurrent-mask", "npu-overlap"];
         let unknown: Vec<&String> = a.kv.keys().filter(|k| !known.contains(&k.as_str())).collect();
-        println!("{}", json!({ "prompt_len": plens, "arms_mask_group": masks, "ubatch": ubatch, "reps": reps, "prefix_len": prefix, "profile": profile, "state_hash": state_hash, "flags": a.flags, "unknown_keys": unknown }));
+        println!("{}", json!({ "prompt_len": plens, "arms_mask_group": masks, "ubatch": ubatch, "reps": reps, "prefix_len": prefix, "profile": profile, "state_hash": state_hash, "npu_prefill": a.get("npu-prefill"), "flags": a.flags, "unknown_keys": unknown }));
         if !unknown.is_empty() {
             die("unknown options");
         }
@@ -818,15 +1024,39 @@ fn cmd_prefill_bench(a: &Args) {
     let pmax = *plens.iter().max().unwrap();
     let n_ctx = a.num("ctx", 4096).max(prefix + pmax + 1);
     let s = setup(a, n_ctx);
-    let eng = Engine::new(&s.loaded.plan, &s.loaded.ws, EngineConfig { n_ctx, logits: false, trace: false, profile }).unwrap_or_else(|e| die(&e));
+    let mut eng = Engine::new(&s.loaded.plan, &s.loaded.ws, EngineConfig { n_ctx, logits: false, trace: false, profile }).unwrap_or_else(|e| die(&e));
+    maybe_npu_prefill(a,&mut eng);
     let snap = if prefix > 0 {
         eng.reset();
-        let pre: Vec<u32> = (0..prefix as u32).map(|i| (i.wrapping_mul(2246822519) % 150_000) + 1000).collect();
+        let pre: Vec<u32> = match a.get("prefix-ids-file") {
+            Some(f) => {
+                let ids = read_ids_file(f);
+                if ids.len() < prefix {
+                    die(&format!("--prefix-ids-file has {} ids < --prefix-len {prefix}", ids.len()));
+                }
+                ids[..prefix].to_vec()
+            }
+            None => (0..prefix as u32).map(|i| (i.wrapping_mul(2246822519) % 150_000) + 1000).collect(),
+        };
         model::engine::set_pf_tiles(masks[0].0);
         model::engine::set_pf_group(masks[0].1);
-        let t0 = Instant::now();
-        eng.prefill(&s.pool, &pre, ubatch).unwrap();
-        eprintln!("prefix: {prefix} tokens in {:.3} s (untimed)", t0.elapsed().as_secs_f64());
+        // --state-file (LONG-CTX): the prefix built once (chunked, untimed), read back by later runs
+        let header = state_header(&eng, "prefill-bench-prefix", &pre);
+        let loaded = a.get("state-file").and_then(|f| state_file_load(f, &eng, &header, prefix)).is_some();
+        if !loaded {
+            let t0 = Instant::now();
+            if a.get("state-file").is_some() {
+                for c in pre.chunks(STATE_CHUNK) {
+                    eng.prefill(&s.pool, c, ubatch).unwrap();
+                }
+            } else {
+                eng.prefill(&s.pool, &pre, ubatch).unwrap();
+            }
+            eprintln!("prefix: {prefix} tokens in {:.3} s (untimed)", t0.elapsed().as_secs_f64());
+            if let Some(f) = a.get("state-file") {
+                state_file_save(f, &eng, &header, 0, &[]);
+            }
+        }
         Some(eng.save_recurrent())
     } else {
         None
@@ -950,9 +1180,13 @@ fn cmd_prefill_bench(a: &Args) {
     res["n_ctx"] = json!(eng.n_ctx);
     res["threads"] = json!(s.pool.nthreads());
     res["effective"] = json!(model::engine::effective_switches());
+    #[cfg(feature="npu-prefill")]
+    {res["npu_prefill"]=eng.npu_prefill_stats().map(npu_stats_json).unwrap_or(serde_json::Value::Null);}
     res["cpus"] = json!(s.pool.cpus());
     res["first_token_identical_across_arms"] = json!(all_same);
     res["kv_vpad"] = json!(model::engine::kv_vpad());
+    res["kv_type"] = json!(eng.kv_type().name());
+    res["state_file"] = json!(a.get("state-file"));
     if state_hash {
         res["state_identical_across_arms"] = json!(state_same);
     }
@@ -987,10 +1221,7 @@ fn cmd_verify_bench(a: &Args) {
     }
     let runs = a.num("runs", 48);
     let plen = a.num("prompt-len", 512);
-    let prompt: Vec<u32> = match a.get("prompt-ids") {
-        Some(t) => parse_ids(t),
-        None => (0..plen as u32).map(|i| (i.wrapping_mul(2654435761) % 150_000) + 1000).collect(),
-    };
+    let prompt = bench_prompt(a, plen);
     let rounds = 2;
     let need = prompt.len() + 16 + rounds * 2 * runs * lanes.iter().sum::<usize>() + 8;
     let n_ctx = a.num("ctx", 4096).max(need);
@@ -1371,10 +1602,7 @@ fn cmd_bench_arms(a: &Args, spec: &str) {
     let drop = a.num("drop", 1).min(reps - 1);
     let plen = a.num("prompt-len", 16);
     let profile = a.flag("profile");
-    let prompt: Vec<u32> = match a.get("prompt-ids") {
-        Some(t) => parse_ids(t),
-        None => (0..plen as u32).map(|i| (i.wrapping_mul(2654435761) % 150_000) + 1000).collect(),
-    };
+    let prompt = bench_prompt(a, plen);
     if prompt.is_empty() {
         die("--arms needs a prompt");
     }
@@ -1521,10 +1749,7 @@ fn cmd_bench(a: &Args) {
     let plan = &s.loaded.plan;
     let eng = Engine::new(plan, &s.loaded.ws, EngineConfig { n_ctx, logits: false, trace: false, profile }).unwrap_or_else(|e| die(&e));
     // a fixed deterministic prompt (ids from --tokens, else a fixed pseudo-random sequence)
-    let prompt: Vec<u32> = match a.get("prompt-ids") {
-        Some(t) => parse_ids(t),
-        None => (0..plen as u32).map(|i| (i.wrapping_mul(2654435761) % 150_000) + 1000).collect(),
-    };
+    let prompt = bench_prompt(a, plen);
     let mut next = 0;
     if a.flag("batched-prompt") {
         // batched prefill of the prompt (long-context decode: --prompt-len 16384 --batched-prompt)
@@ -1577,14 +1802,15 @@ fn cmd_bench(a: &Args) {
         "ms_per_token": { "median": med, "mean": mean, "min": sorted[0], "p90": p90 },
         "tok_s": 1000.0 / med,
         "barriers_per_token": barriers, "barriers_per_token_plan": eng.barriers_per_token(),
-        "attn": if eng.attn_tiled() { "tiled" } else { "legacy" }, "attn_tiled_min_kv": eng.attn_tiled_min_kv(),
+        "attn": if eng.attn_fused() { "fused" } else if eng.attn_tiled() { "tiled" } else { "legacy" }, "attn_tiled_min_kv": eng.attn_tiled_min_kv(),
+        "attn_fused_chunk": eng.attn_fused_chunk(),
         "attn_col_stride": eng.attn_col_stride(),
         "attn_prob_blocks": eng.attn_stats().map(|(b, z, t)| json!({"blocks": b, "zero": z, "below_2m10": t,
             "zero_frac": z as f64 / b.max(1) as f64, "below_2m10_frac": t as f64 / b.max(1) as f64})),
         "bytes_per_token": { "weights": budget.weights(), "state_rw": budget.state_rw, "total_at_ctx": budget.total() },
         "generated_ids": gen, "generated_hash": sha_ids(&gen),
         "load": { "seconds": s.loaded.ws.load_seconds, "cache_hit": info.cache_hit, "backing": info.backing,
-                  "cache_path": info.cache_path, "built_seconds": info.built_seconds,
+                  "cache_path": info.cache_path, "built_seconds": info.built_seconds, "shared_expert_owned_bytes": s.loaded.ws.shared_expert_bytes(),
                   "verified_tensors": info.verified_tensors, "weights_bytes": s.loaded.ws.repacked_bytes },
         "memory_kb": mem,
         "profile": phases,
@@ -1802,25 +2028,67 @@ fn cmd_bench_mtp(a: &Args) {
     let eng = Engine::with_options(plan, &s.loaded.ws, EngineConfig { n_ctx, logits: false, trace: false, profile: false }, EngineOptions { verify_lanes: depth + 1, mtp: Some(&mw), kv_type: None })
         .unwrap_or_else(|e| die(&e));
     let mut drv = MtpDriver::new(&eng, depth).unwrap_or_else(|e| die(&e));
-    let prompt: Vec<u32> = match a.get("prompt-ids") {
-        Some(t) => parse_ids(t),
-        None => (0..plen as u32).map(|i| (i.wrapping_mul(2654435761) % 150_000) + 1000).collect(),
-    };
+    let prompt = bench_prompt(a, plen);
     let tp = Instant::now();
+    // --state-file (LONG-CTX): the prompt state built once, read back by later runs
+    let state_file = a.get("state-file");
+    if state_file.is_some() && !a.flag("batched-prompt") {
+        die("--state-file needs --batched-prompt");
+    }
+    let header = state_header(&eng, &format!("bench-mtp head={}", a.get("mtp-from").unwrap_or("model")), &prompt);
+    let mut loaded = None;
+    if let Some(f) = state_file {
+        if let Some((first, mut r)) = state_file_load(f, &eng, &header, prompt.len()) {
+            let ne = plan.desc.n_embd;
+            let rd = |r: &mut dyn Read, n: usize| -> Vec<u8> {
+                let mut b = vec![0u8; n];
+                r.read_exact(&mut b).unwrap_or_else(|e| die(&format!("state-file: MTP part: {e}")));
+                b
+            };
+            let q = u64::from_le_bytes(rd(&mut r, 8).try_into().unwrap()) as usize;
+            let n = u64::from_le_bytes(rd(&mut r, 8).try_into().unwrap()) as usize;
+            let toks: Vec<u32> = rd(&mut r, n * 4).chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let f: Vec<f32> = rd(&mut r, (n + 1) * ne * 4).chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            let (h, hl) = f.split_at(n * ne);
+            drv.import_state(&eng, q, toks, h.to_vec(), hl).unwrap_or_else(|e| die(&format!("state-file: {e}")));
+            loaded = Some(first);
+        }
+    }
+    let state_loaded = loaded.is_some();
     // --batched-prompt: the server's prompt path (batched prefill + KV-only MTP seeding); else the
     // token-wise verify-run prefill (slow for long prompts)
-    let mut x = if a.flag("batched-prompt") {
+    let mut x = if let Some(first) = loaded {
+        first
+    } else if state_file.is_some() {
+        // built in chunks (as the server prefills), then saved
+        let mut x = 0;
+        for c in prompt.chunks(STATE_CHUNK) {
+            x = drv.prefill_batched(&eng, &s.pool, &s.pool, c, model::engine::UBATCH);
+        }
+        let (q, toks, h, hl) = drv.export_state();
+        let mut extra = Vec::new();
+        extra.extend((q as u64).to_le_bytes());
+        extra.extend((toks.len() as u64).to_le_bytes());
+        toks.iter().for_each(|t| extra.extend(t.to_le_bytes()));
+        h.iter().chain(&hl).for_each(|v| extra.extend(v.to_le_bytes()));
+        state_file_save(state_file.unwrap(), &eng, &header, x, &extra);
+        x
+    } else if a.flag("batched-prompt") {
         drv.prefill_batched(&eng, &s.pool, &s.pool, &prompt, model::engine::UBATCH)
     } else {
         drv.prefill(&eng, &s.pool, &prompt)
     };
     let prefill_ms = tp.elapsed().as_secs_f64() * 1000.0;
+    // --plain-steps (LONG-CTX MTP-by-context pricing): decode depth 0 on the same MTP engine and
+    // state (step_plain keeps the MTP catch-up in sync: the server's path beyond --mtp-max-ctx)
+    let plain = a.flag("plain-steps");
+    let step = |drv: &mut MtpDriver, x: u32, out: &mut Vec<u32>| if plain { drv.step_plain(&eng, &s.pool, x, out) } else { drv.step(&eng, &s.pool, x, out) };
     let mut gen = Vec::new();
     let mut out = Vec::new();
     // warm-up: produce `warmup` tokens (gen holds every token fed to the target, as in the plain bench)
     while gen.len() < warmup {
         gen.push(x);
-        drv.step(&eng, &s.pool, x, &mut out);
+        step(&mut drv, x, &mut out);
         gen.extend_from_slice(&out[..out.len() - 1]);
         x = *out.last().unwrap();
     }
@@ -1832,7 +2100,7 @@ fn cmd_bench_mtp(a: &Args) {
     while gen.len() < target {
         gen.push(x);
         let t = Instant::now();
-        drv.step(&eng, &s.pool, x, &mut out);
+        step(&mut drv, x, &mut out);
         step_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         gen.extend_from_slice(&out[..out.len() - 1]);
         x = *out.last().unwrap();
@@ -1845,13 +2113,17 @@ fn cmd_bench_mtp(a: &Args) {
     let eff = total_ms / produced.max(1) as f64;
     let mem: serde_json::Map<String, serde_json::Value> = memory_report().into_iter().map(|(k, v)| (k, json!(v))).collect();
     let info = &s.loaded.ws.info;
+    let cm = eng.ctx_mem();
+    let ctx_mem_json = json!({ "kv": cm.kv, "kv_per_pos": cm.kv_per_pos, "recurrent": cm.recurrent, "decode_scratch": cm.decode_scratch });
     let res = json!({
         "engine": "oxe", "engine_commit": option_env!("OXE_GIT_COMMIT").unwrap_or("unknown"),
         "effective": model::engine::effective_switches(),
         "model": a.model().display().to_string(),
         "cpus": s.pool.cpus(), "threads": s.pool.nthreads(),
-        "spec": { "type": "draft-mtp", "draft_n_max": depth },
+        "spec": { "type": "draft-mtp", "draft_n_max": if plain { 0 } else { depth }, "plain_steps": plain },
         "prompt_tokens": prompt.len(), "prefill_ms": prefill_ms, "warmup": warmup, "tokens": tokens, "n_ctx": eng.n_ctx,
+        "state_file": state_file, "state_loaded": state_loaded, "kv_type": eng.kv_type().name(),
+        "ctx_mem_bytes": ctx_mem_json,
         "tokens_produced_timed": produced,
         "ms_per_token": { "effective": eff, "median": eff, "mean": eff },
         "tok_s": 1000.0 / eff,
@@ -2005,25 +2277,146 @@ fn cmd_mtp_check(a: &Args) {
     }
 }
 
+#[cfg(feature="npu-prefill")]
+fn npu_stats_json(s:model::npu_prefill::Stats)->serde_json::Value{
+    json!({"prepared":s.prepared,"skipped":s.skipped,"calls":s.calls,"rows":s.rows,
+        "reserved_dma_bytes":s.reserved_dma_bytes,"occupied_weight_bytes":s.occupied_weight_bytes,
+        "host_scratch_bytes":s.host_scratch_bytes,"first_error":s.first_error,"recurrent_mode":s.recurrent_mode,"recurrent_mask":format!("{:016x}",s.recurrent_mask),"cpu_f32_matrices":s.cpu_f32_matrices,"gemm_flops":s.gemm_flops,"overlap_shared":s.overlap_shared,"shared_chain_units":s.shared_chain_units,"shared_chain_s":s.shared_chain_s,"expert_units_started_during_shared":s.expert_units_started_during_shared,"host_phases":{"input_s":s.input_s,"device_run_s":s.device_run_s,"output_s":s.output_s,"commit_s":s.commit_s,"projection_s":s.projection_s,"lock_wait_thread_s":s.lock_wait_s},
+        "original_audit":s.original_audit.iter().map(|a|json!({"tensor":a.tensor,"k":a.k,"o":a.o,"samples":a.samples,
+            "relative_rmse":(a.squared_error/a.squared_reference.max(1e-30)).sqrt(),"max_error":a.max_error,"max_input":a.max_input,
+            "max_output":a.max_output,"max_reference":a.max_reference})).collect::<Vec<_>>(),
+        "accelerator":s.accelerator.map(|a|json!({"pack_s":a.pack_s,"gemm_s":a.gemm_s,"dsp_us":a.dsp_us,"calls":a.calls,"allocated_bytes":a.allocated_bytes,"weights_bytes":a.weights_bytes}))})
+}
+
+fn maybe_npu_prefill(a:&Args,eng:&mut Engine){
+    let Some(mode)=a.get("npu-prefill")else{return};
+    #[cfg(not(feature="npu-prefill"))]{let _=(eng,mode);die("build with the npu-prefill feature");}
+    #[cfg(feature="npu-prefill")]{
+        if !["device","emu"].contains(&mode){die("--npu-prefill must be device or emu");}
+        let g=gguf::Gguf::open(a.model()).unwrap_or_else(|e|die(&e.to_string()));
+        let dir=model::weights::cache_dir(a.load_opts().cache_dir.as_deref()).unwrap_or_else(|e|die(&e));
+        // Check THIS source independently of an inherited target-model SHA env.
+        let sha=model::weights::model_sha256_opt(&g.path,&dir,false).unwrap_or_else(|e|die(&e));
+        // CPU weights already live in the independent repacked cache. A cold
+        // source checksum must not leave a second model-sized clean page cache.
+        for t in &g.header.tensors{g.release_range(t,0,t.bytes()as usize);g.drop_cache(t);}
+        let backend:Box<dyn oxn::Backend>=if mode=="emu"{
+            Box::new(oxn::emu::Emu::new(8<<20,1))
+        }else{
+            if !cfg!(feature="npu-device"){die("build with the npu-device feature");}
+            let go=a.get("npu-go-file").unwrap_or_else(||die("device prefill needs --npu-go-file for guard handshake"));
+            println!("{}",json!({"event":"ready_before_device","pid":std::process::id()}));
+            std::io::stdout().flush().unwrap();let deadline=Instant::now()+Duration::from_secs(30);
+            while !Path::new(go).is_file(){if Instant::now()>deadline{die("guard handshake timeout; no NPU opened");}std::thread::sleep(Duration::from_millis(20));}
+            #[cfg(feature="npu-device")]{Box::new(oxn::device::Device::open(1).unwrap_or_else(|e|die(&e)))}
+            #[cfg(not(feature="npu-device"))]{unreachable!()}
+        };
+        let st=eng.enable_npu_prefill(&g,&sha,backend,model::npu_prefill::Config{audit_original:a.get("npu-audit")==Some("1"),
+            recurrent:model::npu_prefill::RecurrentMode::parse(a.get("npu-recurrent").unwrap_or("native")).unwrap_or_else(|e|die(&e)),
+            overlap_shared:match a.get("npu-overlap").unwrap_or("none"){"none"=>false,"shared"=>true,_=>die("--npu-overlap none|shared")},
+            recurrent_mask:a.get("npu-recurrent-mask").map(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).unwrap_or_else(|_|die("hex recurrent mask required"))).unwrap_or(u64::MAX),..Default::default()},&a.cpus()).unwrap_or_else(|e|die(&e));
+        eprintln!("oxe: npu-prefill prepared {}",npu_stats_json(st));
+        println!("{}",json!({"event":"npu_prepared"}));std::io::stdout().flush().unwrap();
+    }
+}
+
+fn cmd_npu_prefill_check(a:&Args){
+    #[cfg(not(feature="npu-prefill"))]{let _=a;die("build with npu-prefill feature");}
+    #[cfg(feature="npu-prefill")]{
+        if a.get("npu-prefill").is_none(){die("explicit --npu-prefill device|emu is required");}
+        let p=if a.get("ref").is_some()||a.get("tokens").is_some(){prompt(a)}else{
+            (0..a.num("prompt-len",64)as u32).map(|i|i.wrapping_mul(2654435761)%150000+1000).collect()
+        };
+        let n=a.num("n",16);
+        if p.len()<32||p.len()>1024||n==0||n>128{die("bounded proof needs32..1024 prompt tokens and1..128 decode rows");}
+        let n_ctx=a.num("ctx",2048).max(p.len()+n+1);
+        let s=setup(a,n_ctx);
+        if p.iter().any(|&t|t as usize>=s.loaded.plan.desc.n_vocab){die("prompt token outside vocabulary");}
+        let cfg=EngineConfig{n_ctx,logits:true,trace:false,profile:false};
+        let reference=Engine::new(&s.loaded.plan,&s.loaded.ws,cfg.clone()).unwrap_or_else(|e|die(&e));
+        let single=Engine::new(&s.loaded.plan,&s.loaded.ws,cfg.clone()).unwrap_or_else(|e|die(&e));
+        let mut candidate=Engine::new(&s.loaded.plan,&s.loaded.ws,cfg).unwrap_or_else(|e|die(&e));
+        maybe_npu_prefill(a,&mut candidate);
+        let ubatch=a.num("ubatch",256);
+        let t=Instant::now();let mut next=reference.prefill(&s.pool,&p,ubatch).unwrap();let cpu_prefill_s=t.elapsed().as_secs_f64();
+        for &tok in &p{single.step(&s.pool,tok);}
+        let t=Instant::now();candidate.prefill(&s.pool,&p,ubatch);let npu_prefill_s=t.elapsed().as_secs_f64();
+        let npu_calls_after_prefill=candidate.npu_prefill_stats().unwrap().calls;
+        let mut rows=Vec::new();let mut ids=Vec::new();
+        for i in 0..n{
+            let base=reference.logits();
+            if base.is_empty()||base.len()!=candidate.logits().len()||base.len()!=single.logits().len()
+                ||base.iter().chain(candidate.logits()).chain(single.logits()).any(|v|!v.is_finite()){
+                die("nonfinite or mismatched logit rows");
+            }
+            let numeric=kld(base,candidate.logits());let noise=kld(base,single.logits());
+            rows.push(json!({"row":i,"npu_vs_batch_kld":numeric,"single_vs_batch_noise":noise,
+                "npu_top1_matches_batch":argmax(base)==argmax(candidate.logits()),"single_top1_matches_batch":argmax(base)==argmax(single.logits())}));
+            ids.push(next);let tok=next;next=reference.step(&s.pool,tok);single.step(&s.pool,tok);candidate.step(&s.pool,tok);
+        }
+        let mean=|key:&str|rows.iter().map(|r|r[key].as_f64().unwrap()).sum::<f64>()/rows.len()as f64;
+        let numeric=mean("npu_vs_batch_kld");let noise=mean("single_vs_batch_noise");
+        let st=candidate.npu_prefill_stats().unwrap();
+        // The already-reviewed W2 gate is SAME-model, SAME-position CPU noise.
+        // Top1 at this bounded count is information only, not a2K-position gate.
+        let no_decode_npu=st.calls==npu_calls_after_prefill;
+        let mut before=Fnv(0xcbf29ce484222325);candidate.write_state(&mut before).unwrap();
+        let passed=numeric.is_finite()&&noise.is_finite()&&numeric<=noise&&st.calls>0&&st.first_error.is_none()&&no_decode_npu;
+        let before_decode_release=npu_stats_json(st);
+        candidate.release_npu_prefill();
+        let mut after=Fnv(0xcbf29ce484222325);candidate.write_state(&mut after).unwrap();
+        let release_state_identical=before.0==after.0;
+        let mut reference_decode=Vec::new();let mut candidate_decode=Vec::new();
+        // Identical post-prefill decode inputs test that releasing the offload
+        // cache leaves CPU state usable. These are not a timing comparison.
+        for tok in ids.iter().take(2){reference_decode.push(reference.step(&s.pool,*tok));candidate_decode.push(candidate.step(&s.pool,*tok));}
+        let passed=passed&&release_state_identical;
+        let result=json!({"passed":passed,"kind":"bounded-NPU-prefill-numeric-proof","prompt_tokens":p.len(),"rows":rows,
+            "mean_npu_kld":numeric,"mean_cpu_batch_single_noise":noise,"gate_multiplier":1.0,"teacher_ids_hash":sha_ids(&ids),
+            "cpu_prefill_s_informational":cpu_prefill_s,"npu_prefill_s_informational":npu_prefill_s,"npu":before_decode_release,
+            "release_cleared_registry":candidate.npu_prefill_stats().is_none(),"post_release_reference_ids":reference_decode,"post_release_candidate_ids":candidate_decode,
+            "decode_npu_calls_zero":no_decode_npu,"release_state_identical":release_state_identical,"release_state_fnv":format!("{:016x}",before.0),
+            "model_sha256":s.loaded.ws.info.model_sha256,"threads":s.pool.nthreads(),"effective":model::engine::effective_switches()});
+        let text=serde_json::to_string_pretty(&result).unwrap();
+        if let Some(out)=a.get("out"){std::fs::write(out,&text).unwrap();}println!("{text}");
+        if !passed{std::process::exit(1);}
+    }
+}
+
 fn main() {
     let a = Args::parse();
+    if let Some(mode)=a.get("shared-experts") {
+        if a.cmd != "bench" || mode != "dma" { die("experimental --shared-experts dma is limited to bench"); }
+    }
     if a.flag("check-args") && a.cmd != "prefill-bench" {
         a.check_known();
     }
-    match a.cmd.as_str() {
-        "gen" => cmd_gen(&a),
-        "trace" => cmd_trace(&a),
-        "compare" => cmd_compare(&a),
-        "verify" => cmd_verify(&a),
-        "bench" => cmd_bench(&a),
-        "verify-bench" => cmd_verify_bench(&a),
-        "kv-kld" => cmd_kv_kld(&a),
-        "kbench-mt" => cmd_kbench_mt(&a),
-        "vocab-freq" => cmd_vocab_freq(&a),
-        "cache" => cmd_cache(&a),
-        "prefill-verify" => cmd_prefill_verify(&a),
-        "prefill-bench" => cmd_prefill_bench(&a),
-        "mtp-check" => cmd_mtp_check(&a),
-        _ => usage(),
+    if a.get("npu-prefill").is_some() && !cfg!(feature="npu-prefill") {
+        die("this binary was built without the npu-prefill feature");
+    }
+    if a.get("npu-prefill").is_some() && !["npu-prefill-check","npu-f32-check","npu-greedy-check","f32-tensor-map","prefill-bench"].contains(&a.cmd.as_str()) {
+        die("experimental NPU option is limited to npu-prefill-check and prefill-bench");
+    }
+    match COMMANDS.iter().find(|(name, _)| *name == a.cmd) {
+        Some((_, run)) => run(&a),
+        None => usage(),
+    }
+}
+
+#[cfg(test)]
+mod n3_tests {
+    use super::*;
+
+    #[test]
+    fn usage_lists_every_dispatched_command_once() {
+        let line = usage_line();
+        let listed = line.split_whitespace().nth(2).unwrap();
+        let names: Vec<&str> = COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(listed.split('|').collect::<Vec<_>>(), names);
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        assert_eq!(names.len(), 24);
     }
 }
