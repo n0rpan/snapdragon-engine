@@ -65,7 +65,18 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// `dst[i * stride] = f16(x[i])` (NEON conversion).
+/// [`f16_bits_ref`] after the saturation of `to_f16`: finite values beyond the f16 range become
+/// +-65504; NaN and +-inf are kept (F-IMG-ATTN-b).
+pub fn f16_bits_sat_ref(x: f32) -> u16 {
+    if x.is_finite() {
+        f16_bits_ref(x.clamp(-65504.0, 65504.0))
+    } else {
+        f16_bits_ref(x)
+    }
+}
+
+/// `dst[i * stride] = f16(x[i])` (NEON conversion), SATURATING: finite values beyond the f16 range
+/// become +-65504 instead of +-inf; NaN and +-inf pass through (see csrc/i8g_fattn.c).
 pub fn to_f16(x: &[f32], dst: &mut [u16], stride: usize) {
     assert!(stride >= 1);
     if x.is_empty() {
@@ -75,6 +86,10 @@ pub fn to_f16(x: &[f32], dst: &mut [u16], stride: usize) {
     // SAFETY: bounds checked above.
     unsafe { raw::i8g_fattn_to_f16(x.as_ptr(), x.len(), dst.as_mut_ptr(), stride) }
 }
+
+#[cfg(test)]
+#[path = "fattn_sat_tests.rs"]
+mod sat_tests;
 
 #[cfg(test)]
 mod tests {
@@ -108,7 +123,7 @@ mod tests {
         let mut got = vec![0u16; xs.len()];
         to_f16(&xs, &mut got, 1);
         for (i, &x) in xs.iter().enumerate() {
-            assert_eq!(got[i], f16_bits_ref(x), "x {x:e}");
+            assert_eq!(got[i], f16_bits_sat_ref(x), "x {x:e}");
             if got[i] & 0x7c00 != 0x7c00 {
                 let back = f16_to_f32(got[i]);
                 let mut one = [0f32];
@@ -121,7 +136,7 @@ mod tests {
         let mut s = vec![0u16; 8 * 5];
         to_f16(&xs[..5], &mut s, 8);
         for i in 0..5 {
-            assert_eq!(s[i * 8], f16_bits_ref(xs[i]));
+            assert_eq!(s[i * 8], f16_bits_sat_ref(xs[i]));
         }
     }
 

@@ -62,7 +62,8 @@ fn real_main() -> Result<(), TeError> {
         "encode" => {
             let threads: usize = a.get("threads").map_or(Ok(12), |v| v.parse()).map_err(|_| TeError::Other("--threads".into()))?;
             let backend = backend_from_opts(&|k| a.get(k).cloned())?;
-            let out = encode_prompt(Path::new(&gguf), &prompt, backend, threads)?;
+            let max_n: usize = a.get("max-tokens").map_or(Ok(0), |v| v.parse()).map_err(|_| TeError::Other("--max-tokens".into()))?;
+            let out = encode_prompt(Path::new(&gguf), &prompt, backend, threads, max_n)?;
             let mut s = out.summary.clone();
             if let Some(p) = a.get("out") {
                 write_f32(Path::new(p), &out.ctx)?;

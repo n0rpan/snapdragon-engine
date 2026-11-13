@@ -41,7 +41,16 @@
 //! `cache.disk_budget_bytes`, default 64 GB). Eviction: TTL-expired sessions first, then the
 //! lowest value = Cost(n) / bytes x recency, Cost(p) = 3.0 p + 0.112 p^2 / 1000 ms; sessions used
 //! in the last 10 minutes are pinned; blocks shared with a kept session stay (refcount), so a kept
-//! block always has its prefix.
+//! block always has its prefix. v0.1.3 (`--state-budget-scope global`, the default): the loaded
+//! engine evicts across EVERY identity under ROOT (other models, older epochs still in their TTL),
+//! in one value order over optional snapshots and whole sessions (a session's head, its deepest
+//! state, goes only with the session); each identity's shared blocks go last (refcount within that
+//! identity).
+//!
+//! v0.1.3 off-lock writes ([`Staged`]): after a reply the head snapshot and the new blocks are copied
+//! to RAM under the worker lock, written without it (a request arriving meanwhile runs at once), and
+//! the manifest is committed under the lock again. Files on their way are listed in `inflight`, so
+//! a sweep in between never takes them.
 //!
 //! Privacy: state files encode the conversation. No prompt text or token ids in logs or names.
 
@@ -64,26 +73,71 @@ const VERSION: u32 = 1;
 /// snapshot file format: 2 = the MTP driver state in full (P2b, G3); P2's version 1 is refused
 const SNAP_VERSION: u32 = 2;
 const HDR: u64 = 8 + 4 + 64 + 8 + 8 + 8;
-/// snapshots kept per session at most (design sec. 2)
+/// bytes of a state file header (a snapshot file is this + its payload)
+pub const HDR_BYTES: u64 = HDR;
+/// snapshots kept per session at most (design sec. 2; the default of `--state-snaps`)
 pub const MAX_SNAPS: usize = 12;
+/// an off-lock write stages at most this many new blocks in RAM (88 MiB at Ornith's row size);
+/// more go through the on-lock writer (a long prefill without progress writes)
+pub const STAGE_MAX_BLOCKS: usize = 16;
 /// a manifest larger than this is refused unread (and removed): never an unbounded read
 pub const MAX_MANIFEST_BYTES: u64 = 8 << 20;
 /// sessions used this recently are never evicted
 const PIN_SECS: u64 = 600;
 
+/// Environment knobs that select an arithmetic path of the oxe engine.
+pub(crate) const ARITH_KNOBS: &[&str] = &[
+    "OXE_ATTN", "OXE_ATTN_TILED_MIN_KV", "OXE_DEC_ATTN_PAD", "OXE_DEC_FUSED_DN", "OXE_KV_VPAD", "OXE_PF_ATTN_PB", "OXE_PF_GROUP", "OXE_PF_GROUP_T",
+    "OXE_PF_GROUP_UNALIGNED", "OXE_PF_MMID_MIN", "OXE_PF_TILES", "OXE_SMALL_PREFILL", "OXE_VL", "OXE_KV", "OXE_KV_TYPE",
+    // P2 review: the knobs the first list missed (`--pf-group-t1/-t2` set the first two)
+    "OXE_PF_GROUP_T1", "OXE_PF_GROUP_T2", "OXE_KV8_FUSED", "OXE_KV8_PV",
+    // v0.1.3 (lane A, PREFILL-LONG): the prefill attention path and the fused-attention cutoffs.
+    // An engine that picks fa2 by itself (auto at 256K, no variable set) must key on its actual
+    // path too: OxeEngine::arith_id appends ` pf_attn=fa2` from `Engine::pf_attn_fa2()`
+    "OXE_PF_ATTN", "OXE_ATTN_FUSED_MIN_KV", "OXE_ATTN_FUSED_1LANE_MIN_KV",
+    // v0.1.3 APPEND-PREFILL: the fa2x kernel's f16 chain length and chunk (arith_id also appends
+    // ` pf_attn=fa2x.f<fold>.c<ch>` from the engine's effective parameters)
+    "OXE_PF_FA2X_FOLD", "OXE_PF_FA2X_CH",
+    // v0.1.3 PREFILL-POLICY: what `auto` resolves to (arith_id also appends the resolved kernel
+    // and `.k<cut>` when the cutoff is not PFA_MIN_KV)
+    "OXE_PF_ATTN_AUTO_MIN_KV", "OXE_PF_ATTN_AUTO_KERNEL",
+];
+
 /// Environment knobs that select an arithmetic path of the oxe engine (sorted `K=V`, set ones only).
 pub fn arith_env() -> String {
-    const KNOBS: &[&str] = &[
-        "OXE_ATTN", "OXE_ATTN_TILED_MIN_KV", "OXE_DEC_ATTN_PAD", "OXE_DEC_FUSED_DN", "OXE_KV_VPAD", "OXE_PF_ATTN_PB", "OXE_PF_GROUP", "OXE_PF_GROUP_T",
-        "OXE_PF_GROUP_UNALIGNED", "OXE_PF_MMID_MIN", "OXE_PF_TILES", "OXE_SMALL_PREFILL", "OXE_VL", "OXE_KV", "OXE_KV_TYPE",
-        // P2 review: the knobs the first list missed (`--pf-group-t1/-t2` set the first two)
-        "OXE_PF_GROUP_T1", "OXE_PF_GROUP_T2", "OXE_KV8_FUSED", "OXE_KV8_PV",
-    ];
-    KNOBS.iter().filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}"))).collect::<Vec<_>>().join(",")
+    arith_env_with(|k| std::env::var(k).ok())
+}
+
+/// [`arith_env`] over a given reader (tests: no process-wide environment change, which the
+/// engines of parallel tests would read at construction).
+pub(crate) fn arith_env_with(get: impl Fn(&str) -> Option<String>) -> String {
+    ARITH_KNOBS.iter().filter_map(|k| get(k).map(|v| format!("{k}={v}"))).collect::<Vec<_>>().join(",")
 }
 
 /// The kernel path (moved to `model::engine` next to the golden-state test that keys on it).
 pub use model::engine::kernel_path;
+
+/// One `key=value` field of an identity text (`state=` runs up to ` epoch=`: the layout has spaces).
+fn ident_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let start = text.find(&format!("{key}="))? + key.len() + 1;
+    let rest = &text[start..];
+    let end = if key == "state" { rest.find(" epoch=")? } else { rest.find(' ').unwrap_or(rest.len()) };
+    Some(&rest[..end])
+}
+
+/// Whether another identity directory's `identity.json` can never be read by any build of this
+/// store format: another format version, numerics epoch, state ABI or block size. Unknown or
+/// unparseable fields count as stale (a directory this build cannot even describe).
+pub(crate) fn stale_identity(other: &Json, mine: &Identity) -> bool {
+    if other.get("version").and_then(Json::as_u64) != Some(VERSION as u64) {
+        return true;
+    }
+    if other.get("numerics_epoch") != Some(&json!(NUMERICS_EPOCH)) {
+        return true;
+    }
+    let Some(text) = other.get("identity").and_then(Json::as_str) else { return true };
+    ["state", "block"].iter().any(|k| ident_field(text, k).is_none() || ident_field(text, k) != ident_field(&mine.text, k))
+}
 
 /// Re-prefill cost of p tokens in ms (design sec. 4, [E]).
 pub fn cost_ms(p: usize) -> f64 {
@@ -270,6 +324,18 @@ pub struct StateStore {
     pub mem_available: fn() -> Option<u64>,
     /// crash-test hook (see [`Kill`])
     pub kill: Kill,
+    /// v0.1.3: snapshots kept per session at most (`--state-snaps`, default [`MAX_SNAPS`])
+    pub max_snaps: usize,
+    /// v0.1.3: the budget evicts across every identity under the root (`--state-budget-scope global`)
+    pub global_budget: bool,
+    /// v0.1.3: files an off-lock write is putting on disk that no manifest names yet (sweeps keep them)
+    pub inflight: std::sync::Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    /// test hook: an off-lock write sleeps this long before it writes (a slow disk)
+    pub stage_delay_ms: u64,
+    /// mutation-test hook (0 in production): 1 = no sweep on every enforce, 2 = a live block a sweep
+    /// removed counts as on disk, 3 = sweeps ignore `inflight`. The v0.1.3 tests check that each
+    /// broken sweep fails the tests that guard it.
+    pub mutant: u8,
 }
 
 fn io(e: std::io::Error) -> String {
@@ -498,6 +564,12 @@ impl StateStore {
             min_mem_bytes: 512 << 20,
             mem_available: crate::prefix_store::proc_mem_available,
             kill: Kill::default(),
+            max_snaps: MAX_SNAPS,
+            // `--state-budget-scope own` (main.rs sets the variable before the store opens)
+            global_budget: std::env::var("OXE_STATE_BUDGET_SCOPE").map_or(true, |v| v != "own"),
+            inflight: Default::default(),
+            stage_delay_ms: 0,
+            mutant: 0,
         };
         st.load_manifests();
         st.sweep();
@@ -507,13 +579,18 @@ impl StateStore {
     }
 
     fn block_path(&self, h: &str, c: &str) -> PathBuf {
-        self.dir.join("blocks").join(&h[..2]).join(format!("{h}.{c}.kv"))
+        block_path_in(&self.dir, h, c)
     }
     fn snap_path(&self, key: &str, c: &str) -> PathBuf {
-        self.dir.join("snaps").join(format!("{key}.{c}.st"))
+        snap_path_in(&self.dir, key, c)
     }
     fn manifest_path(&self, sid: &str) -> PathBuf {
         self.dir.join("sessions").join(format!("{sid}.json"))
+    }
+
+    /// Is this snapshot file on disk?
+    pub fn has_snap(&self, key: &str, c: &str) -> bool {
+        self.snap_path(key, c).is_file()
     }
 
     fn load_manifests(&mut self) {
@@ -538,48 +615,20 @@ impl StateStore {
         }
     }
 
-    /// Delete `.pending` files and blocks / snapshots no manifest references.
+    /// Delete `.pending` files and blocks / snapshots no manifest references (files of an off-lock
+    /// write on its way are kept: `inflight`).
     pub fn sweep(&mut self) -> u64 {
-        let mut want: HashSet<PathBuf> = HashSet::new();
-        for m in self.manifests.values() {
-            for (h, c) in &m.blocks {
-                want.insert(self.block_path(h, c));
-            }
-            for s in &m.snaps {
-                want.insert(self.snap_path(&s.key, &s.c));
-            }
+        if self.mutant == 3 {
+            return sweep_dir(&self.dir, &self.manifests, &self.kill, &Default::default());
         }
-        let mut freed = 0;
-        let kill = &self.kill;
-        let mut visit = |p: PathBuf| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let ours = name.ends_with(".pending") || ((name.ends_with(".kv") || name.ends_with(".st")) && !want.contains(&p));
-            if ours {
-                if let Ok(md) = fs::symlink_metadata(&p) {
-                    if md.is_file() && rm(kill, &p) {
-                        freed += md.len();
-                    }
-                }
-            }
-        };
-        if let Ok(rd) = fs::read_dir(self.dir.join("blocks")) {
-            for sub in rd.flatten() {
-                if let Ok(rd2) = fs::read_dir(sub.path()) {
-                    rd2.flatten().for_each(|d| visit(d.path()));
-                }
-            }
-        }
-        if let Ok(rd) = fs::read_dir(self.dir.join("snaps")) {
-            rd.flatten().for_each(|d| visit(d.path()));
-        }
-        if let Ok(rd) = fs::read_dir(self.dir.join("sessions")) {
-            rd.flatten().filter(|d| d.path().to_string_lossy().ends_with(".pending")).for_each(|d| visit(d.path()));
-        }
-        freed
+        sweep_dir(&self.dir, &self.manifests, &self.kill, &self.inflight)
     }
 
-    /// Remove the directories of older identities of the same model (another numerics epoch,
-    /// state ABI, ...): nothing can ever read them. Returns the bytes freed (logged).
+    /// Remove the directories of STALE identities of the same model: another store format
+    /// (`version`), numerics epoch, state ABI (`state=` layout) or block size. Nothing can ever
+    /// read them. Same-epoch variants (other arithmetic knobs, deep/max context modes, tiled/fa2
+    /// prefill, ubatch) are kept: another start may use them again; the global budget and the TTL
+    /// age them out (v0.1.3 integration decision). Returns the bytes freed (logged).
     pub fn orphan_sweep(&mut self) -> u64 {
         let mut freed = 0;
         let Ok(rd) = fs::read_dir(&self.root) else { return 0 };
@@ -590,7 +639,7 @@ impl StateStore {
             }
             let id = fs::read(p.join("identity.json")).ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok());
             let same_model = id.as_ref().and_then(|v| v.get("model")).and_then(Json::as_str) == Some(self.ident.model.as_str());
-            if same_model {
+            if same_model && id.as_ref().is_some_and(|v| stale_identity(v, &self.ident)) {
                 let b = dir_bytes(&p);
                 if fs::remove_dir_all(&p).is_ok() {
                     freed += b;
@@ -772,15 +821,7 @@ impl StateStore {
     }
 
     fn remove_session(&mut self, sid: &str) {
-        let gone = self.manifests.remove(sid);
-        rm(&self.kill, &self.manifest_path(sid));
-        // P2b: the session's echo file (`echo/<hint hash>.jsonl`, one scheme with echo.rs and the
-        // controller's state_cache.py) goes with the last manifest that names its hint
-        if let Some(h) = gone.and_then(|m| m.hint) {
-            if hex_name(&h, 32) && !self.manifests.values().any(|m| m.hint.as_deref() == Some(h.as_str())) {
-                rm(&self.kill, &self.dir.join("echo").join(format!("{h}.jsonl")));
-            }
-        }
+        remove_manifest_in(&self.dir, &mut self.manifests, sid, &self.kill);
     }
 
     fn free_space_ok(&self) -> bool {
@@ -800,7 +841,7 @@ impl StateStore {
         self.min_mem_bytes == 0 || (self.mem_available)().is_none_or(|m| m >= self.min_mem_bytes)
     }
 
-    fn write_allowed(&self) -> Result<(), String> {
+    pub(crate) fn write_allowed(&self) -> Result<(), String> {
         if !self.free_space_ok() {
             return Err("disk free below the floor: write skipped".into());
         }
@@ -845,10 +886,15 @@ impl StateStore {
     /// 4 MiB buffer and checksummed on the way (P2b, M2: no 63-190 MiB snapshot buffer, so the
     /// shutdown write fits under memory pressure). Returns (c, file bytes).
     pub fn write_snap<E: Engine>(&mut self, eng: &mut E, key: &str, pos: usize, snap: Option<&E::Snapshot>) -> Result<(String, u64), String> {
+        self.write_snap_c(eng, key, pos, snap, None)
+    }
+
+    /// [`StateStore::write_snap`] that gives up inside the file when `cancel` rises (v0.1.3: a request
+    /// that arrives during a snapshot write waits for at most one 4 MiB buffer, not the whole file);
+    /// the half-written `.pending` is removed and nothing is published.
+    pub fn write_snap_c<E: Engine>(&mut self, eng: &mut E, key: &str, pos: usize, snap: Option<&E::Snapshot>, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<(String, u64), String> {
         self.write_allowed()?;
-        let a = pos / BLOCK * BLOCK;
         let id = self.ident.hash.clone();
-        let rb = eng.kv_row_bytes();
         let dir = self.dir.join("snaps");
         let (_, len, sum) = atomic_stream(
             &self.kill,
@@ -858,20 +904,32 @@ impl StateStore {
             &|len, sum| header(MAGIC_SNAP, &id, pos as u64, len, sum),
             &|sum| format!("{key}.{sum:016x}.st"),
             &mut |w| {
-                w.write_all(&(((pos - a) * rb) as u64).to_le_bytes()).map_err(io)?;
-                if pos > a {
-                    eng.kv_rows_save(a, pos, w).map_err(|e| e.0)?;
-                }
-                match snap {
-                    Some(s) => eng.snap_save(s, w).map_err(|e| e.0),
-                    None => eng.snap_save_live(w).map_err(|e| e.0),
-                }
+                let mut cw = Cancellable { w, cancel };
+                snap_payload(eng, pos, snap, &mut cw)
             },
         )?;
         let bytes = HDR + len;
         self.stats.snaps_written += 1;
         self.stats.bytes_written += bytes;
         Ok((format!("{sum:016x}"), bytes))
+    }
+
+    /// v0.1.3 off-lock write: block `i` of the live state copied to RAM (checksum hex, payload; no
+    /// payload when that exact file is on disk already).
+    pub fn stage_block<E: Engine>(&self, eng: &mut E, h: &str, i: usize) -> Result<(String, Option<Vec<u8>>), String> {
+        let a = i * BLOCK;
+        let mut buf = Vec::with_capacity(BLOCK * eng.kv_row_bytes());
+        eng.kv_rows_save(a, a + BLOCK, &mut buf).map_err(|e| e.0)?;
+        let c = format!("{:016x}", check64(&buf));
+        Ok(if self.block_path(h, &c).exists() { (c, None) } else { (c, Some(buf)) })
+    }
+
+    /// v0.1.3 off-lock write: the live state's snapshot payload at `pos` (= the engine position)
+    /// copied to RAM: (checksum hex, payload), the bytes [`StateStore::write_snap`] would stream.
+    pub fn stage_snap<E: Engine>(&self, eng: &mut E, pos: usize) -> Result<(String, Vec<u8>), String> {
+        let mut buf = Vec::new();
+        snap_payload(eng, pos, None, &mut buf)?;
+        Ok((format!("{:016x}", check64(&buf)), buf))
     }
 
     /// Store / replace a session's manifest (written last: blocks and snapshots are on disk).
@@ -883,7 +941,7 @@ impl StateStore {
 
     /// Is this block file on disk (a sweep removes blocks no manifest names yet)?
     pub fn has_block(&self, h: &str, c: &str) -> bool {
-        self.block_path(h, c).is_file()
+        self.mutant == 2 || self.block_path(h, c).is_file()
     }
 
     pub fn manifest(&self, sid: &str) -> Option<&Manifest> {
@@ -958,46 +1016,193 @@ impl StateStore {
         Ok(before.saturating_sub(self.used_bytes()))
     }
 
-    /// TTL, then the budget: evict this model's sessions by value until every model's bytes fit
-    /// (other models' files are only counted: their own engine evicts them, the controller when
-    /// none runs). `keep`: a session never evicted now (the one just written). Returns bytes freed.
+    /// TTL, then the budget: evict by value until every model's bytes fit. With `global_budget`
+    /// (v0.1.3) every identity under the root is a candidate, else only this one's sessions (the
+    /// others are only counted). Order: TTL, then one value order over the optional snapshots and
+    /// whole sessions (store-depth: re-prefill lost x recency per byte still needed; a head, anchor
+    /// or cut goes only with its session); a block shared with a kept session of its identity
+    /// stays. `keep`: a session never evicted now (the one just written). Returns bytes freed.
     pub fn enforce(&mut self, keep: Option<&str>) -> u64 {
         let before = self.used_bytes();
         let now = now_s();
+        // audit v0.1.2 N3: a last use in the future (the wall clock stepped back) would read as age
+        // 0 until the clock caught up, pinning the session against TTL and budget eviction; it is
+        // last used "now" instead and ages normally from here (persisted, so a restart agrees)
+        let future: Vec<String> = self.manifests.values().filter(|m| m.atime > now).map(|m| m.sid.clone()).collect();
+        for sid in future {
+            if let Some(m) = self.manifests.get_mut(&sid) {
+                m.atime = now;
+            }
+            let _ = self.write_manifest(&self.manifests[&sid]);
+        }
         let expired: Vec<String> = self.manifests.values().filter(|m| now.saturating_sub(m.atime) > self.ttl_secs && Some(m.sid.as_str()) != keep).map(|m| m.sid.clone()).collect();
         for s in &expired {
             self.remove_session(s);
         }
         // every time (P2 review): each turn replaces the head snapshot (63-68 MiB); unswept, the
         // old ones filled the budget and whole live sessions were evicted before them
-        self.sweep();
-        let mut used = self.used_bytes();
-        while used > self.budget {
-            // value = re-prefill seconds saved per byte x recency (lowest first); pinned kept
-            let refc = self.block_refcounts();
-            let victim = self
-                .manifests
-                .values()
-                .filter(|m| Some(m.sid.as_str()) != keep && now.saturating_sub(m.atime) >= PIN_SECS)
-                .map(|m| {
-                    let own: u64 = m.blocks.iter().filter(|b| refc.get(*b).copied().unwrap_or(0) <= 1).filter_map(|(h, c)| fs::metadata(self.block_path(h, c)).ok()).map(|x| x.len()).sum::<u64>()
-                        + m.snaps.iter().map(|s| s.bytes).sum::<u64>();
-                    let age_h = now.saturating_sub(m.atime) as f64 / 3600.0;
-                    let v = cost_ms(m.n_tokens) / (own.max(1) as f64) / (1.0 + age_h);
-                    (v, m.sid.clone())
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0));
-            let Some((_, sid)) = victim else { break };
-            self.remove_session(&sid);
+        if self.mutant != 1 {
             self.sweep();
-            used = self.used_bytes();
+        }
+        let mut used = self.used_bytes();
+        if used > self.budget {
+            let mut tiers = vec![Tier { dir: self.dir.clone(), id_hash: self.ident.hash.clone(), manifests: std::mem::take(&mut self.manifests) }];
+            if self.global_budget {
+                for mut t in foreign_tiers(&self.root, &self.dir) {
+                    for m in t.manifests.values_mut().filter(|m| m.atime > now) {
+                        m.atime = now;
+                        let _ = write_manifest_in(&t.dir, &t.id_hash, m, &self.kill);
+                    }
+                    // their TTL too: an older epoch's sessions are nobody else's to expire
+                    let gone: Vec<String> = t.manifests.values().filter(|m| now.saturating_sub(m.atime) > self.ttl_secs).map(|m| m.sid.clone()).collect();
+                    for s in &gone {
+                        remove_manifest_in(&t.dir, &mut t.manifests, s, &self.kill);
+                    }
+                    if !gone.is_empty() {
+                        sweep_dir(&t.dir, &t.manifests, &self.kill, &self.inflight);
+                    }
+                    tiers.push(t);
+                }
+                used = self.used_bytes();
+            }
+            let pinned = |ti: usize, m: &Manifest| (ti == 0 && Some(m.sid.as_str()) == keep) || now.saturating_sub(m.atime) < PIN_SECS;
+            // v0.1.3 store-depth: one value order over optional snapshots and whole sessions (the
+            // v0.1.2 order thinned EVERY unpinned session, a deep recent one too, before any shallow
+            // old session went). Each step drops the item that loses the least re-prefill per byte
+            // still needed: loss = Cost(depth it saves) x recency, / min(bytes it frees, bytes over
+            // budget) (a 2.3 GB session is not dropped to free 60 MB while a 60 MB point would do).
+            // An optional snapshot saves Cost(pos) - Cost(next point below it in its session); a
+            // session saves Cost(n_tokens). A session's head (its deepest state), anchor and cut
+            // points go only with the whole session.
+            while used > self.budget {
+                let need = (used - self.budget) as f64;
+                let mut best: Option<(f64, usize, String, Option<usize>)> = None;
+                for (ti, t) in tiers.iter().enumerate() {
+                    let refc = t.refcounts();
+                    for m in t.manifests.values().filter(|m| !pinned(ti, m)) {
+                        let rec = recency(m, now);
+                        let own = t.own_bytes(m, &refc).max(1) as f64;
+                        let mut cands = vec![(cost_ms(m.n_tokens) * rec / own.min(need), None)];
+                        let head = m.snaps.iter().map(|x| x.pos).max().unwrap_or(0);
+                        for x in m.snaps.iter().filter(|x| x.pos != head && x.class != "anchor" && x.class != "cut") {
+                            let below = m.snaps.iter().map(|y| y.pos).filter(|&p| p < x.pos).max().unwrap_or(0);
+                            cands.push(((cost_ms(x.pos) - cost_ms(below)) * rec / (x.bytes.max(1) as f64).min(need), Some(x.pos)));
+                        }
+                        for (v, pos) in cands {
+                            if best.as_ref().is_none_or(|b| v < b.0) {
+                                best = Some((v, ti, m.sid.clone(), pos));
+                            }
+                        }
+                    }
+                }
+                let Some((_, ti, sid, pos)) = best else { break };
+                let t = &mut tiers[ti];
+                match pos {
+                    None => remove_manifest_in(&t.dir, &mut t.manifests, &sid, &self.kill),
+                    Some(p) => {
+                        let mut m2 = t.manifests[&sid].clone();
+                        m2.snaps.retain(|x| x.pos != p);
+                        if write_manifest_in(&t.dir, &t.id_hash, &m2, &self.kill).is_err() {
+                            break;
+                        }
+                        t.manifests.insert(sid, m2);
+                    }
+                }
+                sweep_dir(&t.dir, &t.manifests, &self.kill, &self.inflight);
+                used = self.used_bytes();
+            }
+            self.manifests = std::mem::take(&mut tiers[0].manifests);
         }
         let freed = before.saturating_sub(self.used_bytes());
         self.stats.evicted_bytes += freed;
         freed
     }
 
-    fn block_refcounts(&self) -> HashMap<(String, String), usize> {
+}
+
+fn block_path_in(dir: &Path, h: &str, c: &str) -> PathBuf {
+    dir.join("blocks").join(&h[..2]).join(format!("{h}.{c}.kv"))
+}
+
+fn snap_path_in(dir: &Path, key: &str, c: &str) -> PathBuf {
+    dir.join("snaps").join(format!("{key}.{c}.st"))
+}
+
+fn write_manifest_in(dir: &Path, id_hash: &str, m: &Manifest, k: &Kill) -> Result<(), String> {
+    atomic_write(k, &dir.join("sessions").join(format!("{}.json", m.sid)), m.to_json(id_hash).to_string().as_bytes())
+}
+
+/// Drop session `sid` of the store at `dir`: its manifest, and its echo file (`echo/<hint hash>.jsonl`,
+/// one scheme with echo.rs and the controller's state_cache.py) with the last manifest naming its hint.
+fn remove_manifest_in(dir: &Path, manifests: &mut HashMap<String, Manifest>, sid: &str, k: &Kill) {
+    let gone = manifests.remove(sid);
+    rm(k, &dir.join("sessions").join(format!("{sid}.json")));
+    if let Some(h) = gone.and_then(|m| m.hint) {
+        if hex_name(&h, 32) && !manifests.values().any(|m| m.hint.as_deref() == Some(h.as_str())) {
+            rm(k, &dir.join("echo").join(format!("{h}.jsonl")));
+        }
+    }
+}
+
+/// Delete `.pending` files and blocks / snapshots no manifest of `manifests` references, in the store
+/// at `dir`; files in `inflight` (an off-lock write on its way) are kept. Returns the bytes freed.
+fn sweep_dir(dir: &Path, manifests: &HashMap<String, Manifest>, kill: &Kill, inflight: &std::sync::Mutex<HashSet<PathBuf>>) -> u64 {
+    let mut want: HashSet<PathBuf> = HashSet::new();
+    for m in manifests.values() {
+        for (h, c) in &m.blocks {
+            want.insert(block_path_in(dir, h, c));
+        }
+        for s in &m.snaps {
+            want.insert(snap_path_in(dir, &s.key, &s.c));
+        }
+    }
+    let busy = inflight.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mut freed = 0;
+    let mut visit = |p: PathBuf| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let ours = name.ends_with(".pending") || ((name.ends_with(".kv") || name.ends_with(".st")) && !want.contains(&p));
+        if ours && !busy.contains(&p) {
+            if let Ok(md) = fs::symlink_metadata(&p) {
+                if md.is_file() && rm(kill, &p) {
+                    freed += md.len();
+                }
+            }
+        }
+    };
+    if let Ok(rd) = fs::read_dir(dir.join("blocks")) {
+        for sub in rd.flatten() {
+            if let Ok(rd2) = fs::read_dir(sub.path()) {
+                rd2.flatten().for_each(|d| visit(d.path()));
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(dir.join("snaps")) {
+        rd.flatten().for_each(|d| visit(d.path()));
+    }
+    if let Ok(rd) = fs::read_dir(dir.join("sessions")) {
+        rd.flatten().filter(|d| d.path().to_string_lossy().ends_with(".pending")).for_each(|d| visit(d.path()));
+    }
+    // audit v0.1.2 N5: an `identity.json.pending` left by a kill during open's identity write
+    if let Ok(rd) = fs::read_dir(dir) {
+        rd.flatten().filter(|d| d.path().to_string_lossy().ends_with(".pending")).for_each(|d| visit(d.path()));
+    }
+    freed
+}
+
+/// The recency weight of a session in the eviction order: 1 / (1 + hours since its last use).
+fn recency(m: &Manifest, now: u64) -> f64 {
+    1.0 / (1.0 + now.saturating_sub(m.atime) as f64 / 3600.0)
+}
+
+/// One identity's store under the root, for the global budget (v0.1.3).
+struct Tier {
+    dir: PathBuf,
+    id_hash: String,
+    manifests: HashMap<String, Manifest>,
+}
+
+impl Tier {
+    fn refcounts(&self) -> HashMap<(String, String), usize> {
         let mut r = HashMap::new();
         for m in self.manifests.values() {
             for b in &m.blocks {
@@ -1005,6 +1210,164 @@ impl StateStore {
             }
         }
         r
+    }
+
+    /// bytes only this session holds (its blocks no other session of this identity names, its snapshots)
+    fn own_bytes(&self, m: &Manifest, refc: &HashMap<(String, String), usize>) -> u64 {
+        m.blocks.iter().filter(|b| refc.get(*b).copied().unwrap_or(0) <= 1).filter_map(|(h, c)| fs::metadata(block_path_in(&self.dir, h, c)).ok()).map(|x| x.len()).sum::<u64>()
+            + m.snaps.iter().map(|s| s.bytes).sum::<u64>()
+    }
+}
+
+/// The other identities' stores under `root` (identity.json + their readable manifests; nothing is
+/// deleted while reading: a foreign file this engine cannot parse is not its to judge).
+fn foreign_tiers(root: &Path, own: &Path) -> Vec<Tier> {
+    let mut v = Vec::new();
+    let Ok(rd) = fs::read_dir(root) else { return v };
+    for de in rd.flatten() {
+        let p = de.path();
+        if p == own || !de.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let idh = fs::read(p.join("identity.json")).ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()).and_then(|j| j.get("identity_hash").and_then(Json::as_str).map(str::to_string));
+        let Some(idh) = idh.filter(|h| hex_name(h, 64)) else { continue };
+        let mut manifests = HashMap::new();
+        if let Ok(rd2) = fs::read_dir(p.join("sessions")) {
+            for d in rd2.flatten() {
+                let mp = d.path();
+                if mp.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let small = fs::symlink_metadata(&mp).is_ok_and(|m| m.is_file() && m.len() <= MAX_MANIFEST_BYTES);
+                let m = small.then(|| fs::read(&mp).ok()).flatten().and_then(|b| serde_json::from_slice::<Json>(&b).ok()).and_then(|j| Manifest::from_json(&j, &idh));
+                if let Some(m) = m.filter(|m| mp.file_stem().and_then(|s| s.to_str()) == Some(m.sid.as_str())) {
+                    manifests.insert(m.sid.clone(), m);
+                }
+            }
+        }
+        v.push(Tier { dir: p, id_hash: idh, manifests });
+    }
+    v
+}
+
+/// The snapshot payload at `pos` (the bytes after the file header): u64 KV bytes, the KV rows of the
+/// partial block from the live state, then the checkpoint's non-KV state (`snap`, or the live one).
+fn snap_payload<E: Engine>(eng: &mut E, pos: usize, snap: Option<&E::Snapshot>, w: &mut dyn Write) -> Result<(), String> {
+    let a = pos / BLOCK * BLOCK;
+    let rb = eng.kv_row_bytes();
+    w.write_all(&(((pos - a) * rb) as u64).to_le_bytes()).map_err(io)?;
+    if pos > a {
+        eng.kv_rows_save(a, pos, w).map_err(|e| e.0)?;
+    }
+    match snap {
+        Some(s) => eng.snap_save(s, w).map_err(|e| e.0),
+        None => eng.snap_save_live(w).map_err(|e| e.0),
+    }
+}
+
+/// Writer that fails as soon as `cancel` rises (a request arrived): the write in progress is given up.
+struct Cancellable<'a, 'b> {
+    w: &'a mut dyn Write,
+    cancel: Option<&'b std::sync::atomic::AtomicBool>,
+}
+
+impl Write for Cancellable<'_, '_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(std::io::Error::other("cancelled by a request"));
+        }
+        self.w.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// v0.1.3 (item 6): a state write prepared under the worker lock ([`StateStore::stage_block`],
+/// [`StateStore::stage_snap`]) and put on disk without it ([`Staged::write`]); the worker commits the
+/// manifest afterwards (`Worker::commit_staged`). Holds no engine or store reference.
+pub struct Staged {
+    pub dir: PathBuf,
+    pub id_hash: String,
+    /// (chain hash, block index, checksum hex, payload; None = that file is on disk already)
+    pub blocks: Vec<(String, usize, String, Option<Vec<u8>>)>,
+    pub head_key: String,
+    pub head_c: String,
+    pub head_payload: Vec<u8>,
+    /// the manifest to commit (blocks, the consistent snapshots of its lineage, this head)
+    pub manifest: Manifest,
+    /// ancestors the manifest absorbs (dropped at commit)
+    pub absorbed: Vec<String>,
+    /// the state written: its length and the cache epoch it was taken at
+    pub n: usize,
+    pub epoch: u64,
+    pub delay_ms: u64,
+    inflight: std::sync::Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    paths: Vec<PathBuf>,
+    /// this write's own `.pending` names (two off-lock writes of the same block never share one)
+    tag: String,
+}
+
+static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Staged {
+    /// Register the files of this write in the store's `inflight` set (sweeps keep them until
+    /// [`Staged::release`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(st: &StateStore, blocks: Vec<(String, usize, String, Option<Vec<u8>>)>, head_key: String, head_c: String, head_payload: Vec<u8>, manifest: Manifest, absorbed: Vec<String>, n: usize, epoch: u64) -> Staged {
+        let tag = format!("s{}", STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let mut paths = Vec::new();
+        for (h, _, c, data) in &blocks {
+            if data.is_some() {
+                let p = block_path_in(&st.dir, h, c);
+                paths.push(p.with_file_name(format!("{h}.{tag}.kv.pending")));
+                paths.push(p);
+            }
+        }
+        paths.push(snap_path_in(&st.dir, &head_key, &head_c));
+        paths.push(st.dir.join("snaps").join(format!("{head_key}.{tag}.st.pending")));
+        st.inflight.lock().unwrap_or_else(|p| p.into_inner()).extend(paths.iter().cloned());
+        Staged { dir: st.dir.clone(), id_hash: st.ident.hash.clone(), blocks, head_key, head_c, head_payload, manifest, absorbed, n, epoch, delay_ms: st.stage_delay_ms, inflight: st.inflight.clone(), paths, tag }
+    }
+
+    /// Write the staged blocks and the head snapshot (atomic: `.pending`, fsync, rename, directory
+    /// fsync). No worker lock is needed; returns the bytes written.
+    pub fn write(&self) -> Result<u64, String> {
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
+        let k = Kill::default();
+        let mut bytes = 0;
+        for (h, i, c, data) in &self.blocks {
+            let Some(data) = data else { continue };
+            let sub = self.dir.join("blocks").join(&h[..2]);
+            if !sub.is_dir() {
+                mkdir(&sub)?;
+                fsync_dir(&self.dir.join("blocks"));
+            }
+            let a = (i * BLOCK) as u64;
+            let name = format!("{h}.{c}.kv");
+            let (_, len, sum) = atomic_stream(&k, &sub, &format!("{h}.{}.kv", self.tag), HDR, &|len, sum| header(MAGIC_BLOCK, &self.id_hash, a, len, sum), &|_| name.clone(), &mut |w| w.write_all(data).map_err(io))?;
+            if format!("{sum:016x}") != *c {
+                return Err("staged block changed on its way to disk".into());
+            }
+            bytes += HDR + len;
+        }
+        let pos = self.n as u64;
+        let name = format!("{}.{}.st", self.head_key, self.head_c);
+        let (_, len, sum) = atomic_stream(&k, &self.dir.join("snaps"), &format!("{}.{}.st", self.head_key, self.tag), HDR, &|len, sum| header(MAGIC_SNAP, &self.id_hash, pos, len, sum), &|_| name.clone(), &mut |w| w.write_all(&self.head_payload).map_err(io))?;
+        if format!("{sum:016x}") != self.head_c {
+            return Err("staged snapshot changed on its way to disk".into());
+        }
+        Ok(bytes + HDR + len)
+    }
+
+    /// The files are named by a manifest (or given up): sweeps may take what is unnamed again.
+    pub fn release(&self) {
+        let mut s = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        for p in &self.paths {
+            s.remove(p);
+        }
     }
 }
 
@@ -1050,15 +1413,32 @@ pub fn dir_bytes(p: &Path) -> u64 {
 
 /// Which snapshot positions of a session to keep (design sec. 2): the anchor and the head always,
 /// every position in the last 16K tokens, one per ~8K down to 64K back, then one per ~32K; at
-/// most [`MAX_SNAPS`], the deepest first.
-pub fn thin(mut pos: Vec<(usize, bool)>, n: usize) -> Vec<usize> {
-    // (position, must keep)
+/// most [`MAX_SNAPS`]. See [`thin_max`].
+pub fn thin(pos: Vec<(usize, bool)>, n: usize) -> Vec<usize> {
+    thin_max(pos, n, MAX_SNAPS)
+}
+
+/// [`thin`] with a cap of `max` (`--state-snaps`). `pos` = (position, must keep). Past the cap
+/// (v0.1.3) the optional point whose removal leaves the smallest gap goes (ties: the deeper-back
+/// one), never the two newest optional points: dense recent points thin before the sparse far
+/// ones, so the worst re-prefill after an old edit stays near 32K tokens wherever `max` points can
+/// cover the session (the old rule dropped the deepest points first and left the far past bare).
+/// Returns the kept positions, deepest first.
+pub fn thin_max(mut pos: Vec<(usize, bool)>, n: usize, max: usize) -> Vec<usize> {
     pos.sort_by(|a, b| b.0.cmp(&a.0));
-    pos.dedup_by_key(|p| p.0);
-    let mut out: Vec<usize> = pos.iter().filter(|p| p.1).map(|p| p.0).collect();
+    pos.dedup_by(|a, b| {
+        if a.0 == b.0 {
+            b.1 |= a.1;
+            true
+        } else {
+            false
+        }
+    });
+    let must: Vec<usize> = pos.iter().filter(|p| p.1).map(|p| p.0).collect();
+    let mut out: Vec<usize> = must.clone();
     let mut last_kept = usize::MAX;
-    for &(p, must) in &pos {
-        if must {
+    for &(p, m) in &pos {
+        if m {
             continue;
         }
         let back = n.saturating_sub(p);
@@ -1070,10 +1450,21 @@ pub fn thin(mut pos: Vec<(usize, bool)>, n: usize) -> Vec<usize> {
     }
     out.sort_unstable_by(|a, b| b.cmp(a));
     out.dedup();
-    let must: Vec<usize> = pos.iter().filter(|p| p.1).map(|p| p.0).collect();
-    while out.len() > MAX_SNAPS {
-        // drop the shallowest optional one
-        let Some(i) = out.iter().rposition(|p| !must.contains(p)) else { break };
+    let newest: Vec<usize> = out.iter().copied().filter(|p| !must.contains(p)).take(2).collect();
+    while out.len() > max {
+        let mut best: Option<(usize, usize)> = None;
+        for i in 0..out.len() {
+            if must.contains(&out[i]) || newest.contains(&out[i]) {
+                continue;
+            }
+            let above = if i == 0 { n.max(out[0]) } else { out[i - 1] };
+            let below = if i + 1 < out.len() { out[i + 1] } else { 0 };
+            let gap = above - below;
+            if best.is_none_or(|(g, _)| gap <= g) {
+                best = Some((gap, i));
+            }
+        }
+        let Some((_, i)) = best else { break };
         out.remove(i);
     }
     out

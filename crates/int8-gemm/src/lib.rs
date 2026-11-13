@@ -125,7 +125,13 @@ unsafe impl Sync for AlignedBytes {}
 impl AlignedBytes {
     pub fn zeroed(len: usize) -> AlignedBytes {
         if len == 0 {
-            return AlignedBytes { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 };
+            // A 64-aligned dangling pointer (not `NonNull::<u8>::dangling()`, which is 1-aligned):
+            // `Packed::scales` views this buffer as `&[f32]`, and even an empty slice needs an
+            // aligned pointer (a `Packed` with n = 0 has empty buffers).
+            #[allow(dead_code)]
+            #[repr(C, align(64))]
+            struct Align64([u8; 64]);
+            return AlignedBytes { ptr: std::ptr::NonNull::<Align64>::dangling().cast::<u8>().as_ptr(), len: 0 };
         }
         let layout = std::alloc::Layout::from_size_align(len, 64).expect("layout");
         // SAFETY: len > 0.
@@ -587,3 +593,7 @@ pub mod fattn;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_v013_review.rs"]
+mod tests_v013_review;

@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // F-CI9: `| head` ends with status 0, not a core dump
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = argv.first().cloned().unwrap_or_default();
     let a = Args::parse(&argv[1.min(argv.len())..]);

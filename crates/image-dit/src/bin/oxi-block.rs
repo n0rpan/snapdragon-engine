@@ -329,6 +329,7 @@ fn bench(args: &[String]) -> i32 {
 }
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // G-EPIPE-OXI (F-CI9): `| head` ends with status 0, not a core dump
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("selftest") => selftest(&args[1..]),

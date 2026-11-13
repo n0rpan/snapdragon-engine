@@ -1090,9 +1090,15 @@ fn load_conv(t: &mut Tensors, base: &str, k: usize) -> Result<Conv, String> {
         &[co, ci] if k == 1 => (co, ci),
         _ => return Err(format!("vae: {base}.weight shape {shape:?}, expected [co, ci, {k}, {k}]")),
     };
+    // `from_tensors` is public: the value vectors must match their shapes, because the kernels
+    // read weights, biases and norm parameters through raw pointers sized by the shapes
+    // (Winograd output transform, GroupNorm apply).
+    if w.len() != cout * cin * k * k {
+        return Err(format!("vae: {base}.weight has {} values, shape {shape:?} needs {}", w.len(), cout * cin * k * k));
+    }
     let (bshape, b) = take(t, &format!("{base}.bias"))?;
-    if bshape != [cout] {
-        return Err(format!("vae: {base}.bias shape {bshape:?}, expected [{cout}]"));
+    if bshape != [cout] || b.len() != cout {
+        return Err(format!("vae: {base}.bias shape {bshape:?} with {} values, expected [{cout}]", b.len()));
     }
     Ok(Conv::new(w, b, cout, cin, k))
 }
@@ -1100,8 +1106,8 @@ fn load_conv(t: &mut Tensors, base: &str, k: usize) -> Result<Conv, String> {
 fn load_norm(t: &mut Tensors, base: &str) -> Result<Norm, String> {
     let (ws, w) = take(t, &format!("{base}.weight"))?;
     let (bs, b) = take(t, &format!("{base}.bias"))?;
-    if ws.len() != 1 || bs != ws {
-        return Err(format!("vae: {base} norm shapes {ws:?} / {bs:?}"));
+    if ws.len() != 1 || bs != ws || w.len() != ws[0] || b.len() != ws[0] {
+        return Err(format!("vae: {base} norm shapes {ws:?} / {bs:?} with {} / {} values", w.len(), b.len()));
     }
     Ok(Norm { w, b })
 }

@@ -29,6 +29,11 @@
 //! oxi cond-put ... --te-gguf TE.gguf [--te-backend cpu-f32|cpu-q8|npu ...] | --te-ctx CTX.f32   (native text encoder:
 //!      the entry's context comes from the Rust encoder, pe/sigmas from the hand-over; the JSON also
 //!      reports the agreement with the hand-over's own context)
+//! oxi cond-native --te-gguf TE.gguf --gguf DIT --prompt-file F --width W --height H [--steps 4] [--cache DIR]
+//!      [--te-backend cpu-ggml|npu ...] [--max-tokens 512] [--threads N]   (new prompt without sd-cli:
+//!      native context + native pe + computed sigmas, stored under the encoder-identity key)
+//! oxi generate --cond-prompt-file ... [--cond-encoder ID | --te-gguf TE --te-arith cpu-ggml|npu-fp16|...]
+//!      (reads the entry of that encoder; without them the legacy sd.cpp hand-over entry)
 //! oxi te-check --te-gguf TE.gguf --prompt-file F --handoff DIR [--te-backend ...] [--threads N]
 //!      [--gate-cos 0.999] [--gate-rel 0.05] [--te-ref REF.f32 [--gate-slack 1.0]] [--te-out CTX.f32] [--json FILE]
 //! ```
@@ -57,6 +62,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // G-EPIPE-OXI (F-CI9): `| head` ends with status 0, not a core dump
     if let Err(e) = real_main() {
         eprintln!("oxi: {e}");
         std::process::exit(1);
@@ -76,10 +82,12 @@ fn real_main() -> Result<(), String> {
         "verify" => cmd_verify(&args),
         "drift-probe" => cmd_drift_probe(&args),
         "act-stats" => cmd_act_stats(&args),
+        "chan-calib" => cmd_chan_calib(&args),
         "txt-stats" => cmd_txt_stats(&args),
         "vae-decode" => cmd_vae_decode(&args),
         "compare" => cmd_compare(&args),
         "te-check" => cmd_te_check(&args),
+        "cond-native" => cmd_cond_native(&args),
         _ => Err(usage()),
     }
 }
@@ -785,6 +793,8 @@ struct CondArgs {
     height: usize,
     steps: usize,
     root: PathBuf,
+    /// encoder identity of the entry (`None` = legacy sd.cpp hand-over context)
+    encoder: Option<String>,
 }
 
 fn cond_args(a: &Args, prompt_flag: &str) -> Result<CondArgs, String> {
@@ -811,7 +821,94 @@ fn cond_args(a: &Args, prompt_flag: &str) -> Result<CondArgs, String> {
         height,
         steps: a.usize_or("steps", 4)?,
         root,
+        encoder: encoder_arg(a)?,
     })
+}
+
+/// `--cond-encoder ID`, or `--te-gguf F --te-arith A` (the identity computed without loading the
+/// model): which encoder namespace of the conditioning cache to use. Neither = legacy entries.
+fn encoder_arg(a: &Args) -> Result<Option<String>, String> {
+    match (a.opt("cond-encoder"), a.opt("te-arith")) {
+        (Some(_), Some(_)) => Err("--cond-encoder and --te-arith exclude each other".into()),
+        (Some(id), None) => Ok(Some(id.to_string())),
+        (None, Some(ar)) => Ok(Some(qwen3_te::encoder_identity(Path::new(a.req("te-gguf")?), ar)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The identity an encoding run writes under; an explicit `--cond-encoder`/`--te-arith` must agree.
+fn run_identity(ca: &CondArgs, te: &Path, arith: &str) -> Result<String, String> {
+    let id = qwen3_te::encoder_identity(te, arith)?;
+    match &ca.encoder {
+        Some(e) if *e != id => Err(format!("--cond-encoder/--te-arith '{e}' disagrees with this run's encoder '{id}'")),
+        _ => Ok(id),
+    }
+}
+
+fn key_inputs(ca: &CondArgs) -> KeyInputs<'_> {
+    KeyInputs {
+        prompt: &ca.prompt,
+        model_name: &ca.model_name,
+        model_size: ca.model_size,
+        width: ca.width,
+        height: ca.height,
+        steps: ca.steps,
+        encoder: ca.encoder.as_deref(),
+    }
+}
+
+/// Native conditioning for a new prompt, no sd-cli: context from the Rust text encoder, RoPE table
+/// from `pe::flux2_pe` (bit-identical to sd.cpp's `dump.pe` on the s42/s43/s44 hand-overs) and the
+/// ported FLUX.2 sigmas. Stored under the encoder-identity key. Exit 4 (keep sd-cli) for prompts
+/// outside the native subset or longer than `--max-tokens` (default 512, the gated n_txt).
+/// Encoder sessions are released before the entry is written; the DiT runs in a later process.
+fn cmd_cond_native(a: &Args) -> Result<(), String> {
+    let mut ca = cond_args(a, "prompt-file")?;
+    let te = PathBuf::from(a.req("te-gguf")?);
+    let grid = latent::grid_for(ca.width, ca.height)?;
+    let max_n = a.usize_or("max-tokens", 512)?;
+    let backend = qwen3_te::backend_from_opts(&|k| a.opt(k).map(str::to_string))?;
+    let id = run_identity(&ca, &te, &backend.arith())?;
+    ca.encoder = Some(id.clone());
+    let text = match std::str::from_utf8(&ca.prompt) {
+        Ok(t) => t.to_string(),
+        Err(_) => needs_reference("prompt is not UTF-8"),
+    };
+    eprintln!("oxi: te: encoding ({})", backend.arith());
+    let out = match qwen3_te::encode_prompt(&te, &text, backend, a.usize_or("threads", 12)?, max_n) {
+        Ok(o) => o,
+        Err(qwen3_te::TeError::NeedsReference(s)) => needs_reference(&s),
+        Err(qwen3_te::TeError::Other(e)) => return Err(format!("text encoder: {e}")),
+    };
+    eprintln!(
+        "oxi: te: released; dma_allocated_bytes {} hwm_kib {}",
+        out.summary["dma_allocated_bytes"], out.summary["host"]["hwm_kib"]
+    );
+    let n_img = grid.0 * grid.1;
+    let full = schedule::flux2_sigmas(ca.steps as u32, n_img);
+    let c = Conditioning {
+        n_txt: out.n,
+        n_img,
+        grid,
+        ctx_dim: out.ctx_dim,
+        pe_half: image_flow::pe::pe_half(),
+        pe: image_flow::pe::flux2_pe(out.n, grid),
+        txt: out.ctx,
+        sigmas: full[..ca.steps].to_vec(),
+    };
+    let kin = key_inputs(&ca);
+    let entry = cond_cache::put(&ca.root, &kin, &c)?;
+    write_json(
+        a,
+        &json!({
+            "key": cond_cache::cache_key(&kin),
+            "entry": entry.display().to_string(),
+            "encoder": id,
+            "width": ca.width, "height": ca.height, "steps": ca.steps,
+            "n_txt": c.n_txt, "n_img": n_img,
+            "text_encoder": out.summary,
+        }),
+    )
 }
 
 fn cmd_cond_put(a: &Args) -> Result<(), String> {
@@ -829,14 +926,27 @@ fn cmd_cond_put(a: &Args) -> Result<(), String> {
                 return Err(format!("--te-ctx: {} values, the hand-over context has {}", v.len(), h.txt.len()));
             }
             h.txt = v;
+            // provenance of an externally computed context: the caller names it, or its content hash
+            let id = match &ca.encoder {
+                Some(e) => e.clone(),
+                None => format!("context-file;{}", image_flow::sha256::hex(&image_flow::sha256::sha256(&std::fs::read(p).map_err(|e| e.to_string())?))),
+            };
+            ca.encoder = Some(id);
             Some(json!({"context_file": p}))
         }
         (Some(te), None) => {
+            let arith = qwen3_te::backend_from_opts(&|k| a.opt(k).map(str::to_string))?.arith();
+            ca.encoder = Some(run_identity(&ca, Path::new(te), &arith)?);
             let (out, rep) = native_context(a, Path::new(te), &ca.prompt, &h)?;
             h.txt = out.ctx;
             Some(json!({"summary": out.summary, "vs_handoff": rep}))
         }
-        (None, None) => None,
+        (None, None) => {
+            if ca.encoder.is_some() {
+                return Err("--cond-encoder/--te-arith without --te-gguf or --te-ctx: a hand-over context is legacy".into());
+            }
+            None
+        }
     };
     // --sigmas stored (default): the entry describes the hand-over's own steps.
     // --sigmas computed: a partial hand-over (sd-cli stopped after model call 0, IMG-SHIP); the entry
@@ -849,14 +959,7 @@ fn cmd_cond_put(a: &Args) -> Result<(), String> {
         "computed" => true,
         other => return Err(format!("--sigmas must be stored or computed, got '{other}'")),
     };
-    let kin = KeyInputs {
-        prompt: &ca.prompt,
-        model_name: &ca.model_name,
-        model_size: ca.model_size,
-        width: ca.width,
-        height: ca.height,
-        steps: ca.steps,
-    };
+    let kin = key_inputs(&ca);
     let entry = if partial {
         cond_cache::put_from_partial_handoff(&ca.root, &kin, &h)?
     } else {
@@ -873,6 +976,7 @@ fn cmd_cond_put(a: &Args) -> Result<(), String> {
             "steps": ca.steps,
             "n_txt": h.n_txt,
             "n_img": h.n_img,
+            "encoder": ca.encoder.as_deref().unwrap_or(cond_cache::LEGACY_ENCODER),
             "text_encoder": te,
         }),
     )
@@ -892,7 +996,7 @@ fn native_context(a: &Args, te: &Path, prompt: &[u8], h: &Handoff) -> Result<(qw
     };
     let backend = qwen3_te::backend_from_opts(&|k| a.opt(k).map(str::to_string))?;
     let threads = a.usize_or("threads", 12)?;
-    let out = match qwen3_te::encode_prompt(te, text, backend, threads) {
+    let out = match qwen3_te::encode_prompt(te, text, backend, threads, 0) {
         Ok(o) => o,
         Err(qwen3_te::TeError::NeedsReference(s)) => needs_reference(&s),
         Err(qwen3_te::TeError::Other(e)) => return Err(format!("text encoder: {e}")),
@@ -955,14 +1059,7 @@ fn cmd_generate_cond(a: &Args) -> Result<(), String> {
     let ca = cond_args(a, "cond-prompt-file")?;
     latent::grid_for(ca.width, ca.height)?;
     let seed: u64 = a.req("seed")?.parse().map_err(|_| "--seed must be an integer".to_string())?;
-    let kin = KeyInputs {
-        prompt: &ca.prompt,
-        model_name: &ca.model_name,
-        model_size: ca.model_size,
-        width: ca.width,
-        height: ca.height,
-        steps: ca.steps,
-    };
+    let kin = key_inputs(&ca);
     let key = cond_cache::cache_key(&kin);
     let cond: Conditioning = match cond_cache::get(&ca.root, &kin)? {
         Some(c) => c,
@@ -1127,6 +1224,80 @@ fn cmd_act_stats(a: &Args) -> Result<(), String> {
     println!("{text}");
     if let Some(p) = a.opt("json") {
         std::fs::write(p, &text).map_err(|e| format!("{p}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `oxi chan-calib --handoff DIR[,DIR...] [--chunk 256] [--blocks 20] [--slack 0.10] --out FILE`:
+/// static channel calibration of the single blocks' linear1 input for a coarse scale chunk (F94 /
+/// F-IMG-256, `image_flow::chancalib`). Uses every dumped call of `dump.single.{b}.in` (+ the
+/// shared single-block modulation) in every hand-over; even tokens calibrate, odd tokens are the
+/// held-out check. Reads only the hand-over files; no model is loaded. The record holds no paths
+/// and no prompt-derived text (sources are SHA-256 of the dumped tensors).
+fn cmd_chan_calib(a: &Args) -> Result<(), String> {
+    use image_flow::actstats::modulated;
+    use image_flow::chancalib::{plan_operand, record, ChanAccum};
+    use image_flow::handoff::read_tag_call;
+    let chunk = a.usize_or("chunk", 256)?;
+    let blocks = a.usize_or("blocks", 20)?;
+    let slack: f64 = match a.opt("slack") {
+        None => 0.10,
+        Some(s) => s.parse().map_err(|_| format!("--slack: '{s}' is not a number"))?,
+    };
+    if !(0.0..=1.0).contains(&slack) {
+        return Err("--slack must be within 0..1".into());
+    }
+    let out = a.req("out")?;
+    let dirs: Vec<&str> = a.req("handoff")?.split(',').filter(|d| !d.is_empty()).collect();
+    let mut plans = Vec::new();
+    let mut sources = Vec::new();
+    for b in 0..blocks {
+        let tag = format!("dump.single.{b}.in");
+        let (mut cal, mut hold, mut n_hold, mut h_seen) = (None::<ChanAccum>, Vec::new(), 0usize, 0usize);
+        for d in &dirs {
+            let dir = Path::new(d);
+            for call in 0..64 {
+                let (x, shift, scale) = match (read_tag_call(dir, &tag, call)?, read_tag_call(dir, "dump.single.mod.shift", call)?, read_tag_call(dir, "dump.single.mod.scale", call)?) {
+                    (Some(x), Some(sh), Some(sc)) => (x, sh, sc),
+                    _ => break,
+                };
+                let (h, n) = (x.ne[0], x.ne[1]);
+                if shift.data.len() != h || scale.data.len() != h || x.data.len() != n * h || (h_seen != 0 && h != h_seen) {
+                    return Err(format!("block {b} call {call}: unexpected dump shapes"));
+                }
+                h_seen = h;
+                let bytes: Vec<u8> = x.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                sources.push(image_flow::sha256::hex(&image_flow::sha256::sha256(&bytes)));
+                let xm = modulated(&x.data, n, h, &shift.data, &scale.data);
+                let acc = cal.get_or_insert_with(|| ChanAccum::new(h));
+                for t in 0..n {
+                    let row = &xm[t * h..(t + 1) * h];
+                    if t % 2 == 0 {
+                        acc.add(row, 1)?;
+                    } else {
+                        hold.extend_from_slice(row);
+                        n_hold += 1;
+                    }
+                }
+            }
+        }
+        match cal {
+            Some(c) if n_hold > 0 => plans.push(plan_operand(&format!("single.{b}.lin1_in"), &c, &hold, n_hold, chunk, slack)?),
+            _ => {
+                if b == 0 {
+                    return Err("no dump.single.0.in with its modulation dumps in these hand-overs".into());
+                }
+                break;
+            }
+        }
+    }
+    let rec = record(chunk, slack, &plans, &sources);
+    let text = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
+    std::fs::write(out, &text).map_err(|e| format!("{out}: {e}"))?;
+    let met = plans.iter().filter(|p| p.meets_target).count();
+    println!("chan-calib: {} operands, {met} meet the chunk-32 target at chunk {chunk}; record written", plans.len());
+    for p in &plans {
+        println!("  {}: {} (meets_target {})", p.name, p.arrange, p.meets_target);
     }
     Ok(())
 }

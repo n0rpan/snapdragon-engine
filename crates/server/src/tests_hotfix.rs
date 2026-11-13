@@ -14,7 +14,7 @@ use tokenizer::gguf_meta::Meta;
 const TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
 /// 256 byte tokens (GPT-2 byte mapping), `<|im_start|>` = 256, `<|im_end|>` = 257 (EOS).
-fn synthetic_tokenizer() -> tokenizer::Tokenizer {
+pub(crate) fn synthetic_tokenizer() -> tokenizer::Tokenizer {
     let table = tokenizer::unicode::byte_to_cpt_table();
     let mut toks: Vec<Meta> = table.iter().map(|c| Meta::Str(c.to_string())).collect();
     let mut types: Vec<Meta> = vec![Meta::Int(1); 256];
@@ -230,7 +230,7 @@ fn post(port: u16, path: &str, headers: &[&str], body: &Json) -> (u16, String, S
 }
 
 /// Start the HTTP front end on an ephemeral loopback port (default access rules, or `access`).
-fn start(st: Arc<State<StubEngine>>, access: Option<Access>) -> (u16, tokio::runtime::Runtime) {
+pub(crate) fn start(st: Arc<State<StubEngine>>, access: Option<Access>) -> (u16, tokio::runtime::Runtime) {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let l = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = l.local_addr().unwrap().port();
@@ -324,6 +324,20 @@ fn key_file_and_compare_rules() {
     assert!(!http::ct_eq(b"abc", b"abcd"));
     assert!(!http::ct_eq(b"", b"a"));
     assert!(http::ct_eq(b"", b""));
+}
+
+#[test]
+fn non_loopback_bind_needs_a_key() {
+    for h in ["127.0.0.1", "127.1.2.3", "::1", "[::1]", "localhost", "LocalHost", " 127.0.0.1 "] {
+        assert!(http::bind_is_loopback(h), "{h}");
+        assert!(http::check_bind(h, false).is_ok(), "{h}");
+    }
+    for h in ["0.0.0.0", "::", "[::]", "192.0.2.20", "198.51.100.5", "fe80::1", "myhost.lan", "", "localhost.evil.example"] {
+        assert!(!http::bind_is_loopback(h), "{h}");
+        let e = http::check_bind(h, false).unwrap_err();
+        assert!(e.contains("--api-key-file"), "{e}");
+        assert!(http::check_bind(h, true).is_ok(), "{h} with a key");
+    }
 }
 
 #[test]

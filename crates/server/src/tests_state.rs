@@ -219,7 +219,7 @@ async fn truncated_or_corrupt_files_are_rejected_and_the_request_still_answers()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn another_identity_is_never_used_and_older_identities_are_orphaned() {
+async fn another_identity_is_never_used_and_same_epoch_variants_are_kept() {
     let tok = synth_tokenizer();
     let dir = tmp("ident");
     let a = server(&dir, vec![tok.encode("Answer one.", false, true)], ident("sha256:m", ""), 1 << 40);
@@ -232,10 +232,11 @@ async fn another_identity_is_never_used_and_older_identities_are_orphaned() {
     assert_eq!(r["timings"]["cache_n"].as_u64().unwrap(), 0, "another model's state is never used");
     assert!(dir.join(&old_key).is_dir(), "another model's directory stays");
     drop(other);
-    // the same model under another arithmetic mode (or numerics epoch): the old directory is an
-    // orphan nobody can read: removed at start, and nothing of it is used
+    // the same model under another arithmetic mode: never used; since v0.1.3 the directory is
+    // kept (same numerics epoch and state ABI: a later start may use it again; budget/TTL age it
+    // out). A stale epoch / ABI is removed: tests_v013_int.
     let c = server(&dir, vec![tok.encode("Tiled.", false, true)], ident("sha256:m", "OXE_ATTN=tiled"), 1 << 40);
-    assert!(!dir.join(&old_key).exists(), "older identity of the same model removed");
+    assert!(dir.join(&old_key).is_dir(), "a same-epoch variant of the same model is kept");
     let r = chat(&c, json!([{"role":"system","content":sys()},{"role":"user","content":"q"},{"role":"assistant","content":"Answer one."},{"role":"user","content":"more"}])).await;
     assert_eq!(r["timings"]["cache_n"].as_u64().unwrap(), 0);
     let _ = std::fs::remove_dir_all(&dir);
@@ -322,6 +323,54 @@ fn ttl_expires_sessions() {
     let s2 = open(&dir, ident("sha256:m", ""), 1 << 40);
     assert!(s2.manifests.is_empty(), "sessions unused for longer than the TTL are gone");
     assert!(files(&dir, ".kv").is_empty() && files(&dir, ".st").is_empty(), "and their files");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_sweeps_a_left_over_identity_pending() {
+    // audit v0.1.2 N5: a kill during the identity.json write leaves identity.json.pending in the
+    // identity directory (not in sessions/, blocks/ or snaps/, which the sweep already covered)
+    let dir = tmp("idpending");
+    let s = open(&dir, ident("sha256:m", ""), 1 << 40);
+    let p = s.dir.join("identity.json.pending");
+    drop(s);
+    std::fs::write(&p, b"{\"half\":").unwrap();
+    let s = open(&dir, ident("sha256:m", ""), 1 << 40);
+    assert!(!p.exists(), "a stale identity.json.pending is swept at open");
+    assert!(s.dir.join("identity.json").is_file(), "the identity itself stays");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_backward_clock_step_does_not_pin_sessions() {
+    // audit v0.1.2 N3: a last use stamped in the future (the clock stepped back since) used to read
+    // as age 0, so the session was pinned against TTL and budget eviction until the clock caught up
+    let dir = tmp("clockstep");
+    let mut w = fill(&dir, 1 << 40, &[600, 3000]);
+    let s = w.states.as_mut().unwrap();
+    let ten_years = 10 * 365 * 24 * 3600;
+    let sids: Vec<String> = s.manifests.keys().cloned().collect();
+    for sid in &sids {
+        let mut m = s.manifests[sid].clone();
+        m.atime = crate::state_store::now_s() + ten_years;
+        s.put_manifest(m).unwrap();
+    }
+    s.enforce(None);
+    let now = crate::state_store::now_s();
+    assert!(s.manifests.values().all(|m| m.atime <= now), "a future last use is clamped to now");
+    // pinned only for the usual 10 minutes from now: once that passes, the budget applies again
+    for sid in &sids {
+        let mut m = s.manifests[sid].clone();
+        m.atime -= 3600;
+        s.put_manifest(m).unwrap();
+    }
+    let used = s.used_bytes();
+    assert!(s.set_budget(used - 1) > 0 && s.manifests.len() == 1, "an aged session is evictable again");
+    // the clamp is on disk: a re-open (which also enforces) sees no future last use either
+    drop(w);
+    let s2 = open(&dir, ident("sha256:m", ""), 1 << 40);
+    let now = crate::state_store::now_s();
+    assert!(!s2.manifests.is_empty() && s2.manifests.values().all(|m| m.atime <= now));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

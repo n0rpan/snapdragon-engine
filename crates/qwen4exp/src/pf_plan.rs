@@ -419,16 +419,28 @@ impl CacheDecision {
     }
 
     /// One JSON object for the controller's status (`flash_cache` field): chosen tier, reason, preference, margins.
+    /// F127-3: the memory-guard mode this decision implies for the controller, known before the model loads:
+    /// `swap-tolerant` (an explicit 20 / 18 preference admitted by the MemTotal rule), `memavailable` (every other
+    /// admitted tier: the 1 GiB host floor) or `refuse`.
+    pub fn swap_guard_mode(&self) -> &'static str {
+        match (self.cache_gib, self.reason) {
+            (None, _) => "refuse",
+            (Some(_), CacheReason::PreferredSwapTolerant) => "swap-tolerant",
+            (Some(_), _) => "memavailable",
+        }
+    }
+
     pub fn status_json(&self) -> String {
         let num = |x: f64| if x.is_finite() { format!("{x:.4}") } else { "null".into() };
         let opt = |x: Option<f64>| x.map_or("null".to_string(), |v| format!("{v:.0}"));
         let needs: Vec<String> = self.needs_gib.iter().map(|&n| num(n)).collect();
         let tiers: Vec<String> = AUTO_CACHE_GIB.iter().map(|&c| format!("{c:.0}")).collect();
         format!(
-            "{{\"cache_gib\":{},\"pref_gib\":{},\"reason\":\"{}\",\"refuse\":{},\"margin_gib\":{},\"mem_available_gib\":{},\"tiers_gib\":[{}],\"needs_gib\":[{}]}}",
+            "{{\"cache_gib\":{},\"pref_gib\":{},\"reason\":\"{}\",\"swap_guard\":\"{}\",\"refuse\":{},\"margin_gib\":{},\"mem_available_gib\":{},\"tiers_gib\":[{}],\"needs_gib\":[{}]}}",
             opt(self.cache_gib),
             opt(self.pref_gib),
             self.reason.as_str(),
+            self.swap_guard_mode(),
             self.cache_gib.is_none(),
             num(self.margin_gib),
             num(self.mem_available_gib),

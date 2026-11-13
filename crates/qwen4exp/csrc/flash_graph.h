@@ -111,6 +111,8 @@ int fg_selftest_fuse_gdn(int nth);
 int fg_selftest_fuse_attn(int nth);
 // chunked-prefill split test: which components differ between one chunk and split chunks (flash_split_test.inc)
 int fg_selftest_split(int nth);
+// F87: per (type, width) bitwise columns of a w-column mul_mat vs 1-column calls (flash_mmcols_test.inc)
+int fg_selftest_mm_cols(int nth, int max_w, int * bitwise_out, double * maxd_out);
 // model-free dense matvec bandwidth bench at Flash's shapes (prints one line per call)
 void fg_bench_dense(int nth, int copies, int reps);
 void fg_ctx_exec_stats(const fg_ctx * c, double * out3);
@@ -137,6 +139,7 @@ size_t fg_ctx_recurrent_bytes(const fg_ctx * c);
 // compact whole state at position pos (KV/indexer rows < pos + recurrent), for persistence
 size_t fg_ctx_compact_bytes(fg_ctx * c, uint32_t pos);
 void fg_ctx_save_compact(fg_ctx * c, void * buf);                    // at the current position
+int fg_ctx_save_compact_cb(fg_ctx * c, int (*cb)(void * user, const char * data, size_t n), void * user);  // same bytes, streamed
 int fg_ctx_load_compact(fg_ctx * c, const void * buf, uint32_t pos);  // then fg_ctx_set_tokens
 void fg_ctx_save_recurrent(const fg_ctx * c, void * buf);
 int fg_ctx_restore_recurrent(fg_ctx * c, const void * buf, uint32_t pos);

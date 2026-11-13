@@ -222,6 +222,7 @@ struct fg_ctx {
 #include "flash_fuse_gdn.inc"
 #include "flash_fuse_attn.inc"
 #include "flash_split_test.inc"  // chunked-prefill split test (model-free, fg_selftest_split)
+#include "flash_mmcols_test.inc"  // F87: mul_mat w columns vs 1 column (model-free, fg_selftest_mm_cols)
 
 namespace {
 
@@ -1869,6 +1870,15 @@ size_t fg_ctx_compact_bytes(fg_ctx * c, uint32_t pos) {
 void fg_ctx_save_compact(fg_ctx * c, void * buf) {
     char * p = (char *) buf;
     compact_walk(c, (uint32_t) c->toks.size(), [&](char * d, size_t b) { std::memcpy(p, d, b); p += b; });
+}
+// FP-2 (v0.1.3): the bytes of fg_ctx_save_compact region by region through `cb` (no buffer of the whole state);
+// stops at the first non-zero return of `cb` and returns it.
+int fg_ctx_save_compact_cb(fg_ctx * c, int (*cb)(void * user, const char * data, size_t n), void * user) {
+    int rc = 0;
+    compact_walk(c, (uint32_t) c->toks.size(), [&](char * d, size_t b) {
+        if (rc == 0) rc = cb(user, d, b);
+    });
+    return rc;
 }
 int fg_ctx_load_compact(fg_ctx * c, const void * buf, uint32_t pos) {
     if (pos > c->n_ctx) return -1;

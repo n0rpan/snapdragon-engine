@@ -14,7 +14,7 @@ fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let inc = std::env::var("FASTRPC_INC").unwrap_or_else(|_| {
         panic!(
-            "oxn: the `device` feature needs FASTRPC_INC=<dir> (the open-source qualcomm/fastrpc inc/ dir with remote.h and AEEStdErr.h)"
+            "oxn: the `device` feature needs FASTRPC_INC=<dir> (the open-source FastRPC ABI include directory)"
         )
     });
     cc::Build::new()

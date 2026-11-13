@@ -39,9 +39,13 @@ use std::sync::Mutex;
 
 pub mod fattn;
 mod kv8;
+pub mod pfattn;
 mod prefill;
 pub use kv8::{KvType, PvMode};
+pub use pfattn::{AutoPolicy, PfAttn, PfKernel, PfPath};
 use kv8::Kv8Scratch;
+#[cfg(any(test, feature = "f32-reference"))]
+pub use prefill::{head_logits, PfCounts};
 pub use prefill::{group_by_size, pf_group, pf_group_for, pf_group_unaligned, set_pf_group_unaligned, pf_group_thresholds, pf_tiles, set_pf_group_thresholds, PF_GROUP_T1_DEFAULT, PF_TILES_DEFAULT, prefill_rows_hist, reset_prefill_rows_hist, set_pf_group, set_pf_tiles, PfProfile, PF_ATTN_PAD, PF_ATTN_PB, PF_ATTN_TT8, PF_CONV_FUSE, PF_DYN_SPLIT, PF_F32_CU8, PF_GDN_X4, PF_MMID_GEMV1, PF_MMID_TILE, PF_PHASES, PF_Q6K_TILE, PF_SUBS, PF_TILE_DENSE, PF_WAIT_DIET, UBATCH};
 
 /// CACHE-PERFECT P2: the numerics epoch in the state cache's identity (server `state_store`).
@@ -90,6 +94,15 @@ pub fn kernel_path() -> String {
 /// Default decode cutoff for the tiled attention (padded n_kv); below it the per-head path
 /// (fewer barriers) is faster at short context. Codex: Qwen3.6 1K decode -12 % tiled.
 pub const ATTN_TILED_MIN_KV: usize = 4096;
+
+/// O70-KEEP: default decode cutoff of the fused attention (padded n_kv, `OXE_ATTN_FUSED_MIN_KV`),
+/// its own knob now (it rode `OXE_ATTN_TILED_MIN_KV` before); the same value, so multi-lane runs
+/// behave as before by default.
+pub const ATTN_FUSED_MIN_KV: usize = 4096;
+/// O70-POLICY: single-lane runs take the fused attention only from this padded n_kv
+/// (`OXE_ATTN_FUSED_1LANE_MIN_KV`). Codex's chunk-256 numbers: one lane -2.6% at 8K, +2.4% at 32K,
+/// while 2-lane verify gains 30-33% at 6-8K; so below 16K one lane stays on the tiled kernel.
+pub const ATTN_FUSED_1LANE_MIN_KV: usize = 16_384;
 
 /// Most tokens one run can carry (verify width; MTP catch-up + draft lane).
 pub const MAX_LANES: usize = 8;
@@ -433,6 +446,17 @@ pub struct Engine<'a> {
     /// (KV head, chunk) partial outputs and (max, sum) pairs, see [`fattn`]
     attn_fused: bool,
     attn_fused_ch: usize,
+    /// fused cutoffs (padded n_kv): any run / single-lane runs (O70-KEEP, O70-POLICY)
+    attn_fused_min_kv: usize,
+    attn_fused_min_kv1: usize,
+    /// PREFILL-LONG: prefill attention kernel choice (`OXE_PF_ATTN`) and the threads that take
+    /// attention-core units in prefill (`OXE_PF_ATTN_THREADS`, 0 = all)
+    pf_attn: pfattn::PfAttn,
+    /// PREFILL-POLICY: what `auto` resolves to (`OXE_PF_ATTN_AUTO_MIN_KV` / `_KERNEL`)
+    pf_auto: pfattn::AutoPolicy,
+    /// APPEND-PREFILL: fa2x kernel parameters (`OXE_PF_FA2X_FOLD` / `OXE_PF_FA2X_CH`)
+    pf_xparams: pfattn::XParams,
+    pf_attn_threads: usize,
     fpart: Raw<f32>,
     fml: Raw<f32>,
     /// test hook: int8 decode attention through the straightforward f32 reference
@@ -446,6 +470,20 @@ pub struct Engine<'a> {
     /// tests: scale the fused attention output by (1 + this) (a deliberately degraded fused path)
     #[cfg(test)]
     fused_degrade: f32,
+    /// O-117 quality runner (bench / tests, `oxe fused-ref --candidate prefill-*`): batched
+    /// prefill attention through the f32-attention reference over the same q and stored f16 KV
+    #[cfg(any(test, feature = "f32-reference"))]
+    pf_ref: bool,
+    /// O-117: after each batched prefill attention core, compare the gated outputs of these
+    /// absolute positions with the f32-attention reference on the same inputs
+    #[cfg(any(test, feature = "f32-reference"))]
+    pf_check: Option<prefill::PfCheck>,
+    /// O-117: batched-prefill evidence counters (passes, rows, attention units per kernel)
+    #[cfg(any(test, feature = "f32-reference"))]
+    pf_ctr: prefill::PfCounters,
+    /// tests: scale the fa2 / fa2x prefill unit outputs by (1 + this) (a degraded candidate)
+    #[cfg(test)]
+    pf_degrade: f32,
     /// Tiled attention (docs/lab-notes/M3-ATTN.md), columns in [kv head][lane][query head in group] order:
     /// f16 q (col * head_dim), sigmoid gate (col * head_dim), scores and f16 probabilities
     /// (col * n_ctx).
@@ -613,6 +651,36 @@ pub fn effective_switches() -> String {
         env.join(" ")
     )
 }
+/// LC-8: `OXE_KV_V_THP=0` = the V^T region of the state arena is advised MADV_NOHUGEPAGE (the rest
+/// of the arena stays MADV_HUGEPAGE). With THP, a V^T row (n_ctx * 2 bytes: 256 KiB at 128K) spans
+/// many 2 MiB pages and the first positions of every row touch them all, so V^T is resident at
+/// the CAP, not at the context in use. Default unchanged (THP on); read when an engine is created;
+/// [`set_kv_v_thp`] overrides the environment. Advice only: no layout, result or state change.
+static KV_V_THP: AtomicUsize = AtomicUsize::new(usize::MAX);
+pub fn set_kv_v_thp(on: bool) {
+    KV_V_THP.store(on as usize, Relaxed);
+}
+pub fn kv_v_thp() -> bool {
+    match KV_V_THP.load(Relaxed) {
+        usize::MAX => std::env::var("OXE_KV_V_THP").map(|v| v.trim() != "0").unwrap_or(true),
+        v => v != 0,
+    }
+}
+
+/// MADV_NOHUGEPAGE on the whole pages inside [off, off + len) of `m` (LC-8). Returns whether a
+/// range was advised (false: nothing page-sized inside, or the kernel refused).
+fn advise_no_thp(m: &Mapping, off: usize, len: usize) -> bool {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+    let a = (m.base() as usize + off).div_ceil(page) * page;
+    let b = (m.base() as usize + off + len) / page * page;
+    if b <= a {
+        return false;
+    }
+    // SAFETY: advisory on whole pages inside our own mapping.
+    unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_NOHUGEPAGE) == 0 }
+}
+
 pub fn set_kv_vpad(n: usize) {
     KV_VPAD.store(n.min(4096), Relaxed);
 }
@@ -624,6 +692,10 @@ pub fn kv_vpad() -> usize {
     let n = std::env::var("OXE_KV_VPAD").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(KV_VPAD_DEFAULT).min(4096);
     KV_VPAD.store(n, Relaxed);
     n
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
 pub fn padded_n_kv(pos: usize, n_ctx: usize) -> usize {
@@ -694,6 +766,19 @@ impl CtxMem {
 /// `MAX_LANES.max(verify_lanes + 1)`), `n_slots` recurrent slots (verify lanes, at least 1).
 /// Mirrors the allocation in [`Engine::with_options`] and `Pf::new`; the tests hold the two equal.
 pub fn ctx_mem(d: &ModelDesc, n_ctx: usize, kv: KvType, n_att: usize, lanes: usize, n_slots: usize) -> CtxMem {
+    ctx_mem_with_auto(d, n_ctx, kv, n_att, lanes, n_slots, pfattn::PfAttn::from_env(), pfattn::AutoPolicy::from_env())
+}
+
+/// [`ctx_mem`] for an explicit prefill attention mode (PREFILL-LONG: with fa2 active at this
+/// n_ctx and f16 KV, the prefill scratch per thread is O(chunk) beyond `pfattn::PFA_MIN_KV`).
+pub fn ctx_mem_with(d: &ModelDesc, n_ctx: usize, kv: KvType, n_att: usize, lanes: usize, n_slots: usize, pf_attn: pfattn::PfAttn) -> CtxMem {
+    ctx_mem_with_auto(d, n_ctx, kv, n_att, lanes, n_slots, pf_attn, pfattn::AutoPolicy::from_env())
+}
+
+/// [`ctx_mem_with`] for an explicit `auto` policy (PREFILL-POLICY: the tiled part of the prefill
+/// scratch is sized for the resolved cutoff).
+#[allow(clippy::too_many_arguments)]
+pub fn ctx_mem_with_auto(d: &ModelDesc, n_ctx: usize, kv: KvType, n_att: usize, lanes: usize, n_slots: usize, pf_attn: pfattn::PfAttn, auto: pfattn::AutoPolicy) -> CtxMem {
     let n_ctx = n_ctx.max(1).div_ceil(256) * 256;
     let hd = d.head_dim;
     let rb = kv8::row_bytes(hd);
@@ -714,7 +799,7 @@ pub fn ctx_mem(d: &ModelDesc, n_ctx: usize, kv: KvType, n_att: usize, lanes: usi
         recurrent: n_slots.max(1) * d.n_recurrent() * (conv + ssm) * 4,
         decode_scratch: lanes * d.n_head * acs * (4 + 2) + vpart,
         decode_per_thread: n_ctx * (4 + 4 + 4 + 2),
-        prefill_per_thread: prefill::pf_ctx_bytes(d, n_ctx, att_tt),
+        prefill_per_thread: prefill::pf_ctx_bytes(d, n_ctx, att_tt, if kv.any8() { None } else { pf_attn.path(n_ctx, auto).cut_opt() }),
     }
 }
 
@@ -866,6 +951,9 @@ impl<'a> Engine<'a> {
         let fpart = c.take::<f32>(if kv.any8() { 0 } else { fattn::part_len(n_ctx, d.n_head_kv, group, hd, lanes) });
         let fml = c.take::<f32>(if kv.any8() { 0 } else { fattn::ml_len(n_ctx, d.n_head_kv, group, lanes) });
         let state = Mapping::anon(c.off, true).map_err(|e| format!("state arena: {e}"))?;
+        if !kv_v_thp() && vcache.1 > 0 {
+            advise_no_thp(&state, vcache.0, vcache.1 * 2);
+        }
         let f = |p: (usize, usize)| Raw::<f32>::new(&state, p.0, p.1);
         let lf = |p: (usize, usize, usize)| LBuf { raw: Raw::<f32>::new(&state, p.0, p.1), stride: p.2 };
         let lu = |p: (usize, usize, usize)| LBuf { raw: Raw::<u8>::new(&state, p.0, p.1), stride: p.2 };
@@ -945,6 +1033,12 @@ impl<'a> Engine<'a> {
             vpart: f(vpart),
             attn_fused: std::env::var("OXE_ATTN").map(|v| v == "fused").unwrap_or(false),
             attn_fused_ch: fattn::chunk_from_env(),
+            attn_fused_min_kv: env_usize("OXE_ATTN_FUSED_MIN_KV").unwrap_or(ATTN_FUSED_MIN_KV),
+            attn_fused_min_kv1: env_usize("OXE_ATTN_FUSED_1LANE_MIN_KV").unwrap_or(ATTN_FUSED_1LANE_MIN_KV),
+            pf_attn: pfattn::PfAttn::from_env(),
+            pf_auto: pfattn::AutoPolicy::from_env(),
+            pf_xparams: pfattn::XParams::from_env(),
+            pf_attn_threads: pfattn::pf_attn_threads_from_env(),
             fpart: f(fpart),
             fml: f(fml),
             #[cfg(any(test, feature = "f32-reference"))]
@@ -953,6 +1047,14 @@ impl<'a> Engine<'a> {
             attn_check: None,
             #[cfg(test)]
             fused_degrade: 0.0,
+            #[cfg(any(test, feature = "f32-reference"))]
+            pf_ref: false,
+            #[cfg(any(test, feature = "f32-reference"))]
+            pf_check: None,
+            #[cfg(any(test, feature = "f32-reference"))]
+            pf_ctr: Default::default(),
+            #[cfg(test)]
+            pf_degrade: 0.0,
             x2: lf(x2),
             x1: lf(x1),
             o: lf(o),
@@ -1032,6 +1134,97 @@ impl<'a> Engine<'a> {
         self.attn_fused_ch
     }
 
+    /// O70-KEEP / O70-POLICY: fused cutoffs in padded n_kv: `any` for every run, `one_lane` for
+    /// single-lane runs (`OXE_ATTN_FUSED_MIN_KV`, default [`ATTN_FUSED_MIN_KV`];
+    /// `OXE_ATTN_FUSED_1LANE_MIN_KV`, default [`ATTN_FUSED_1LANE_MIN_KV`]). Below them the run
+    /// takes the tiled (or per-head) path. Note: a 1-lane run and a verify lane at the same
+    /// position are then different numerics classes between the two cutoffs (fused is batch
+    /// invariant only among fused runs); `one_lane = any` restores that.
+    pub fn set_attn_fused_min_kv(&mut self, any: usize, one_lane: usize) {
+        self.attn_fused_min_kv = any;
+        self.attn_fused_min_kv1 = one_lane;
+    }
+
+    pub fn attn_fused_min_kv(&self) -> (usize, usize) {
+        (self.attn_fused_min_kv, self.attn_fused_min_kv1)
+    }
+
+    /// Whether a decode / verify run of `nl` lanes whose last position is `last` takes the fused
+    /// attention (the same decision on every thread of the run).
+    #[inline]
+    fn fused_at(&self, last: usize, nl: usize) -> bool {
+        if !self.attn_fused() || !self.attn_tiled || self.trace.is_some() {
+            return false;
+        }
+        let nk = padded_n_kv(last, self.n_ctx);
+        nk >= self.attn_fused_min_kv && (nl >= 2 || nk >= self.attn_fused_min_kv1)
+    }
+
+    /// PREFILL-LONG: the prefill attention kernel choice (see [`pfattn`]); takes effect at the
+    /// next batched prefill (the scratch is rebuilt when its size changes). Default `OXE_PF_ATTN`.
+    pub fn set_pf_attn(&mut self, mode: pfattn::PfAttn) {
+        self.pf_attn = mode;
+    }
+
+    pub fn pf_attn(&self) -> pfattn::PfAttn {
+        self.pf_attn
+    }
+
+    /// PREFILL-POLICY: what `auto` resolves to; takes effect at the next batched prefill. Default
+    /// `OXE_PF_ATTN_AUTO_MIN_KV` / `OXE_PF_ATTN_AUTO_KERNEL` over [`pfattn::PFA_AUTO_MIN_KV`].
+    pub fn set_pf_auto(&mut self, auto: pfattn::AutoPolicy) {
+        self.pf_auto = auto;
+    }
+
+    pub fn pf_auto(&self) -> pfattn::AutoPolicy {
+        self.pf_auto
+    }
+
+    /// PREFILL-POLICY: the path this engine's batched prefill takes (mode and auto policy resolved
+    /// at this n_ctx; tiled with int8 KV, a trace or the f32 reference). State identity and reports.
+    pub fn pf_attn_path(&self) -> pfattn::PfPath {
+        self.pf_path()
+    }
+
+    /// Whether this engine's batched prefill uses fa2 beyond [`pfattn::PFA_MIN_KV`] (fa2x included:
+    /// same units, cutoffs and scratch).
+    pub fn pf_attn_fa2(&self) -> bool {
+        self.pf_fa2()
+    }
+
+    /// APPEND-PREFILL: the fa2x kernel parameters when the fa2 units run fa2x, else None.
+    pub fn pf_attn_fa2x(&self) -> Option<pfattn::XParams> {
+        self.pf_fa2x()
+    }
+
+    /// APPEND-PREFILL: fa2x kernel parameters (default `OXE_PF_FA2X_FOLD` / `OXE_PF_FA2X_CH`).
+    pub fn set_pf_xparams(&mut self, xp: pfattn::XParams) {
+        self.pf_xparams = xp;
+    }
+
+    /// The prefill attention kernel past [`pfattn::PFA_MIN_KV`] this engine runs: "tiled", "fa2"
+    /// or "fa2x" (state identity, reports).
+    pub fn pf_attn_kernel(&self) -> &'static str {
+        self.pf_path().name()
+    }
+
+    /// THREADS-BY-PHASE (F34 / F106): threads of the prefill team that take attention-core units
+    /// (0 = all, the default; values above the team size mean all). Bit-identical for any value.
+    /// Default `OXE_PF_ATTN_THREADS`.
+    pub fn set_pf_attn_threads(&mut self, n: usize) {
+        self.pf_attn_threads = n;
+    }
+
+    pub fn pf_attn_threads(&self) -> usize {
+        self.pf_attn_threads
+    }
+
+    /// LC-8 test hook: (address, bytes) of the f16 V^T cache region in the state arena.
+    #[cfg(test)]
+    pub(crate) fn v_region(&self) -> (usize, usize) {
+        (self.vcache.ptr_at(0) as usize, self.vcache.len * 2)
+    }
+
     /// OD-2: decode / verify delta-net step through the fused 4-row kernel (bit-identical).
     /// Default on at construction (`OXE_DEC_FUSED_DN=0` = off).
     pub fn set_dec_fused_dn(&mut self, on: bool) {
@@ -1063,6 +1256,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether decode / prefill use the tiled attention.
+    /// Turns the OXE_ATTN_STATS counters on (zeroed) or off (A/B and tests; the environment
+    /// variable selects them at construction). Counting never changes a result.
+    pub fn set_attn_stats(&mut self, on: bool) {
+        self.att_stats = on.then(|| [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    }
+
     /// OXE_ATTN_STATS counters: (32-position probability blocks, all exactly zero, all < 2^-10).
     pub fn attn_stats(&self) -> Option<(u64, u64, u64)> {
         self.att_stats.as_ref().map(|s| (s[0].load(Relaxed), s[1].load(Relaxed), s[2].load(Relaxed)))
@@ -1091,11 +1290,17 @@ impl<'a> Engine<'a> {
     /// attention phase when the tiled path runs (n_kv >= the cutoff).
     pub fn barriers_per_token(&self) -> usize {
         let n_att = self.plan.desc.n_attention();
-        let tiled = self.tiled_at(self.pos());
+        let last = self.pos();
+        // O-70 fused: one barrier between the chunk items and the merge (its own cutoffs now)
         // fused int8 V: one more barrier before the chunk-ordered reduction
-        // O-70 fused: one barrier between the chunk items and the merge
-        let per = if self.attn_fused() { 1 } else { 2 + (self.kv.v8() && self.kv8_fused) as usize };
-        self.plan.barriers_per_token() + if tiled { per * n_att } else { 0 }
+        let per = if self.fused_at(last, 1) {
+            1
+        } else if self.tiled_at(last) {
+            2 + (self.kv.v8() && self.kv8_fused) as usize
+        } else {
+            0
+        };
+        self.plan.barriers_per_token() + per * n_att
     }
 
     /// Test hook: run the int8 decode attention through `f` (a straightforward f32 reference
@@ -1388,7 +1593,7 @@ impl<'a> Engine<'a> {
             recurrent: (self.conv_state.len + self.ssm_state.len) * 4,
             decode_scratch: self.akq.len * 4 + self.ap16.len * 2 + self.vpart.len * 4,
             decode_per_thread: per_thread,
-            prefill_per_thread: prefill::pf_ctx_bytes(d, self.n_ctx, prefill::att_tt_want(d, pf_tiles())),
+            prefill_per_thread: prefill::pf_ctx_bytes(d, self.n_ctx, prefill::att_tt_want(d, pf_tiles()), self.pf_path().cut_opt()),
         }
     }
 
@@ -2541,8 +2746,10 @@ impl<'a> Engine<'a> {
     }
 
     fn attn_core(&self, ctx: &mut Ctx, tss: &mut [ThreadState], l: usize, pos0: usize, qheads: Range<usize>) {
-        // the same decision on every thread (same run); both paths are bit-identical
-        if self.tiled_at(pos0 + tss.len() - 1) {
+        // the same decision on every thread (same run); tiled and per-head are bit-identical,
+        // fused (opt-in) is its own class with its own cutoffs
+        let last = pos0 + tss.len() - 1;
+        if self.fused_at(last, tss.len()) || self.tiled_at(last) {
             #[cfg(any(test, feature = "f32-reference"))]
             if self.attn_check.is_some() && self.attn_ref.is_none() {
                 self.attn_core_tiled(ctx, tss, l, pos0, qheads.clone());
@@ -2674,7 +2881,7 @@ impl<'a> Engine<'a> {
         if let Some(f) = self.attn_ref {
             return self.attn_core_ref(ctx, tss, f, l, pos0, qheads);
         }
-        if self.attn_fused() {
+        if self.fused_at(last, nl) {
             return self.attn_core_fused(ctx, tss, ai, pos0);
         }
         // [1] scores: rows (kvh, p) for p <= last, split evenly over the threads
@@ -3005,7 +3212,7 @@ impl<'a> Engine<'a> {
         // item are written only by its thread; after the barrier each O element of (kvh, dim) rows
         // is written only by the owner of the row.
         unsafe {
-            fa.chunks(tid, nth, scr);
+            fa.chunks_stats(tid, nth, scr, self.att_stats.as_ref());
         }
         self.ibar(ctx);
         // SAFETY: as above; every partial complete (barrier).

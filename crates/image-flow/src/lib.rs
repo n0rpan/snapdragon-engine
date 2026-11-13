@@ -11,12 +11,14 @@
 //! The CLI is `src/bin/oxi.rs` (`generate`, `verify`, `compare`, `cond-put`).
 
 pub mod actstats;
+pub mod chancalib;
 pub mod cond_cache;
 pub mod drift;
 pub mod full_ref;
 pub mod handoff;
 pub mod latent;
 pub mod noise;
+pub mod pe;
 pub mod schedule;
 pub mod sampler;
 pub mod sha256;

@@ -37,11 +37,48 @@ pub struct GenParams {
     pub echo: Option<serde_json::Value>,
     /// the session hint (`X-Oxe-Session`): the state store's prefill-progress manifests (P2b, M1)
     pub session: Option<String>,
+    /// v0.1.3 pre-think point: the prompt position just before the generation prompt's `<think>`
+    /// (thinking on). A later request whose history drops this turn's reasoning (no think block in
+    /// the re-render) diverges exactly there; a RAM checkpoint (class pre-think) is taken at it.
+    pub pre_think: Option<usize>,
+    /// v0.1.3 `X-Oxe-Turn-Kind` (controller label: chat | compaction | post-compaction)
+    pub turn_kind: Option<String>,
+    /// chat requests: token position of every user-message start (turn points in the last 16K,
+    /// the compaction cut = the last one of a compaction request)
+    pub user_starts: Vec<usize>,
+    /// LAN share (`X-Oxe-State-Policy: ephemeral`, set by the controller for a request from another
+    /// device): RAM-only, request-scoped state. No prefix reuse of any kind (live, parked, checkpoint
+    /// or disk: no prefix-timing oracle on this machine's conversations), no state-store, session or
+    /// prefix-store read or write, no warm-hint write; the local live session is held aside and the
+    /// request's own state is dropped when it ends (the held session is then live again).
+    pub ephemeral: bool,
+    /// LONG-APPEND (v0.1.3 #7): prefill progress of this request, read by the stream's SSE
+    /// keepalive (`service::spawn_keepalive`); None = nobody reads it
+    pub progress: Option<std::sync::Arc<Progress>>,
+}
+
+/// LONG-APPEND (v0.1.3 #7): how far a request's prompt is in the engine state. `total` is 0 until
+/// the worker takes the request; `done` moves after the cache restore and every prefill chunk
+/// (CANCEL_UBATCHES ubatches); `decoding` is set by the stream at its first decoded token.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: std::sync::atomic::AtomicUsize,
+    pub total: std::sync::atomic::AtomicUsize,
+    pub decoding: std::sync::atomic::AtomicBool,
 }
 
 impl GenParams {
     pub fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn note_progress(&self, done: usize, total: Option<usize>) {
+        if let Some(pr) = &self.progress {
+            if let Some(t) = total {
+                pr.total.store(t, std::sync::atomic::Ordering::Relaxed);
+            }
+            pr.done.store(done, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -80,6 +117,11 @@ impl Default for GenParams {
             cancel: None,
             echo: None,
             session: None,
+            pre_think: None,
+            turn_kind: None,
+            user_starts: Vec::new(),
+            ephemeral: false,
+            progress: None,
         }
     }
 }
@@ -234,6 +276,38 @@ pub struct Worker<E: Engine> {
     /// the legacy disk stores (prefix store, session cache) while the disk budget is 0: off
     /// means off for every conversation store (Codex P2/P3 review 2); back when it rises again
     pub legacy_off: Option<(Option<crate::prefix_store::PrefixStore>, Option<crate::prefix_store::PrefixStore>)>,
+    /// v0.1.3: user-message starts within this many tokens of the prompt end come first among the
+    /// turn checkpoints (`--turn-user-window`, 0 = off: the newest message starts, as before)
+    pub user_window: usize,
+    /// v0.1.3: a compaction request (`X-Oxe-Turn-Kind: compaction`) takes a checkpoint exactly at its
+    /// cut, the start of its instruction message (`--compaction-cut on|off`)
+    pub cut_snapshots: bool,
+    /// v0.1.3: before a request cuts the live session back, its unwritten state and RAM checkpoints
+    /// go to the state store (`--state-park-write on|off`): a disk-parked session keeps them
+    pub park_write: bool,
+    /// v0.1.3: the post-reply write copies the head snapshot and the new blocks under the worker lock
+    /// and writes them without it (`--state-write-offlock on|off`)
+    pub offlock: bool,
+    /// the optional RAM checkpoints of the live state are not all on disk yet
+    snaps_pending: bool,
+    /// v0.1.3 store-depth: the legacy whole-state session cache is written (`--session-cache-writes
+    /// auto|on|off`; auto = off while the state cache and its park write are on: the segmented store
+    /// then holds every state the legacy park / spill / shutdown would write, so the legacy cache is
+    /// read-only, its existing entries still restore). Default true (as before) outside main.rs.
+    pub legacy_writes: bool,
+    /// test hook (usize::MAX in production): the optional snapshot writes of one persist stop after
+    /// this many files, as when a request arrives between them
+    pub opt_write_limit: usize,
+}
+
+/// The local live session and its write bookkeeping, held across one ephemeral request.
+struct HeldLocal<S> {
+    held: Option<crate::cache::Held<S>>,
+    live_blocks: Vec<(String, String)>,
+    progress_mark: usize,
+    state_dirty: bool,
+    snaps_pending: bool,
+    last_first_user: Option<usize>,
 }
 
 /// A disk restore source (see [`Worker::plan_restore`]).
@@ -254,6 +328,21 @@ pub struct Preloaded {
     pub ms: f64,
 }
 
+/// `--session-cache-writes auto|on|off` (v0.1.3 store-depth): whether the legacy whole-state
+/// session cache is written (park to disk, RAM-park spill, SIGTERM). `auto` (the default) = off
+/// while the state cache and its park write (`--state-park-write on`) are on: the segmented store
+/// then holds the deepest state of every session at least as deep as the legacy park did (the head
+/// after every reply, its RAM points deepest first, the park write when a session is left, the
+/// shutdown write). Existing legacy entries are still read. None: not one of the three words.
+pub fn legacy_session_writes(mode: &str, state_cache: bool, park_write: bool) -> Option<bool> {
+    match mode {
+        "auto" => Some(!(state_cache && park_write)),
+        "on" | "1" | "true" => Some(true),
+        "off" | "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// How [`Worker::persist`] runs (P2b).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PersistMode {
@@ -262,8 +351,9 @@ pub enum PersistMode {
     Reply,
     /// during a long prefill (M1): new blocks, the head at the prefill position, the manifest
     Progress,
-    /// SIGTERM (M2): only what is not on disk yet (new blocks, the head) and the manifest, file by
-    /// file until `deadline`; no optional snapshots, no eviction pass (start-up runs it)
+    /// SIGTERM (M2): only what is not on disk yet (new blocks, the head) and the manifest, then the
+    /// optional RAM checkpoints a cut post-reply write left (deepest first), file by file until
+    /// `deadline`; no eviction pass (start-up runs it)
     Shutdown(Instant),
 }
 
@@ -290,6 +380,9 @@ impl PersistReport {
             Some(p) => format!("{} blocks + head at {p} tokens ({} MiB)", self.blocks, self.bytes >> 20),
             None => format!("{} blocks, no head ({} MiB)", self.blocks, self.bytes >> 20),
         };
+        if self.snaps > 0 {
+            s.push_str(&format!(" + {} snapshots", self.snaps));
+        }
         if let Some(n) = &self.note {
             s.push_str(&format!("; {n}"));
         }
@@ -426,6 +519,68 @@ fn find_stop_full(text: &str, from: usize, stops: &[String]) -> Option<(usize, S
     best
 }
 
+/// The disk class of a RAM checkpoint priority; None = not written (pre-think points are RAM only).
+fn snap_class(prio: u8) -> Option<&'static str> {
+    match prio {
+        crate::cache::PRIO_ANCHOR => Some("anchor"),
+        crate::cache::PRIO_QUERY => Some("query"),
+        crate::cache::PRIO_TURN => Some("turn"),
+        crate::cache::PRIO_CUT => Some("cut"),
+        crate::cache::PRIO_PRETHINK => None,
+        _ => Some("tail"),
+    }
+}
+
+/// Snapshot classes thinning always keeps (with the head): the anchor and the compaction cut.
+fn must_keep(class: &str) -> bool {
+    class == "anchor" || class == "cut"
+}
+
+/// The lineage of a live state of `tokens` (chain `hs`, blocks `live` on disk) in the store (P2b):
+/// the manifest it continues (the deepest whose whole content is a prefix of it), the other such
+/// ancestors it absorbs, that manifest, and the snapshots of those manifests still consistent with
+/// `live` and `tokens` (positions <= n). Without an ancestor a new manifest starts under the
+/// lineage's session id or, when a sibling holds that id (a fork, a retry, an edit), under an id of
+/// its own: a sibling's head is never replaced.
+type Lineage = (String, Vec<String>, Option<crate::state_store::Manifest>, Vec<crate::state_store::SnapRef>);
+
+fn lineage(st: &crate::state_store::StateStore, hs: &[String], tokens: &[u32], live: &[(String, String)], first_user: Option<usize>) -> Lineage {
+    use crate::state_store::{session_id, snap_key, Manifest, SnapRef, BLOCK};
+    let n = tokens.len();
+    let head_key = snap_key(&st.ident.hash, hs, tokens, n);
+    let is_ancestor = |o: &Manifest| {
+        o.n_tokens <= n && o.blocks.len() <= live.len() && live.starts_with(&o.blocks) && o.snaps.iter().any(|x| x.pos == o.n_tokens && snap_key(&st.ident.hash, hs, tokens, x.pos) == x.key)
+    };
+    let mut ancestors: Vec<&Manifest> = st.manifests.values().filter(|o| is_ancestor(o)).collect();
+    ancestors.sort_by_key(|o| (std::cmp::Reverse(o.n_tokens), std::cmp::Reverse(o.atime), o.sid.clone()));
+    let absorbed: Vec<String> = ancestors.iter().skip(1).map(|o| o.sid.clone()).collect();
+    let sid = match ancestors.first() {
+        Some(p) => p.sid.clone(),
+        None => {
+            let base = session_id(&st.ident.hash, tokens, first_user.unwrap_or(0));
+            if st.manifests.contains_key(&base) {
+                crate::prefix_store::sha256_hex(format!("{base}/{head_key}").as_bytes())[..32].to_string()
+            } else {
+                base
+            }
+        }
+    };
+    let prev = st.manifest(&sid).cloned();
+    let consistent = |s: &SnapRef, blocks: &[(String, String)]| {
+        let k = s.pos / BLOCK;
+        s.pos <= n && k <= live.len() && blocks.len() >= k && blocks[..k] == live[..k] && snap_key(&st.ident.hash, hs, tokens, s.pos) == s.key
+    };
+    let mut kept: Vec<SnapRef> = Vec::new();
+    for m in prev.iter().chain(absorbed.iter().filter_map(|a| st.manifests.get(a))) {
+        for s in &m.snaps {
+            if consistent(s, &m.blocks) && !kept.iter().any(|c| c.pos == s.pos) {
+                kept.push(s.clone());
+            }
+        }
+    }
+    (sid, absorbed, prev, kept)
+}
+
 /// What the decode loop holds for the next position: the logits row, or (greedy fast path)
 /// only its argmax.
 enum NextRow {
@@ -489,7 +644,41 @@ impl<E: Engine> Worker<E> {
         let turns = 4.min(max_snapshots.saturating_sub(4));
         let mut cache = PrefixCache::new(max_snapshots);
         cache.max_turn = turns;
-        Worker { engine, cache, ubatch: model::engine::UBATCH, store: None, turn_checkpoints: turns, sessions: None, ledger: None, repeat_watchdog: 0, spec_table: None, mtp_max_ctx: None, lookup: None, msg_split: false, warm: None, states: None, live_blocks: Vec::new(), last_first_user: None, persist_every: 4096, progress_mark: 0, state_dirty: true, persisted_head: None, preloaded: None, last_resume: ("cold", 0.0), last_preload_ms: None, legacy_off: None, restore_bps: (0.83e9, 0.64e9), restores: 0 }
+        Worker {
+            engine,
+            cache,
+            ubatch: model::engine::UBATCH,
+            store: None,
+            turn_checkpoints: turns,
+            sessions: None,
+            ledger: None,
+            repeat_watchdog: 0,
+            spec_table: None,
+            mtp_max_ctx: None,
+            lookup: None,
+            msg_split: false,
+            warm: None,
+            states: None,
+            live_blocks: Vec::new(),
+            last_first_user: None,
+            persist_every: 4096,
+            progress_mark: 0,
+            state_dirty: true,
+            persisted_head: None,
+            preloaded: None,
+            last_resume: ("cold", 0.0),
+            last_preload_ms: None,
+            legacy_off: None,
+            user_window: 16 << 10,
+            cut_snapshots: true,
+            park_write: true,
+            offlock: true,
+            snaps_pending: true,
+            legacy_writes: true,
+            opt_write_limit: usize::MAX,
+            restore_bps: (0.83e9, 0.64e9),
+            restores: 0,
+        }
     }
 
     /// Process start: hand the stored warm-up hint to the engine (it queues the reads and
@@ -577,17 +766,41 @@ impl<E: Engine> Worker<E> {
         turns.sort_unstable();
         turns.dedup();
         let skip = turns.len().saturating_sub(self.turn_checkpoints);
+        let mut chosen: Vec<usize> = turns[skip..].to_vec();
+        // v0.1.3: the user-message starts of the last `user_window` tokens come first (an edit, a
+        // retry or a compaction cuts there), then the newest other message starts, up to the cap
+        if self.user_window > 0 && self.turn_checkpoints > 0 && !p.user_starts.is_empty() {
+            let lo = n.saturating_sub(self.user_window);
+            let mut users: Vec<usize> = p.user_starts.iter().filter(|&&m| m >= lo && p.first_user.map_or(true, |f| m > f)).filter_map(|&m| grid_floor(base, u, n_cached, m.min(n - 1))).collect();
+            users.sort_unstable();
+            users.dedup();
+            if !users.is_empty() {
+                let mut pick: Vec<usize> = users.iter().rev().copied().take(self.turn_checkpoints).collect();
+                for &t in turns.iter().rev() {
+                    if pick.len() >= self.turn_checkpoints {
+                        break;
+                    }
+                    if !pick.contains(&t) {
+                        pick.push(t);
+                    }
+                }
+                pick.sort_unstable();
+                chosen = pick;
+            }
+        }
         let mut splits: Vec<(usize, u8)> = anchor
             .map(|a| (a, crate::cache::PRIO_ANCHOR))
             .into_iter()
             .chain(query.map(|q| (q, crate::cache::PRIO_QUERY)))
-            .chain(turns[skip..].iter().map(|&t| (t, crate::cache::PRIO_TURN)))
+            .chain(chosen.iter().map(|&t| (t, crate::cache::PRIO_TURN)))
             .filter(|&(x, _)| x < n - 1)
             .collect();
         splits.sort();
         splits.dedup_by(|b, a| {
             if a.0 == b.0 {
-                a.1 = a.1.max(b.1);
+                if crate::cache::rank(b.1) > crate::cache::rank(a.1) {
+                    a.1 = b.1;
+                }
                 true
             } else {
                 false
@@ -693,7 +906,7 @@ impl<E: Engine> Worker<E> {
     /// new manifest starts, under `session_id` or, when that id is a sibling's (a fork, a retry, an
     /// edit), under an id of its own: a sibling's head is never replaced.
     pub fn persist(&mut self, hint: Option<&str>, mode: PersistMode, cancel: Option<&std::sync::atomic::AtomicBool>) -> PersistReport {
-        use crate::state_store::{chain, session_id, snap_key, thin, Manifest, SnapRef, BLOCK};
+        use crate::state_store::{chain, snap_key, thin_max, Manifest, SnapRef, BLOCK};
         let mut rep = PersistReport::default();
         let rb = self.engine.kv_row_bytes();
         let Some(st) = self.states.as_mut() else { return rep };
@@ -711,8 +924,12 @@ impl<E: Engine> Worker<E> {
         let hs = chain(&st.ident.hash, &tokens);
         let head_key = snap_key(&st.ident.hash, &hs, &tokens, n);
         // nothing changed since the last complete write and its head is still listed: done (the
-        // shutdown after a finished post-reply write costs a lookup, not a 63 MiB re-hash)
-        if !self.state_dirty && self.persisted_head.as_deref() == Some(head_key.as_str()) && st.manifests.values().any(|m| m.snaps.iter().any(|x| x.key == head_key && x.pos == n)) {
+        // shutdown after a finished post-reply write costs a lookup, not a 63 MiB re-hash); a reply
+        // write still has the optional checkpoints to do when an earlier one was cut (v0.1.3)
+        let listed = st.manifests.values().any(|m| m.snaps.iter().any(|x| x.key == head_key && x.pos == n));
+        // v0.1.3 store-depth: a shutdown too (a SIGTERM right after a reply cut its optional writes;
+        // the restart then resumed at an older point than the legacy park had kept)
+        if !self.state_dirty && self.persisted_head.as_deref() == Some(head_key.as_str()) && listed && (mode == PersistMode::Progress || !self.snaps_pending) {
             rep.note = Some("already on disk".into());
             return rep;
         }
@@ -742,81 +959,52 @@ impl<E: Engine> Worker<E> {
         }
         self.cache.low_water = n;
         let now = crate::state_store::now_s();
-        // lineage: the ancestors of the live state (whole content a prefix of ours)
-        let is_ancestor = |o: &Manifest| {
-            o.n_tokens <= n
-                && o.blocks.len() <= self.live_blocks.len()
-                && self.live_blocks.starts_with(&o.blocks)
-                && o.snaps.iter().any(|x| x.pos == o.n_tokens && snap_key(&st.ident.hash, &hs, &tokens, x.pos) == x.key)
-        };
-        let mut ancestors: Vec<&Manifest> = st.manifests.values().filter(|o| is_ancestor(o)).collect();
-        ancestors.sort_by_key(|o| (std::cmp::Reverse(o.n_tokens), std::cmp::Reverse(o.atime), o.sid.clone()));
-        let absorbed: Vec<String> = ancestors.iter().skip(1).map(|o| o.sid.clone()).collect();
-        let sid = match ancestors.first() {
-            Some(p) => p.sid.clone(),
-            None => {
-                let base = session_id(&st.ident.hash, &tokens, self.last_first_user.unwrap_or(0));
-                if st.manifests.contains_key(&base) {
-                    // a sibling holds the lineage id: this branch gets its own manifest
-                    crate::prefix_store::sha256_hex(format!("{base}/{head_key}").as_bytes())[..32].to_string()
-                } else {
-                    base
-                }
-            }
-        };
+        let (sid, absorbed, prev, kept0) = lineage(st, &hs, &tokens, &self.live_blocks, self.last_first_user);
         // snapshots: the ones of the ancestors still consistent with our blocks and tokens, the
         // head (live state), the live RAM checkpoints
-        let prev = st.manifest(&sid).cloned();
-        let consistent = |s: &SnapRef, blocks: &[(String, String)]| {
-            let k = s.pos / BLOCK;
-            s.pos <= n && k <= self.live_blocks.len() && blocks.len() >= k && blocks[..k] == self.live_blocks[..k] && snap_key(&st.ident.hash, &hs, &tokens, s.pos) == s.key
-        };
-        let mut cands: Vec<(SnapRef, Option<usize>)> = Vec::new(); // (ref, index into checkpoints to write)
-        for m in prev.iter().chain(absorbed.iter().filter_map(|a| st.manifests.get(a))) {
-            for s in &m.snaps {
-                if consistent(s, &m.blocks) && !cands.iter().any(|c| c.0.pos == s.pos) {
-                    cands.push((s.clone(), None));
-                }
-            }
-        }
+        let mut cands: Vec<(SnapRef, Option<usize>)> = kept0.into_iter().map(|r| (r, None)).collect(); // (ref, index into checkpoints to write)
         let cps = self.cache.checkpoints();
-        let class = |prio: u8| match prio {
-            crate::cache::PRIO_ANCHOR => "anchor",
-            crate::cache::PRIO_QUERY => "query",
-            crate::cache::PRIO_TURN => "turn",
-            _ => "tail",
-        };
-        // the RAM checkpoints: after a reply, and at SIGTERM (v0.1.2 gate: a reply's write cut by the
-        // next request left the follow-up's exact resume point, the tail checkpoint, only in RAM;
-        // the shutdown wrote the head alone and the restart re-prefilled from 9216: output changed)
-        if mode != PersistMode::Progress {
+        let optional = mode != PersistMode::Progress;
+        if optional {
             for (i, &(pos, prio, clean, _)) in cps.iter().enumerate() {
+                // pre-think points stay in RAM (v0.1.3: RAM only, design)
+                let Some(class) = snap_class(prio) else { continue };
                 if pos < n && pos >= BLOCK.min(n) && !cands.iter().any(|c| c.0.pos == pos) {
                     let key = snap_key(&st.ident.hash, &hs, &tokens, pos);
-                    cands.push((SnapRef { pos, class: class(prio).into(), key, c: String::new(), clean, bytes: 0 }, Some(i)));
+                    cands.push((SnapRef { pos, class: class.into(), key, c: String::new(), clean, bytes: 0 }, Some(i)));
                 }
             }
         }
         cands.retain(|c| c.0.pos != n);
-        let keep = thin(cands.iter().map(|c| (c.0.pos, c.0.class == "anchor")).chain([(n, true)]).collect(), n);
+        let keep = thin_max(cands.iter().map(|c| (c.0.pos, must_keep(&c.0.class))).chain([(n, true)]).collect(), n, st.max_snaps);
         // P2 review: the head and the manifest first, the other checkpoints after. A cut (a new
         // request, a kill inside the SIGTERM grace) then costs the optional points, not the resume.
-        let (kept, todo): (Vec<_>, Vec<_>) = cands.into_iter().filter(|c| keep.contains(&c.0.pos)).partition(|c| c.1.is_none());
+        let (kept, mut todo): (Vec<_>, Vec<_>) = cands.into_iter().filter(|c| keep.contains(&c.0.pos)).partition(|c| c.1.is_none());
+        // v0.1.3 store-depth: deepest first. A request arriving between files cuts the rest; the deep
+        // points (the prompt's last token, the compaction cut, the last user turn) save the most
+        // re-prefill and are the ones a retry, a warm restart or an edit of the last turn resumes
+        // at. Shallowest first, the v0.1.2 gate kept a 74K turn point and lost the 82.7K one.
+        todo.sort_by(|a, b| b.0.pos.cmp(&a.0.pos));
         let mut snaps: Vec<SnapRef> = kept.into_iter().map(|c| c.0).collect();
         if stop() {
             rep.note = Some("stopped before the head snapshot".into());
             return rep;
         }
-        match st.write_snap(&mut self.engine, &head_key, n, None) {
-            Ok((c, bytes)) => {
-                snaps.push(SnapRef { pos: n, class: "head".into(), key: head_key.clone(), c, clean: self.cache.clean, bytes });
-                rep.bytes += bytes;
-            }
-            Err(e) => {
-                eprintln!("oxe-server: state cache: head snapshot not written: {e}");
-                rep.note = Some(format!("head snapshot not written: {e}"));
-                return rep;
-            }
+        // the head is on disk already (an off-lock write committed it): reuse it (v0.1.3)
+        let existing = prev.as_ref().and_then(|m| m.snaps.iter().find(|x| x.pos == n && x.key == head_key)).filter(|x| st.has_snap(&x.key, &x.c)).cloned();
+        match existing {
+            Some(h) => snaps.push(SnapRef { class: "head".into(), clean: self.cache.clean, ..h }),
+            None => match st.write_snap_c(&mut self.engine, &head_key, n, None, cancel) {
+                Ok((c, bytes)) => {
+                    snaps.push(SnapRef { pos: n, class: "head".into(), key: head_key.clone(), c, clean: self.cache.clean, bytes });
+                    rep.bytes += bytes;
+                }
+                Err(e) => {
+                    eprintln!("oxe-server: state cache: head snapshot not written: {e}");
+                    rep.note = Some(format!("head snapshot not written: {e}"));
+                    return rep;
+                }
+            },
         }
         snaps.sort_by_key(|s| s.pos);
         let old_hint = prev.as_ref().and_then(|m| m.hint.clone()).or_else(|| absorbed.iter().find_map(|a| st.manifests.get(a).and_then(|m| m.hint.clone())));
@@ -838,35 +1026,44 @@ impl<E: Engine> Worker<E> {
         }
         rep.head = Some(n);
         rep.sid = Some(sid.clone());
+        self.persisted_head = Some(head_key);
+        self.state_dirty = false;
         for a in &absorbed {
             st.drop_session(a);
         }
-        if mode == PersistMode::Progress {
+        if !optional {
             st.enforce(Some(&sid));
             return rep;
         }
-        let mut cut = false;
-        // optional checkpoints deepest first: the newest exact resume points matter most when a
-        // request or the SIGTERM deadline cuts the write
-        let mut todo = todo;
-        todo.sort_by(|a, b| b.0.pos.cmp(&a.0.pos));
         let mut added = false;
-        for (r, idx) in todo {
-            if stop() {
-                rep.note = Some("optional snapshots cut (a request or the deadline)".into());
+        let mut cut = false;
+        // a shutdown starts an optional file only while one fits before its deadline
+        let late = || deadline.is_some_and(|d| Instant::now() + std::time::Duration::from_millis(250) >= d);
+        for (k, (r, idx)) in todo.into_iter().enumerate() {
+            if stop() || late() || k >= self.opt_write_limit {
+                rep.note = Some("optional snapshots cut by a request".into());
                 cut = true;
                 break;
             }
-            match st.write_snap(&mut self.engine, &r.key, r.pos, Some(cps[idx.unwrap()].3)) {
+            // v0.1.3: a request that arrives inside a snapshot file stops it within one buffer
+            match st.write_snap_c(&mut self.engine, &r.key, r.pos, Some(cps[idx.unwrap()].3), cancel) {
                 Ok((c, bytes)) => {
                     m.snaps.push(SnapRef { c, bytes, ..r });
                     rep.snaps += 1;
                     rep.bytes += bytes;
                     added = true;
                 }
-                Err(e) => eprintln!("oxe-server: state cache: snapshot at {} not written: {e}", r.pos),
+                Err(e) => {
+                    if stop() {
+                        rep.note = Some("optional snapshots cut by a request".into());
+                        cut = true;
+                        break;
+                    }
+                    eprintln!("oxe-server: state cache: snapshot at {} not written: {e}", r.pos)
+                }
             }
         }
+        self.snaps_pending = cut;
         if added {
             m.snaps.sort_by_key(|s| s.pos);
             if let Err(e) = st.put_manifest(m) {
@@ -874,19 +1071,137 @@ impl<E: Engine> Worker<E> {
                 return rep;
             }
         }
-        if !cut {
-            // complete: the head AND the checkpoints kept are on disk; until then a later write
-            // (the shutdown) still has work to do
-            self.persisted_head = Some(head_key);
-            self.state_dirty = false;
-        }
         if stop() || mode != PersistMode::Reply {
-            // (shutdown: no eviction pass; start-up runs it)
             return rep;
         }
         let freed = st.enforce(Some(&sid));
         if freed > 0 {
             eprintln!("oxe-server: state cache: evicted {} MiB (budget {} MiB)", freed >> 20, st.budget >> 20);
+        }
+        rep
+    }
+
+    /// v0.1.3 (lane B item 6), phase 1 of the off-lock post-reply write, under the worker lock: copy
+    /// the new blocks and the head snapshot to RAM and build the manifest that names them. Phase 2
+    /// ([`crate::state_store::Staged::write`]) needs no lock: a request that arrives meanwhile runs
+    /// at once instead of waiting for the head file. Phase 3 is [`Worker::commit_staged`]. None:
+    /// nothing to stage; the caller then runs [`Worker::persist_states`] on the lock (nothing new,
+    /// only optional snapshots left, more than `STAGE_MAX_BLOCKS` new blocks, a refused write).
+    pub fn stage_persist(&mut self, hint: Option<&str>) -> Option<crate::state_store::Staged> {
+        use crate::state_store::{chain, snap_key, thin_max, Manifest, SnapRef, Staged, BLOCK, STAGE_MAX_BLOCKS};
+        if !self.offlock {
+            return None;
+        }
+        let rb = self.engine.kv_row_bytes();
+        let st = self.states.as_ref()?;
+        let n = self.cache.tokens.len();
+        if rb == 0 || st.budget == 0 || n < st.min_tokens || self.engine.n_past() != n || st.write_allowed().is_err() {
+            return None;
+        }
+        let tokens = self.cache.tokens.clone();
+        let hs = chain(&st.ident.hash, &tokens);
+        let head_key = snap_key(&st.ident.hash, &hs, &tokens, n);
+        if st.manifests.values().any(|m| m.snaps.iter().any(|x| x.key == head_key && x.pos == n)) {
+            return None;
+        }
+        let lw = self.cache.low_water.min(n) / BLOCK;
+        let valid = (0..self.live_blocks.len().min(lw).min(hs.len())).take_while(|&i| self.live_blocks[i].0 == hs[i] && st.has_block(&self.live_blocks[i].0, &self.live_blocks[i].1)).count();
+        if hs.len() - valid > STAGE_MAX_BLOCKS {
+            return None;
+        }
+        let mut blocks = Vec::with_capacity(hs.len() - valid);
+        for (i, h) in hs.iter().enumerate().skip(valid) {
+            match st.stage_block(&mut self.engine, h, i) {
+                Ok((c, data)) => blocks.push((h.clone(), i, c, data)),
+                Err(e) => {
+                    eprintln!("oxe-server: state cache: block not staged: {e}");
+                    return None;
+                }
+            }
+        }
+        let (head_c, head_payload) = match st.stage_snap(&mut self.engine, n) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("oxe-server: state cache: head snapshot not staged: {e}");
+                return None;
+            }
+        };
+        let mut live: Vec<(String, String)> = self.live_blocks[..valid].to_vec();
+        live.extend(blocks.iter().map(|b| (b.0.clone(), b.2.clone())));
+        let (sid, absorbed, prev, kept0) = lineage(st, &hs, &tokens, &live, self.last_first_user);
+        let keep = thin_max(kept0.iter().filter(|r| r.pos != n).map(|r| (r.pos, must_keep(&r.class))).chain([(n, true)]).collect(), n, st.max_snaps);
+        let mut snaps: Vec<SnapRef> = kept0.into_iter().filter(|r| r.pos != n && keep.contains(&r.pos)).collect();
+        snaps.push(SnapRef { pos: n, class: "head".into(), key: head_key.clone(), c: head_c.clone(), clean: self.cache.clean, bytes: crate::state_store::HDR_BYTES + head_payload.len() as u64 });
+        snaps.sort_by_key(|s| s.pos);
+        let now = crate::state_store::now_s();
+        let old_hint = prev.as_ref().and_then(|m| m.hint.clone()).or_else(|| absorbed.iter().find_map(|a| st.manifests.get(a).and_then(|m| m.hint.clone())));
+        let m = Manifest {
+            sid,
+            hint: hint.map(crate::state_store::hint_hash).or(old_hint),
+            created: prev.as_ref().map_or(now, |m| m.created),
+            atime: now,
+            n_tokens: n,
+            blocks: live,
+            snaps,
+        };
+        Some(Staged::new(st, blocks, head_key, head_c, head_payload, m, absorbed, n, self.cache.epoch))
+    }
+
+    /// v0.1.3 phase 3 (worker lock again): commit what [`Worker::stage_persist`] staged and phase 2
+    /// wrote (`written`). The manifest goes in unless a newer write of the same lineage landed
+    /// meanwhile; when the live state is still the staged one, the optional RAM checkpoints and the
+    /// budget follow on the lock (cut by `cancel` between and inside files).
+    pub fn commit_staged(&mut self, s: crate::state_store::Staged, written: Result<u64, String>, hint: Option<&str>, cancel: Option<&std::sync::atomic::AtomicBool>) -> PersistReport {
+        let mut rep = PersistReport::default();
+        let Some(st) = self.states.as_mut() else {
+            s.release();
+            return rep;
+        };
+        let bytes = match written {
+            Ok(b) => b,
+            Err(e) => {
+                s.release();
+                eprintln!("oxe-server: state cache: off-lock write failed: {e}");
+                rep.note = Some(format!("off-lock write failed: {e}"));
+                return rep;
+            }
+        };
+        if st.manifests.get(&s.manifest.sid).is_some_and(|m| m.n_tokens > s.n) {
+            // a newer write of this lineage landed while ours was on its way; ours is older (its
+            // files are swept at the next enforce)
+            s.release();
+            rep.note = Some("superseded by a newer write".into());
+            return rep;
+        }
+        let r = st.put_manifest(s.manifest.clone());
+        s.release();
+        if let Err(e) = r {
+            eprintln!("oxe-server: state cache: manifest not written: {e}");
+            rep.note = Some(format!("manifest not written: {e}"));
+            return rep;
+        }
+        for a in &s.absorbed {
+            st.drop_session(a);
+        }
+        let new_blocks = s.blocks.iter().filter(|b| b.3.is_some()).count();
+        st.stats.blocks_written += new_blocks as u64;
+        st.stats.snaps_written += 1;
+        st.stats.bytes_written += bytes;
+        rep.blocks = new_blocks;
+        rep.bytes = bytes;
+        rep.head = Some(s.n);
+        rep.sid = Some(s.manifest.sid.clone());
+        if self.cache.epoch == s.epoch && self.cache.tokens.len() == s.n {
+            self.live_blocks = s.manifest.blocks.clone();
+            self.cache.low_water = s.n;
+            self.persisted_head = Some(s.head_key.clone());
+            self.state_dirty = false;
+            let r2 = self.persist(hint, PersistMode::Reply, cancel);
+            rep.snaps = r2.snaps;
+            rep.bytes += r2.bytes;
+            rep.note = r2.note;
+        } else if let Some(st) = self.states.as_mut() {
+            st.enforce(Some(&s.manifest.sid));
         }
         rep
     }
@@ -926,7 +1241,7 @@ impl<E: Engine> Worker<E> {
     /// M1: inside a long prefill, write the progress every `persist_every` new tokens (called
     /// between prefill chunks, where the engine and the cache agree). Never fails the request.
     fn persist_progress(&mut self, p: &GenParams) {
-        if self.persist_every == 0 || self.states.as_ref().is_none_or(|s| s.budget == 0) || self.engine.kv_row_bytes() == 0 {
+        if p.ephemeral || self.persist_every == 0 || self.states.as_ref().is_none_or(|s| s.budget == 0) || self.engine.kv_row_bytes() == 0 {
             return;
         }
         let n = self.cache.tokens.len();
@@ -948,6 +1263,7 @@ impl<E: Engine> Worker<E> {
     /// a consistent prefix of the prompt (a retry resumes from it).
     fn prefill_chunks(&mut self, seg: &[Token], base: usize, u: usize, p: &GenParams) -> Result<(), GenError> {
         let mut i = 0;
+        p.note_progress(self.cache.tokens.len(), None);
         while i < seg.len() {
             if p.cancelled() {
                 return Err(GenError::Cancelled);
@@ -970,6 +1286,7 @@ impl<E: Engine> Worker<E> {
             // parking keeps (P1), so a retry after another request still resumes it
             self.cache.prompt_len = self.cache.tokens.len();
             i += take;
+            p.note_progress(self.cache.tokens.len(), None);
             self.persist_progress(p);
         }
         Ok(())
@@ -978,6 +1295,9 @@ impl<E: Engine> Worker<E> {
     /// Write parked sessions evicted from RAM to the session cache.
     fn spill_sessions(&mut self) {
         let out = std::mem::take(&mut self.cache.spilled);
+        if !self.legacy_writes {
+            return; // store-depth: the state store holds them (the park write put them there)
+        }
         if let Some(st) = &mut self.sessions {
             for (t, b) in out {
                 if !st.contains(&t) {
@@ -995,7 +1315,7 @@ impl<E: Engine> Worker<E> {
     /// session through the session-cache lookup. Off unless `--park-disk-min-bytes` and
     /// `--session-cache` are set. Returns the number of entries written.
     pub(crate) fn park_large(&mut self, prompt: &[Token]) -> usize {
-        if self.cache.park_disk_min == 0 || self.sessions.is_none() {
+        if self.cache.park_disk_min == 0 || self.sessions.is_none() || !self.legacy_writes {
             return 0;
         }
         let Some(keep) = self.cache.park_keep(prompt) else { return 0 };
@@ -1013,6 +1333,7 @@ impl<E: Engine> Worker<E> {
         for (pos, snap) in self.cache.take_points_above(keep, 2) {
             if self.engine.restore(&snap).is_ok() {
                 self.cache.tokens.truncate(pos);
+                self.cache.epoch += 1;
                 self.cache.low_water = self.cache.low_water.min(pos);
                 self.cache.prompt_len = self.cache.prompt_len.min(pos);
                 self.cache.clean = false;
@@ -1190,7 +1511,9 @@ impl<E: Engine> Worker<E> {
     /// Bring the engine to `prompt[..n-1]` (prefix cache, disk stores, grid checkpoints, cancel
     /// checks); returns n_cached. The caller evaluates the last token.
     fn prefill_head(&mut self, prompt: &[Token], p: &GenParams) -> Result<usize, GenError> {
+        self.park_to_states(prompt, p);
         self.state_dirty = true;
+        self.snaps_pending = true;
         let t_resume = Instant::now();
         let unpark0 = self.cache.stats.unpark_ms;
         // P2b preload: the state the preload loaded is adopted when this prompt continues it
@@ -1255,23 +1578,55 @@ impl<E: Engine> Worker<E> {
         self.progress_mark = n_cached;
         let n = prompt.len();
         // checkpoint plan for the head prompt[n_cached..n-1] (see cache.rs)
-        let (aligned, splits) = if self.msg_split { self.plan_messages(p, n_cached, n) } else { self.plan_grid(p, n_cached, n) };
+        let (aligned, mut splits) = if self.msg_split { self.plan_messages(p, n_cached, n) } else { self.plan_grid(p, n_cached, n) };
+        // v0.1.3 exact points (grid schedule only): the pre-think point and a compaction request's cut.
+        // Off the ubatch grid: the state AT such a point is still that of a cold grid prefill (the
+        // segment up to it starts on the grid), the positions after it are not (`clean` false).
+        // Both are functions of the prompt, so the request's numerics are deterministic.
+        if !self.msg_split {
+            let ok = |x: usize| x > n_cached && x < n - 1;
+            if let Some(pt) = p.pre_think.filter(|&x| ok(x) && self.cache.max_pre > 0) {
+                splits.push((pt, Some(crate::cache::PRIO_PRETHINK)));
+            }
+            if self.cut_snapshots && p.turn_kind.as_deref() == Some("compaction") {
+                if let Some(c) = p.user_starts.last().copied().filter(|&x| ok(x)) {
+                    splits.push((c, Some(crate::cache::PRIO_CUT)));
+                }
+            }
+            splits.sort_by_key(|x| x.0);
+            splits.dedup_by(|b, a| {
+                if a.0 == b.0 {
+                    if b.1.map_or(0, |x| crate::cache::rank(x) + 1) > a.1.map_or(0, |x| crate::cache::rank(x) + 1) {
+                        a.1 = b.1;
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         // cancel cuts (prefill_chunks): on the grid schedule the checkpoint grid `base + k*u`; on the
         // message schedule each segment's own start (segments start at message starts and the
         // engine chunks a call by `u` from its start), so a cut never moves a ubatch boundary
         let u = self.ubatch.max(1);
         let grid_base = if self.cache.clean && n_cached % u == 0 { 0 } else { n_cached };
         let msg_split = self.msg_split;
+        // past an exact point off the lattice the state is no longer that of a cold grid prefill
+        let mut off_grid = false;
         for (pos, prio) in splits {
             let start = self.cache.tokens.len();
             let seg = &prompt[start..pos];
             if !seg.is_empty() {
                 self.prefill_chunks(seg, if msg_split { start } else { grid_base }, u, p)?;
             }
-            self.cache.clean = aligned;
+            let clean = aligned && !off_grid;
+            self.cache.clean = clean;
+            if !msg_split && (pos.saturating_sub(grid_base)) % u != 0 {
+                off_grid = true;
+            }
             let Some(prio) = prio else { continue };
-            self.cache.checkpoint_with(&mut self.engine, prio, aligned)?;
-            if prio == crate::cache::PRIO_ANCHOR && aligned {
+            self.cache.checkpoint_with(&mut self.engine, prio, clean)?;
+            if prio == crate::cache::PRIO_ANCHOR && clean && !p.ephemeral {
                 if let Some(st) = &mut self.store {
                     if pos >= st.min_tokens && !st.contains(&prompt[..pos]) {
                         // FLASH-PREFIX-2: no state buffer while memory is short (checked BEFORE it is built)
@@ -1279,9 +1634,11 @@ impl<E: Engine> Worker<E> {
                         if let Err(why) = st.save_allowed(hint) {
                             eprintln!("oxe-server: prefix store: save of {pos} tokens skipped: {why}");
                         } else {
-                            match self.engine.save_state_vec() {
-                                Ok(buf) => st.save_async(prompt[..pos].to_vec(), buf),
-                                Err(e) => eprintln!("oxe-server: prefix store: {}", e.0),
+                            // v0.1.3 (lane G ask): streamed into the entry file, no state-sized
+                            // buffer (285 MB for a Flash anchor); written here, on the request path
+                            let eng = &mut self.engine;
+                            if let Err(e) = st.save_stream(&prompt[..pos], &mut |w| eng.save_state(w).map_err(|e| e.0)) {
+                                eprintln!("oxe-server: prefix store: {e}");
                             }
                         }
                     }
@@ -1293,10 +1650,35 @@ impl<E: Engine> Worker<E> {
         let head = &prompt[start..n - 1];
         if !head.is_empty() {
             self.prefill_chunks(head, if msg_split { start } else { grid_base }, u, p)?;
-            self.cache.clean = aligned;
-            self.cache.checkpoint_with(&mut self.engine, crate::cache::PRIO_TAIL, aligned)?;
+            self.cache.clean = aligned && !off_grid;
+            self.cache.checkpoint_with(&mut self.engine, crate::cache::PRIO_TAIL, aligned && !off_grid)?;
         }
         Ok(n_cached)
+    }
+
+    /// v0.1.3 (lane B item 3): this request is about to cut the live session back (its prompt does
+    /// not continue it): put what of it is not on disk yet (blocks, head, RAM checkpoints worth
+    /// keeping, at most `--state-snaps`) into the state store first, on the request path, so the
+    /// parked session keeps its resume points (a post-reply write a request cut short, an idle
+    /// gap too short for the checkpoints). Nothing to do after a complete post-reply write.
+    fn park_to_states(&mut self, prompt: &[Token], p: &GenParams) {
+        if !self.park_write || !p.cache_prompt || !(self.state_dirty || self.snaps_pending) || self.engine.kv_row_bytes() == 0 {
+            return;
+        }
+        let Some(st) = self.states.as_ref() else { return };
+        let n = self.cache.tokens.len();
+        if st.budget == 0 || n < st.min_tokens || self.preloaded.is_some() {
+            return;
+        }
+        let lcp = self.cache.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        if lcp >= n {
+            return;
+        }
+        let t0 = Instant::now();
+        let r = self.persist(None, PersistMode::Reply, p.cancel.as_deref());
+        if r.head.is_some() || r.snaps > 0 {
+            eprintln!("oxe-server: state cache: the session being left was written first ({}, {} snapshots) in {:.0} ms", r.line(), r.snaps, t0.elapsed().as_secs_f64() * 1e3);
+        }
     }
 
     /// SX-2 idle re-prefill: prefill `hist` (the conversation in the form the next request will
@@ -1354,8 +1736,19 @@ impl<E: Engine> Worker<E> {
         if prompt.len() >= n_ctx {
             return Err(GenError::ExceedContext(prompt.len(), n_ctx));
         }
+        p.note_progress(0, Some(prompt.len()));
         // F4: the engine may stop inside a prefill call on this flag; cleared again whatever happens
         self.engine.set_cancel(p.cancel.clone());
+        if p.ephemeral {
+            let local = self.enter_ephemeral();
+            // nothing of the request may name or find a stored conversation
+            let q = GenParams { cache_prompt: false, session: None, turn_kind: None, echo: None, ..p.clone() };
+            let r = self.generate_inner(tok, prompt, &q, on_partial);
+            self.engine.set_cancel(None);
+            // whatever happened (an engine error too), its state is dropped here
+            self.leave_ephemeral(local);
+            return r;
+        }
         let r = self.generate_inner(tok, prompt, p, on_partial);
         self.engine.set_cancel(None);
         if let Err(GenError::Engine(e)) = &r {
@@ -1363,6 +1756,59 @@ impl<E: Engine> Worker<E> {
             self.cache.reset(&mut self.engine);
         }
         r
+    }
+
+    /// LAN share, before an ephemeral request: the local live session is taken out of the engine
+    /// whole (RAM copy, within the park budget; the parked sessions are not touched) and comes back
+    /// after it. When it cannot be held, its unwritten state goes to the state store first (the park
+    /// write a session switch makes; local content only). The ephemeral request then starts from an
+    /// empty engine (`cache_prompt` off: no lookup anywhere).
+    fn enter_ephemeral(&mut self) -> Option<HeldLocal<E::Snapshot>> {
+        if self.cache.tokens.is_empty() {
+            return None;
+        }
+        let held = self.cache.hold_live(&mut self.engine);
+        if held.is_none() {
+            let local = GenParams { cache_prompt: true, ..Default::default() };
+            self.park_to_states(&[], &local);
+            return None;
+        }
+        Some(HeldLocal {
+            held,
+            live_blocks: std::mem::take(&mut self.live_blocks),
+            progress_mark: self.progress_mark,
+            state_dirty: self.state_dirty,
+            snaps_pending: self.snaps_pending,
+            last_first_user: self.last_first_user,
+        })
+    }
+
+    /// LAN share, after an ephemeral request (also after an error or a cancel): its state is dropped
+    /// (engine and cache reset: nothing of it to write, resume from or match a prefix against) and
+    /// the held local session, if any, is live again exactly as it was.
+    fn leave_ephemeral(&mut self, local: Option<HeldLocal<E::Snapshot>>) {
+        self.cache.reset(&mut self.engine);
+        self.live_blocks.clear();
+        self.progress_mark = 0;
+        self.state_dirty = false;
+        self.snaps_pending = false;
+        self.last_first_user = None;
+        let Some(mut l) = local else { return };
+        let Some(h) = l.held.take() else { return };
+        match self.cache.restore_held(&mut self.engine, h) {
+            Ok(n) if n > 0 => {
+                self.live_blocks = l.live_blocks;
+                self.progress_mark = l.progress_mark;
+                self.state_dirty = l.state_dirty;
+                self.snaps_pending = l.snaps_pending;
+                self.last_first_user = l.last_first_user;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("oxe-server: the local session could not be restored after a shared request: {}", e.0);
+                self.cache.reset(&mut self.engine);
+            }
+        }
     }
 
     fn generate_inner(
@@ -1377,6 +1823,7 @@ impl<E: Engine> Worker<E> {
         let stats0 = self.cache.stats.clone();
         let n_cached = self.prefill_head(prompt, p)?;
         self.state_dirty = true;
+        self.snaps_pending = true;
         let n = prompt.len();
         let last = &prompt[n - 1..];
         let mut logits = self.engine.prefill(last)?.to_vec();
@@ -1634,7 +2081,9 @@ impl<E: Engine> Worker<E> {
         self.cache.checkpoint(&mut self.engine)?;
         let checkpoint_ms = tc.elapsed().as_secs_f64() * 1e3;
         let predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
-        self.save_warm(false);
+        if !p.ephemeral {
+            self.save_warm(false);
+        }
         if let Some(f) = &mut self.ledger {
             use std::io::Write;
             let s = &self.cache.stats;
@@ -1650,6 +2099,7 @@ impl<E: Engine> Worker<E> {
                 "park_evictions": s.park_evictions - stats0.park_evictions,
                 "checkpoints": self.cache.snapshot_positions().len(), "parked": self.cache.parked_lengths().len(),
                 "parked_mib": self.cache.parked_bytes() >> 20,
+                "turn_kind": p.turn_kind, "pre_think": p.pre_think.is_some(),
             });
             if let (Some(serde_json::Value::Object(e)), serde_json::Value::Object(l)) = (&p.echo, &mut line) {
                 for (k, v) in e {

@@ -241,17 +241,32 @@ void i8g_fattn_pv_f16(const float16_t *restrict pt, const float16_t *restrict vt
 }
 
 // ---- conversion ----------------------------------------------------------------------------------
-// dst[i * stride] = f16(x[i]) (round to nearest even; overflow -> inf), n any.
+// dst[i * stride] = f16(x[i]) (round to nearest even), n any. SATURATING (F-IMG-ATTN-b): |x| beyond the
+// largest finite f16 becomes +-65504 instead of +-inf, so one finite outlier q/k/v value cannot turn a
+// whole softmax row into NaN. Values inside the f16 range convert exactly as before (vcvt rounds
+// anything below 65520 to at most 65504 anyway). Non-finite inputs are NOT hidden: NaN stays NaN
+// (FMIN/FMAX propagate it) and +-inf stays +-inf, so the non-finite checks downstream still fire. This is the only f16 store of an unbounded value: the softmax
+// probabilities (<= 1) and the f32 arms never overflow.
+#define I8G_F16_MAX 65504.0f
 void i8g_fattn_to_f16(const float *restrict x, size_t n, float16_t *restrict dst, size_t stride) {
+    const float32x4_t hi = vdupq_n_f32(I8G_F16_MAX), lo = vdupq_n_f32(-I8G_F16_MAX);
+    const float32x4_t inf = vdupq_n_f32(__builtin_inff());
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
-        const float16x4_t h = vcvt_f16_f32(vld1q_f32(x + i));
+        const float32x4_t v = vld1q_f32(x + i);
+        const float32x4_t c = vmaxq_f32(vminq_f32(v, hi), lo);
+        const float16x4_t h = vcvt_f16_f32(vbslq_f32(vceqq_f32(vabsq_f32(v), inf), v, c));
         dst[(i + 0) * stride] = vget_lane_f16(h, 0);
         dst[(i + 1) * stride] = vget_lane_f16(h, 1);
         dst[(i + 2) * stride] = vget_lane_f16(h, 2);
         dst[(i + 3) * stride] = vget_lane_f16(h, 3);
     }
-    for (; i < n; i++) dst[i * stride] = (float16_t)x[i];
+    for (; i < n; i++) {
+        float v = x[i];
+        if (v > I8G_F16_MAX && v != __builtin_inff()) v = I8G_F16_MAX;
+        else if (v < -I8G_F16_MAX && v != -__builtin_inff()) v = -I8G_F16_MAX;
+        dst[i * stride] = (float16_t)v;
+    }
 }
 
 // x[i] = f32(src[i]) (exact).

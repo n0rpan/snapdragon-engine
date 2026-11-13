@@ -7,7 +7,7 @@ use server::generate::Worker;
 use server::service::{Config, State};
 use std::sync::Arc;
 
-const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0.0.1] [--port 8080]
+const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0.0.1 (non-loopback needs an API key)] [--port 8080]
   [--ctx-size N] [--ctx-checkpoints N] [--chat-template-kwargs JSON] [--reasoning-format none|auto|deepseek]
   [--reasoning on|off] [--slots] [--idle-reprefill (SX-2, off by default)] [--engine stub|oxe|flash (stub: tokenizer + template only, no weights: /apply-template, /tokenize)] [--stub-reply TEXT] [--echo on|off (CACHE-PERFECT ECHO, default on)] [--echo-max-tokens 4194304] [--echo-ttl-secs 604800] [--oxe-cpus 0-7]
   [--oxe-prefill-cpus LIST (default: --oxe-cpus)] [--ubatch-size 256 (oxe prefill ubatch)]
@@ -22,10 +22,21 @@ const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0
    streamed, instead of a RAM copy; e.g. 536870912 for 128K contexts)]
   [--session-cache DIR (off; whole conversations on disk, written on RAM eviction and on SIGTERM unless --state-cache)]
   [--session-cache-max-bytes N (8 GiB)] [--session-cache-ttl-hours N (24)]
+  [--session-cache-writes auto|on|off (auto: off while --state-cache and --state-park-write are on;
+   the legacy session cache is then read only, the state store holds every session at least as deep)]
   [--state-cache DIR|default (CACHE-PERFECT P2 disk state store, off unless given; DIR is the root shared by
    all models, inside the home; default = ~/.cache/local-ai/snapdragon-engine/state)] [--state-budget-bytes N
    (64000000000; one budget over every model under DIR; 0 = off)] [--state-ttl-secs N (604800)]
    [--state-min-tokens N (1024)] [--state-cache-strict-build (the binary's sha in the identity: gates)]
+  v0.1.3 cache-deep (each on by default; off restores the v0.1.2 behaviour of that part):
+   [--pre-think-snapshots N (2; RAM checkpoints just before a thinking turn's <think>; 0 = off)]
+   [--turn-user-window N (16384; user-message starts in the last N tokens come first among turn checkpoints; 0 = off)]
+   [--compaction-cut on|off (on; X-Oxe-Turn-Kind: compaction takes a checkpoint exactly at its cut)]
+   [--state-snaps N (12; disk snapshots per session)] [--state-park-write on|off (on; a session being left
+   is written to the state store first)] [--state-write-offlock on|off (on; post-reply head + blocks written
+   without the worker lock)] [--state-budget-scope global|own (global: evict across every model under DIR)]
+   [--echo-compact-bytes N (4194304; rewrite a session's echo file with its live records; 0 = never)]
+  [--flash-pf-protect-hot 0|1 (F123: protect hot residents inside one batched Flash op; default 0)]
   capabilities: oxe-capability state-preload-v1 (POST /state-cache/preload; the controller's read-only
    binary probe looks for this literal: route strings need not survive LTO as one string)
   [--ledger PATH (off; one JSON line of numbers per generation, appended, mode 0600)]
@@ -33,11 +44,17 @@ const USAGE: &str = "usage: oxe-server --model PATH [--alias NAME] [--host 127.0
    \"Authorization: Bearer KEY\")] [--api-key KEY (visible in argv: prefer the file)]
   [--allow-host NAME (extra accepted Host name; default only 127.0.0.1 / localhost / [::1] with the port)]
   [--stream-stall-timeout SECS (30: a streaming client that takes no data this long is dropped, its generation cancelled)]
+  [--sse-keepalive SECS (15; env OXE_SSE_KEEPALIVE_SECS; 0 = off: a streamed request that waits or prefills sends an SSE
+   comment \": prefill DONE/TOTAL Ns\" this often until its first token; SSE parsers ignore comments)]
   [--repeat-watchdog N (stop a generation that ends in a token loop within the last N tokens; 0 = off)]
   [--mtp-head GGUF (MTP block from a sidecar; default <model>.mtp-head.gguf if present)]
   [--mtp-tune FILE (measured MTP depth per context bucket; default <model>.mtp-tune.json if present)]
   [--pf-group-t1 N (100) --pf-group-t2 N (0 = never): prefill calls of >= T1 new tokens run 2 ubatches per pass,
    >= T2 run 4; same state at every setting. OXE_PF_GROUP=1|2|4 fixes the group, OXE_PF_TILES=<mask> the kernels]
+  [--pf-attn auto|tiled|fa2|fa2x (env OXE_PF_ATTN; default auto) --pf-attn-auto-min-kv N|legacy (env
+   OXE_PF_ATTN_AUTO_MIN_KV; auto runs the fa2-class kernel for prefill units beyond n_kv N, clamped to
+   8192..131072, tiled below; default legacy = fa2 only when --ctx-size > 131072, until AP-1 measures the
+   crossover) --pf-attn-auto-kernel fa2|fa2x (env OXE_PF_ATTN_AUTO_KERNEL; default fa2)]
   [--mtp-max-ctx N (no MTP speculation at or beyond context position N; decided per verify)]
   [--spec-type lookup (prompt-lookup drafting, engines without MTP) [--lookup-kmin 4] [--lookup-n 4] [--lookup-backoff 0]]
   (per request: \"speculative\": false turns speculation off, \"spec_draft_n_max\": n sets the depth)
@@ -59,6 +76,7 @@ const IGNORED: &[(&str, bool)] = &[
 ];
 
 fn main() {
+    server::startup_check::run(USAGE); // lane G (v0.1.3): CPU features, OXE_* env, --help / --check-args, EPIPE
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut model = None;
     let mut alias = None;
@@ -159,6 +177,15 @@ fn main() {
     let mut state_ttl: u64 = 7 * 24 * 3600;
     let mut state_min: usize = 1024;
     let mut state_strict = false;
+    // v0.1.3 cache-deep switches (see USAGE)
+    let mut pre_think: usize = 2;
+    let mut user_window: usize = 16 << 10;
+    let mut cut_snapshots = true;
+    let mut state_snaps: usize = server::state_store::MAX_SNAPS;
+    let mut park_write = true;
+    let mut session_writes = String::from("auto");
+    let mut offlock = true;
+    let mut budget_global = true;
     let mut i = 0;
     let need = |i: usize| -> String {
         args.get(i + 1).cloned().unwrap_or_else(|| {
@@ -215,6 +242,13 @@ fn main() {
             "--park-min-tokens" => park_min = need(i).parse().expect("--park-min-tokens"),
             "--park-disk-min-bytes" => park_disk_min = need(i).parse().expect("--park-disk-min-bytes"),
             "--session-cache" => session_dir = Some(need(i)),
+            "--session-cache-writes" => {
+                session_writes = need(i);
+                if server::generate::legacy_session_writes(&session_writes, false, false).is_none() {
+                    eprintln!("--session-cache-writes {session_writes}: auto|on|off");
+                    std::process::exit(2)
+                }
+            }
             "--state-cache" => state_dir = Some(need(i)),
             "--state-budget-bytes" => state_budget = need(i).parse().expect("--state-budget-bytes"),
             "--state-ttl-secs" => state_ttl = need(i).parse().expect("--state-ttl-secs"),
@@ -223,6 +257,49 @@ fn main() {
                 state_strict = true;
                 used = 1;
             }
+            "--pre-think-snapshots" => pre_think = need(i).parse().expect("--pre-think-snapshots"),
+            "--turn-user-window" => user_window = need(i).parse().expect("--turn-user-window"),
+            "--state-snaps" => state_snaps = need(i).parse::<usize>().ok().filter(|&n| n >= 1).expect("--state-snaps: a number >= 1"),
+            "--compaction-cut" | "--state-park-write" | "--state-write-offlock" => {
+                let on = match need(i).as_str() {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    x => {
+                        eprintln!("{a} {x}: on|off");
+                        std::process::exit(2)
+                    }
+                };
+                match a {
+                    "--compaction-cut" => cut_snapshots = on,
+                    "--state-park-write" => park_write = on,
+                    _ => offlock = on,
+                }
+            }
+            "--state-budget-scope" => {
+                budget_global = match need(i).as_str() {
+                    "global" => true,
+                    "own" => false,
+                    x => {
+                        eprintln!("--state-budget-scope {x}: global|own");
+                        std::process::exit(2)
+                    }
+                };
+                // read by StateStore::open, whose start-up pass already applies the budget (single-threaded here)
+                std::env::set_var("OXE_STATE_BUDGET_SCOPE", if budget_global { "global" } else { "own" });
+            }
+            // F123 (lane G): protect hot residents in a batched Flash op; the flag sets the engine's switch
+            "--flash-pf-protect-hot" => std::env::set_var(
+                "OXE_FLASH_PF_PROTECT_HOT",
+                match need(i).as_str() {
+                    "1" | "on" => "1",
+                    "0" | "off" => "0",
+                    x => {
+                        eprintln!("--flash-pf-protect-hot {x}: 0|1");
+                        std::process::exit(2)
+                    }
+                },
+            ),
+            "--echo-compact-bytes" => std::env::set_var("OXE_ECHO_COMPACT_BYTES", need(i).parse::<u64>().expect("--echo-compact-bytes").to_string()),
             "--ledger" => ledger = Some(need(i)),
             "--api-key-file" => api_key_file = Some(need(i)),
             "--api-key" => {
@@ -231,6 +308,7 @@ fn main() {
             }
             "--allow-host" => allow_hosts.push(need(i).trim().to_ascii_lowercase()),
             // S8: read by State::new (single-threaded here)
+            "--sse-keepalive" => std::env::set_var("OXE_SSE_KEEPALIVE_SECS", need(i).parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).expect("--sse-keepalive").to_string()),
             "--stream-stall-timeout" => std::env::set_var("OXE_STREAM_STALL_SECS", need(i).parse::<f64>().ok().filter(|v| *v > 0.0).expect("--stream-stall-timeout").to_string()),
             "--session-cache-max-bytes" => session_max = need(i).parse().expect("--session-cache-max-bytes"),
             "--session-cache-ttl-hours" => session_ttl_h = need(i).parse().expect("--session-cache-ttl-hours"),
@@ -391,6 +469,31 @@ fn main() {
             // set before the engine reads them (single-threaded here)
             "--pf-group-t1" => std::env::set_var("OXE_PF_GROUP_T1", need(i).parse::<usize>().expect("--pf-group-t1").to_string()),
             "--pf-group-t2" => std::env::set_var("OXE_PF_GROUP_T2", need(i).parse::<usize>().expect("--pf-group-t2").to_string()),
+            // PREFILL-POLICY (v0.1.3 #2): validated here, read by the engine from the environment
+            "--pf-attn" => {
+                let v = need(i);
+                if model::engine::PfAttn::parse(&v).is_none() {
+                    eprintln!("--pf-attn {v}: auto|tiled|fa2|fa2x");
+                    std::process::exit(2)
+                }
+                std::env::set_var("OXE_PF_ATTN", v.trim().to_ascii_lowercase())
+            }
+            "--pf-attn-auto-min-kv" => {
+                let v = need(i);
+                if model::engine::AutoPolicy::parse_min_kv(&v).is_none() {
+                    eprintln!("--pf-attn-auto-min-kv {v}: a position count or legacy");
+                    std::process::exit(2)
+                }
+                std::env::set_var("OXE_PF_ATTN_AUTO_MIN_KV", v.trim().to_ascii_lowercase())
+            }
+            "--pf-attn-auto-kernel" => {
+                let v = need(i);
+                if model::engine::AutoPolicy::parse_kernel(&v).is_none() {
+                    eprintln!("--pf-attn-auto-kernel {v}: fa2|fa2x");
+                    std::process::exit(2)
+                }
+                std::env::set_var("OXE_PF_ATTN_AUTO_KERNEL", v.trim().to_ascii_lowercase())
+            }
             "--mtp-max-ctx" => mtp_max_ctx = Some(need(i).parse().expect("--mtp-max-ctx")),
             "--lookup-kmin" => lookup_cfg.kmin = need(i).parse().expect("--lookup-kmin"),
             "--lookup-n" => lookup_cfg.n_max = need(i).parse().expect("--lookup-n"),
@@ -431,6 +534,11 @@ fn main() {
     }
     if api_keys.iter().any(|k| k.is_empty()) {
         eprintln!("oxe-server: empty API key");
+        std::process::exit(2)
+    }
+    // S12: no LAN bind without a key (the Host check is a rebinding guard, not authentication)
+    if let Err(e) = server::http::check_bind(&host, !api_keys.is_empty()) {
+        eprintln!("oxe-server: {e}");
         std::process::exit(2)
     }
     // a specific non-loopback bind address is a Host name its clients use
@@ -554,6 +662,14 @@ fn main() {
         state_ttl,
         state_min,
         state_strict,
+        pre_think,
+        user_window,
+        cut_snapshots,
+        state_snaps,
+        park_write,
+        offlock,
+        budget_global,
+        session_writes,
     };
     match engine.as_str() {
         "stub" => {
@@ -640,6 +756,8 @@ fn main() {
                 eprintln!("oxe engine: {e}");
                 std::process::exit(1)
             });
+            // PREFILL-POLICY: the resolved prefill attention path (what the state identity keys on)
+            eprintln!("oxe-server: {}", eng.pf_attn_summary());
             if let Some(mode)=oxe_npu_prefill.as_deref(){
                 #[cfg(feature="npu-prefill")]
                 eng.enable_npu_prefill(std::path::Path::new(&model),mode,oxe_npu_go_file.as_deref().map(std::path::Path::new),pcpus.as_deref().unwrap_or(&cpus)).unwrap_or_else(|e|{
@@ -753,6 +871,16 @@ struct SessionOpts {
     state_ttl: u64,
     state_min: usize,
     state_strict: bool,
+    /// v0.1.3 cache-deep switches (`--pre-think-snapshots` .. `--state-budget-scope`)
+    pre_think: usize,
+    user_window: usize,
+    cut_snapshots: bool,
+    state_snaps: usize,
+    park_write: bool,
+    offlock: bool,
+    budget_global: bool,
+    /// `--session-cache-writes auto|on|off` (v0.1.3 store-depth)
+    session_writes: String,
 }
 
 static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -790,6 +918,11 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
     w.cache.park_budget = sess.session_ram;
     w.cache.park_min = sess.park_min;
     w.cache.park_disk_min = sess.park_disk_min;
+    w.cache.max_pre = sess.pre_think;
+    w.user_window = sess.user_window;
+    w.cut_snapshots = sess.cut_snapshots;
+    w.park_write = sess.park_write;
+    w.offlock = sess.offlock;
     w.msg_split = sess.msg_split;
     // stored states are only valid for the schedule that computed them
     let sched = if sess.msg_split { " sched=messages" } else { "" };
@@ -884,6 +1017,8 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
                 match server::state_store::StateStore::open(dir, ident, sess.state_budget, sess.state_ttl, false) {
                     Ok(mut s) => {
                         s.min_tokens = sess.state_min;
+                        s.max_snaps = sess.state_snaps;
+                        s.global_budget = sess.budget_global;
                         eprintln!(
                             "oxe-server: state cache {} (model {}, {} sessions, {} MiB of {} MiB budget, numerics epoch {})",
                             dir.display(),
@@ -902,6 +1037,12 @@ fn serve<E: Engine>(cfg: Config, tok: tokenizer::Tokenizer, eng: E, sess: Sessio
         }
     }
     let state_cache = w.states.is_some();
+    // v0.1.3 store-depth: the legacy session cache is read-only while the state store holds the state
+    w.legacy_writes = server::generate::legacy_session_writes(&sess.session_writes, state_cache && w.states.as_ref().is_some_and(|s| s.budget > 0), sess.park_write).unwrap_or(true);
+    if session_cache && !w.legacy_writes {
+        w.cache.spill = false;
+        eprintln!("oxe-server: session cache: read only (--session-cache-writes {}: the state cache holds the sessions)", sess.session_writes);
+    }
     let echo_dir = w.states.as_ref().map(|s| (s.dir.join("echo"), s.ident.text.clone()));
     // a disk budget of 0: no conversation state on disk at all (Codex P2/P3 review 2): the echo
     // files and the legacy prefix / session stores are off too until the budget rises

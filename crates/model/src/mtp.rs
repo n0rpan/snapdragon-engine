@@ -330,7 +330,19 @@ pub struct MtpDriver {
     pub draft_override: Option<Box<dyn FnMut(usize, u32) -> u32 + Send>>,
     /// prefill hidden rows (reused)
     scratch: Vec<f32>,
+    /// LC-6: most tokens per `prefill_nextn` call inside [`MtpDriver::prefill_batched`] (rounded
+    /// down to a multiple of the ubatch, at least one ubatch; 0 = [`PREFILL_CHUNK_TOKENS`]). Bounds
+    /// the hidden-row scratch and the pending catch-up rows to chunk x n_embd floats each.
+    #[doc(hidden)]
+    pub prefill_chunk: usize,
 }
+
+/// LC-6: default tokens per chunk of [`MtpDriver::prefill_batched`]: 8192 x n_embd f32 = 64 MiB of
+/// hidden rows for Ornith's 2048 (plus the same for the pending MTP catch-up), not 1 GiB per
+/// 128K-token call. Exact: chunk ends fall on ubatch boundaries, so every llama.cpp ubatch, its
+/// padded n_kv and the grouped passes are what one call computes; the MTP catch-up runs the same
+/// full lane groups from the same positions (each flush leaves fewer than `mtp_lanes` pairs).
+pub const PREFILL_CHUNK_TOKENS: usize = 8192;
 
 impl MtpDriver {
     pub fn new(eng: &Engine, depth: usize) -> Result<MtpDriver, String> {
@@ -341,7 +353,7 @@ impl MtpDriver {
             return Err(format!("MTP depth {depth}: the engine verifies {} tokens per run", eng.verify_lanes()));
         }
         let ne = eng.plan.desc.n_embd;
-        let mut d = MtpDriver { depth, ne, q: 0, cu_tok: vec![], cu_h: vec![], hl: vec![0.0; ne], last_h: vec![], last: None, stats: MtpStats::default(), draft_override: None, scratch: Vec::new() };
+        let mut d = MtpDriver { depth, ne, q: 0, cu_tok: vec![], cu_h: vec![], hl: vec![0.0; ne], last_h: vec![], last: None, stats: MtpStats::default(), draft_override: None, scratch: Vec::new(), prefill_chunk: 0 };
         d.sync(eng, None);
         Ok(d)
     }
@@ -459,25 +471,29 @@ impl MtpDriver {
             self.step_plain(eng, pool, toks[0], &mut out);
             return out[0];
         }
-        let p0 = eng.pos();
-        let t0 = Instant::now();
+        let ub = ubatch.max(1);
+        let want = if self.prefill_chunk == 0 { PREFILL_CHUNK_TOKENS } else { self.prefill_chunk };
+        let chunk = (want / ub).max(1) * ub;
+        let (mut pf_s, mut seed_s) = (0f64, 0f64);
+        let mut g = 0;
         let mut hid = std::mem::take(&mut self.scratch);
-        let g = eng.prefill_nextn(team, toks, ubatch, &mut hid).expect("non-empty prompt");
-        let t1 = Instant::now();
-        let ne = self.ne;
-        self.note_with(p0, toks, |i| &hid[i * ne..(i + 1) * ne]);
+        for c in toks.chunks(chunk) {
+            let p0 = eng.pos();
+            let t0 = Instant::now();
+            g = eng.prefill_nextn(team, c, ubatch, &mut hid).expect("non-empty prompt");
+            let t1 = Instant::now();
+            let ne = self.ne;
+            self.note_with(p0, c, |i| &hid[i * ne..(i + 1) * ne]);
+            self.flush(eng, pool, eng.mtp_lanes() - 1);
+            pf_s += (t1 - t0).as_secs_f64();
+            seed_s += t1.elapsed().as_secs_f64();
+        }
         self.scratch = hid;
-        self.flush(eng, pool, eng.mtp_lanes() - 1);
-        self.stats.prefill_s += (t1 - t0).as_secs_f64();
-        self.stats.prefill_seed_s += t1.elapsed().as_secs_f64();
+        self.stats.prefill_s += pf_s;
+        self.stats.prefill_seed_s += seed_s;
         self.stats.prefill_tokens += toks.len() as u64;
         if std::env::var_os("OXE_MTP_LOG").is_some() {
-            eprintln!(
-                "oxe mtp: prefill {} tokens: prefill_nextn {:.1} ms, MTP seeding {:.1} ms",
-                toks.len(),
-                (t1 - t0).as_secs_f64() * 1e3,
-                t1.elapsed().as_secs_f64() * 1e3
-            );
+            eprintln!("oxe mtp: prefill {} tokens: prefill_nextn {:.1} ms, MTP seeding {:.1} ms", toks.len(), pf_s * 1e3, seed_s * 1e3);
         }
         self.last = None;
         g

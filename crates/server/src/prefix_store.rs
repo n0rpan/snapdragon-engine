@@ -272,6 +272,13 @@ pub struct Loaded {
     pub ms: f64,
 }
 
+/// fsync a directory (after a rename into it), best effort.
+fn fsync_dir(p: &Path) {
+    if let Ok(f) = fs::File::open(p) {
+        let _ = f.sync_all();
+    }
+}
+
 impl PrefixStore {
     /// Open (create) `dir` for entries of `identity`; drops stale `.pending` files, indexes
     /// the entries of this identity and applies the size cap.
@@ -485,6 +492,7 @@ impl PrefixStore {
                 f.sync_all()?;
                 drop_pages(&f);
                 fs::rename(&pending, &fin)?;
+                fsync_dir(&dir); // audit v0.1.2 N5: the rename itself survives a power cut
                 Ok(())
             })();
             match w {
@@ -536,6 +544,7 @@ impl PrefixStore {
             f.sync_all().map_err(io)?;
             drop_pages(&f);
             fs::rename(&pending, &fin).map_err(io)?;
+            fsync_dir(&self.dir); // audit v0.1.2 N5
             Ok(len)
         })();
         match r {

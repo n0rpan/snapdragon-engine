@@ -1,8 +1,9 @@
-//! `oxe fused-ref` (bench only, `--features f32-reference`): long-context numeric reference for
-//! the O-70 fused attention, with the declared scope of [`model::fused_ref::SCOPE`]. See
-//! `FUSED-REF.md` for the recipe, costs and gate. Never a server setting.
+//! `oxe fused-ref --candidate prefill-fa2|prefill-fa2x|fused-decode` (bench only, `--features
+//! f32-reference`): the O-117 quality runner, with the declared scope of
+//! [`model::fused_ref::SCOPE`]. See `FUSED-REF.md` for the recipe, costs and gate. Never a server
+//! setting.
 use super::*;
-use model::fused_ref::{self, Gate};
+use model::fused_ref::{self, Candidate, Control, Gate, Report, Verdict};
 
 /// Synthetic mixed continuation (chat markup, tool-call JSON, code, logs, prose); no real data.
 const FIXTURE: &str = include_str!("../fixtures/fused-ref-continuation.txt");
@@ -23,13 +24,77 @@ fn text_tokens(tk: &tokenizer::Tokenizer, path: &str, need: usize) -> Vec<u32> {
     }
 }
 
-pub(super) fn run(a: &Args) {
+/// The validated fused-ref options (dies on a bad value): shared by the run and `--check-args`.
+struct Opts {
+    cand: Candidate,
+    control: Control,
+    gate: Gate,
+    p: usize,
+    n: usize,
+    n_samples: usize,
+    ubatch: usize,
+}
+
+fn opts(a: &Args) -> Opts {
+    let cand = a.get("candidate").and_then(Candidate::parse).unwrap_or_else(|| {
+        die("--candidate prefill-fa2 | prefill-fa2x | fused-decode required (O-117: the candidate is explicit; prefill candidates run genuinely batched prefill)")
+    });
     let p = a.get("prefix-len").map(|_| a.num("prefix-len", 0)).unwrap_or_else(|| die("--prefix-len P required (32768, 65536, ..)"));
     let n = a.num("n", 1000);
     let n_samples = a.num("ref-samples", 200);
-    if p < 64 || n == 0 || n_samples == 0 {
-        die("fused-ref needs --prefix-len >= 64, --n >= 1, --ref-samples >= 1");
+    let ubatch = a.num("ubatch", model::engine::UBATCH);
+    if p < 64 || n == 0 || n_samples == 0 || ubatch == 0 {
+        die("fused-ref needs --prefix-len >= 64, --n >= 1, --ref-samples >= 1, --ubatch >= 1");
     }
+    let control = match a.get("control") {
+        Some(c) => Control::parse(c).unwrap_or_else(|| die(&format!("--control {c}: decode | ubatch:N"))),
+        None if cand.is_prefill() => Control::Decode,
+        None => Control::Ubatch(model::engine::UBATCH),
+    };
+    if cand == Candidate::FusedDecode && control == Control::Decode {
+        die("fused-decode: the incumbent is the tiled decode; the control must be batched (--control ubatch:N)");
+    }
+    let num = |k: &str, d: f64| {
+        let v = a.get(k).map(|v| v.parse::<f64>().unwrap_or_else(|_| die(&format!("--{k}: not a number")))).unwrap_or(d);
+        if !v.is_finite() || v < 0.0 {
+            die(&format!("--{k}: a finite number >= 0"));
+        }
+        v
+    };
+    let def = Gate::default();
+    let gate = Gate {
+        kld_factor: num("kld-factor", def.kld_factor),
+        top1_slack: num("top1-slack-pp", def.top1_slack * 100.0) / 100.0,
+        ref_ratio_max: num("ref-ratio-max", def.ref_ratio_max),
+        jump_threshold: num("jump-threshold", def.jump_threshold),
+        ..def
+    };
+    Opts { cand, control, gate, p, n, n_samples, ubatch }
+}
+
+/// `oxe fused-ref ... --check-args`: the resolved options (no tokenizer, no model), then the
+/// generic unknown-option check (exit 0, or 1 on any bad value / unknown option).
+pub(super) fn check_args(a: &Args) {
+    let o = opts(a);
+    for k in ["model", "state-file", "out"] {
+        if a.get(k).is_none() {
+            die(&format!("--{k} required"));
+        }
+    }
+    if a.get("prefix-ids-file").is_some() == a.get("text-file").is_some() {
+        die("exactly one of --prefix-ids-file F or --text-file F");
+    }
+    println!(
+        "{}",
+        json!({"fused_ref_resolved": {"candidate": o.cand.name(), "control": o.control.name(), "prefix_len": o.p, "n": o.n, "ref_samples": o.n_samples,
+            "ubatch": o.ubatch, "kld_factor": o.gate.kld_factor, "top1_slack": o.gate.top1_slack, "ref_ratio_max": o.gate.ref_ratio_max,
+            "jump_threshold": o.gate.jump_threshold, "min_positions": o.gate.min_positions, "min_ref_samples": o.gate.min_ref_samples}})
+    );
+    a.check_known();
+}
+
+pub(super) fn run(a: &Args) {
+    let Opts { cand, control, gate, p, n, n_samples, ubatch } = opts(a);
     let tk = tokenizer::Tokenizer::from_gguf(a.model()).unwrap_or_else(|e| die(&format!("tokenizer: {e:?}")));
     // prefix: ids file (the same ids as a prefill-bench --prefix-ids-file state) or a text file
     let src = match (a.get("prefix-ids-file"), a.get("text-file")) {
@@ -55,31 +120,26 @@ pub(super) fn run(a: &Args) {
         die("--ctx must exceed prefix + n");
     }
     let samples = fused_ref::sample_positions(n, n_samples);
-    let mut gate = Gate {
-        noise_floor_kld: a.get("noise-floor-kld").map(|v| v.parse().unwrap_or_else(|_| die("--noise-floor-kld"))).unwrap_or(f64::NAN),
-        ref_ratio_max: a.get("ref-ratio-max").map(|v| v.parse().unwrap_or_else(|_| die("--ref-ratio-max"))).unwrap_or(1.1),
-        jump_threshold: a.get("jump-threshold").map(|v| v.parse().unwrap_or_else(|_| die("--jump-threshold"))).unwrap_or(1e-3),
-        margin: a.get("margin").map(|v| v.parse().unwrap_or_else(|_| die("--margin"))).unwrap_or(5.0),
-        ..Gate::default()
-    };
+    let scope_label = format!(
+        "O-117 R2 clauses (a)-(c): candidate {} vs tiled incumbent, prefix {p} (one saved state), {n} teacher-forced positions all compared, control {} (measured, same state and positions), f32-attention reference at {} sampled positions (NOT a full-model f32 reference); clause (d) tool-JSON runs separately (closed-loop runner)",
+        cand.name(),
+        control.name(),
+        samples.len()
+    );
     let cont_hash = format!("{:016x}", model::weights::hash_bytes(cont_src.as_bytes()));
-    let plan = json!({"prefix_tokens": p, "positions": n, "ref_samples": samples.len(), "n_ctx": n_ctx,
-        "prefix_ids": sha_ids(prefix), "continuation": cont_name, "continuation_text_hash": cont_hash,
+    let arms = if cand.is_prefill() {
+        json!(["incumbent: tiled batched prefill (ubatch)", "candidate: batched prefill with the candidate kernel (ubatch)", "reference: batched prefill, f32-attention reference for every row", "control: tiled decode or tiled batched prefill at another ubatch"])
+    } else {
+        json!(["control: tiled batched prefill (ubatch)", "incumbent: tiled decode", "candidate: fused decode", "reference: forked decode steps of the incumbent"])
+    };
+    let plan = json!({"candidate": cand.name(), "prefix_tokens": p, "positions": n, "ref_samples": samples.len(), "n_ctx": n_ctx,
+        "ubatch": ubatch, "control": control.name(), "prefix_ids": sha_ids(prefix), "continuation": cont_name, "continuation_text_hash": cont_hash,
         "continuation_tokens_available": cont_all.len(), "continuation_ids": sha_ids(cont), "state_file": a.get("state-file"),
-        "engines": 2, "scope": fused_ref::SCOPE});
+        "engines": if cand.is_prefill() { 1 } else { 2 }, "arms": arms, "scope": fused_ref::SCOPE, "scope_label": scope_label});
     if a.flag("dry-run") {
         // tokenizer only: no weights, no engine
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
         return;
-    }
-    let control_on = a.flag("control");
-    let control_w = a.num("control-ubatch", 4);
-    let control_factor: f64 = a.get("control-factor").map(|v| v.parse().unwrap_or_else(|_| die("--control-factor"))).unwrap_or(1.0);
-    if control_on && (control_w == 0 || control_w > n) {
-        die("--control-ubatch must be in 1..=n");
-    }
-    if !gate.noise_floor_kld.is_finite() && !control_on {
-        die("--control (measures the floor on this state) or --noise-floor-kld X (provided, not measured) required");
     }
     let state_file = a.get("state-file").unwrap_or_else(|| die("--state-file F required (built once, reused)"));
     let out = a.get("out").unwrap_or_else(|| die("--out NEW_FILE required"));
@@ -92,12 +152,10 @@ pub(super) fn run(a: &Args) {
     }
     let cfg = EngineConfig { n_ctx, logits: true, trace: false, profile: false };
     let mk = || Engine::with_options(&s.loaded.plan, &s.loaded.ws, cfg.clone(), EngineOptions { verify_lanes: 1, mtp: None, kv_type: Some(model::engine::KvType::F16) }).unwrap_or_else(|e| die(&e));
-    let (mut ea, mut eb) = (mk(), mk());
-    if let Some(ch) = a.get("fused-chunk") {
-        eb.set_attn_fused_chunk(ch.parse().unwrap_or_else(|_| die("--fused-chunk")));
-        ea.set_attn_fused_chunk(eb.attn_fused_chunk());
-    }
-    // the same kind as prefill-bench --prefix-len/--state-file: one state serves both tools
+    let mut ea = mk();
+    // the saved state is built by the tiled incumbent (the same kind as prefill-bench
+    // --prefix-len/--state-file: one state serves both tools)
+    ea.set_pf_attn(model::engine::PfAttn::Tiled);
     let header = state_header(&ea, "prefill-bench-prefix", prefix);
     let t0 = Instant::now();
     let built = if state_file_load(state_file, &ea, &header, p).is_none() {
@@ -111,95 +169,98 @@ pub(super) fn run(a: &Args) {
         false
     };
     let state_s = t0.elapsed().as_secs_f64();
-    if state_file_load(state_file, &eb, &header, p).is_none() {
-        die("state file could not be read back into the second engine");
-    }
-    if ea.pos() != p || eb.pos() != p {
-        die("engines are not at the prefix end");
-    }
-    // --control: the incumbent's own noise on the SAME state (decode vs batched prefill, both
-    // tiled), then both engines are reloaded from the state file for the fused comparison
-    let mut control_json = serde_json::Value::Null;
-    let mut floor_source = "provided (not measured)".to_string();
-    if control_on {
-        fused_ref::configure(&mut ea, &mut eb);
-        eb.set_attn_fused(false);
-        let tc = Instant::now();
-        let cv = fused_ref::control(&ea, &eb, &s.pool, cont, control_w, &mut |i| {
-            if (i + 1) % 200 < control_w {
-                eprintln!("fused-ref control: {}/{n} positions, {:.1} s", i + 1, tc.elapsed().as_secs_f64());
-            }
-        });
-        let (cn, mean, p50, p90, p99, max, top1) = fused_ref::control_summary(&cv);
-        eprintln!("fused-ref control: {cn} chunk-end positions, kld mean {mean:.3e} p99 {p99:.3e}, top1 {top1:.4}");
-        if !gate.noise_floor_kld.is_finite() {
-            gate.noise_floor_kld = control_factor * mean;
-            floor_source = format!("measured: {control_factor} x control mean on this state");
+    let mut load = |e: &Engine| {
+        if state_file_load(state_file, e, &header, p).is_none() || e.pos() != p {
+            die("state file could not be read back (the same saved state before every arm)");
         }
-        control_json = json!({"kind": "tiled decode (1 token per step) vs tiled batched prefill (ubatch = chunk) from the same saved state, teacher-forced; chunk-end positions",
-            "ubatch": control_w, "positions": cn, "kld_direction": "KL(P_decode || P_prefill_batch)",
-            "kld": {"mean": mean, "p50": p50, "p90": p90, "p99": p99, "max": max}, "top1_agreement": top1,
-            "factor": control_factor, "seconds": tc.elapsed().as_secs_f64(),
-            "rows": cv.iter().map(|x| json!([x.position, x.kld, x.tiled_top1, x.fused_top1])).collect::<Vec<_>>()});
-        for e in [&ea, &eb] {
-            if state_file_load(state_file, e, &header, p).is_none() {
-                die("state file could not be re-read after the control");
-            }
-        }
-    }
-    fused_ref::configure(&mut ea, &mut eb);
+    };
     let t1 = Instant::now();
-    let rep = fused_ref::run(&mut ea, &mut eb, &s.pool, cont, &samples, &mut |i, r| {
-        if (i + 1) % 50 == 0 || i + 1 == n {
-            let v = r.verdict(&gate);
-            eprintln!("fused-ref: {}/{n} positions, {} forks, kld mean {:.3e}, top1 {:.4}, {:.1} s", i + 1, r.refs.len(), v.kld_mean, v.top1_agreement, t1.elapsed().as_secs_f64());
+    let mut progress = |m: &str| eprintln!("fused-ref {}: {m} ({:.1} s)", cand.name(), t1.elapsed().as_secs_f64());
+    let (rep, fused_chunk) = if cand.is_prefill() {
+        let r = fused_ref::run_prefill(&mut ea, &s.pool, &mut load, cand, cont, ubatch, control, &samples, &mut progress);
+        (r, None)
+    } else {
+        let mut eb = mk();
+        if let Some(ch) = a.get("fused-chunk") {
+            eb.set_attn_fused_chunk(ch.parse().unwrap_or_else(|_| die("--fused-chunk")));
+            ea.set_attn_fused_chunk(eb.attn_fused_chunk());
         }
-    });
+        let r = fused_ref::run_fused_decode(&mut ea, &mut eb, &s.pool, &mut load, cont, control, &samples, &mut progress);
+        (r, Some(eb.attn_fused_chunk()))
+    };
     let run_s = t1.elapsed().as_secs_f64();
     let v = rep.verdict(&gate);
-    let positions: Vec<_> = rep.positions.iter().map(|x| json!([x.position, x.kld, x.tiled_top1, x.fused_top1])).collect();
-    let refs: Vec<_> = rep.refs.iter().map(|r| json!({"index": r.index, "position": r.position, "sampled": r.sampled, "disagreement": r.disagreement,
-        "ref_top1": r.ref_top1, "ref_margin": r.ref_margin, "ref_absmax": r.ref_absmax, "tiled_top1": r.tiled_top1, "fused_top1_shared_state": r.fused_top1,
-        "fused_top1_continuous": r.fused_cont_top1, "tiled_rms": r.tiled_rms, "fused_rms": r.fused_rms,
-        "tiled_kld_vs_ref": r.tiled_kld, "fused_kld_vs_ref": r.fused_kld, "fork_replay_exact": r.fork_replay_exact,
-        "tiled_attn_err2_ref2": [r.tiled_attn.0, r.tiled_attn.1], "fused_attn_err2_ref2": [r.fused_attn.0, r.fused_attn.1]})).collect();
-    let res = json!({
-        "kind": "fused-ref/v1", "scope": fused_ref::SCOPE, "passed": v.passed,
-        "noise_floor_source": floor_source, "control": control_json,
-        "gate": {"a_mean_kld_tiled_to_fused_max": gate.noise_floor_kld, "a_top1_min": gate.min_top1,
-                 "wrong_top1_margin": gate.margin, "wrong_top1_max": 0, "b_fused_le_ratio_x_tiled": gate.ref_ratio_max,
-                 "b_applies_to": "median and p90 of the per-position logit RMS error, attention-level rel-L2",
-                 "b_jump_threshold": gate.jump_threshold, "b_jump_tolerance": v.jump_tolerance,
-                 "min_positions": gate.min_positions, "min_ref_samples": gate.min_ref_samples},
-        "a_candidate_vs_incumbent": {"kld_direction": "KL(P_tiled || P_fused) per teacher-forced position", "positions": v.positions,
-            "kld": {"mean": v.kld_mean, "p50": v.kld_p50, "p90": v.kld_p90, "p99": v.kld_p99, "max": v.kld_max},
-            "top1_agreement": v.top1_agreement, "pass_kld": v.pass_kld, "pass_top1": v.pass_top1},
-        "b_f32_attention_reference": {"label": "f32-attention reference with production weights", "samples": v.ref_samples,
-            "forced_disagreement_forks": v.ref_forced, "error_metric": "RMS logit difference vs the reference over the full vocabulary, same stored state",
-            "note": "the per-position logit error is heavy-tailed (~10% of positions jump to 1e-2..1e-1 for any ~1e-4 attention change, likely MoE routing flips): gate on median / p90 / jump count, the mean is informational",
-            "logit_rms": {"tiled": {"p50": v.tiled_rms_p50, "p90": v.tiled_rms_p90, "mean": v.tiled_rms_mean, "jumps": v.tiled_jumps},
-                          "fused": {"p50": v.fused_rms_p50, "p90": v.fused_rms_p90, "mean": v.fused_rms_mean, "jumps": v.fused_jumps}},
-            "attention_rel_l2": {"tiled": v.tiled_attn_rel_l2, "fused": v.fused_attn_rel_l2,
-                                 "metric": "sqrt(sum |gated output - f32-attention reference|^2 / sum |reference|^2), same q and stored KV, all layers/heads of the sampled forks"},
-            "pass_ref_p50": v.pass_ref_p50, "pass_ref_p90": v.pass_ref_p90, "pass_ref_jumps": v.pass_ref_jumps, "pass_ref_attn": v.pass_ref_attn,
-            "tiled_kld_vs_ref_mean": v.tiled_kld_ref_mean, "fused_kld_vs_ref_mean": v.fused_kld_ref_mean,
-            "fused_le_tiled_share": v.fused_le_tiled_share, "pass_ref": v.pass_ref},
-        "wrong_top1_high_margin": {"fused": v.fused_wrong_top1_high_margin, "tiled_incumbent": v.tiled_wrong_top1_high_margin, "pass": v.pass_wrong_top1},
-        "fork_replay_exact": v.fork_replay_exact, "scope_met": v.scope_met,
-        "plan": plan, "model": a.model().display().to_string(), "model_sha256": s.loaded.ws.info.model_sha256,
-        "threads": s.pool.nthreads(), "fused_chunk": eb.attn_fused_chunk(), "effective": model::engine::effective_switches(),
-        "engine_commit": option_env!("OXE_GIT_COMMIT").unwrap_or("unknown"),
-        "state": {"built": built, "seconds": state_s}, "run_seconds": run_s,
-        "per_position": {"columns": ["position", "kld_tiled_to_fused", "tiled_top1", "fused_top1"], "rows": positions},
-        "forks": refs});
+    if !v.finite_ok {
+        eprintln!("fused-ref: FAIL: non-finite values ({} compared rows, {} reference rows): see \"finite\" in the receipt", v.nonfinite_rows, v.nonfinite_refs);
+    }
+    let res = receipt(&rep, &v, &gate, &scope_label);
+    let mut res = res;
+    let o = res.as_object_mut().unwrap();
+    o.insert("plan".into(), plan);
+    o.insert("model".into(), json!(a.model().display().to_string()));
+    o.insert("model_sha256".into(), json!(s.loaded.ws.info.model_sha256));
+    o.insert("threads".into(), json!(s.pool.nthreads()));
+    o.insert("fused_chunk".into(), json!(fused_chunk));
+    o.insert("effective".into(), json!(model::engine::effective_switches()));
+    o.insert("engine_commit".into(), json!(option_env!("OXE_GIT_COMMIT").unwrap_or("unknown")));
+    o.insert("state".into(), json!({"built": built, "seconds": state_s, "built_with": "tiled batched prefill, ubatch 256, chunks of 4096"}));
+    o.insert("run_seconds".into(), json!(run_s));
     let text = serde_json::to_string_pretty(&res).unwrap();
     std::fs::write(out, &text).unwrap_or_else(|e| die(&format!("{out}: {e}")));
     let mut short = res.clone();
-    for k in ["per_position", "forks", "plan"] {
+    for k in ["per_position", "refs", "plan"] {
         short.as_object_mut().unwrap().remove(k);
     }
     println!("{}", serde_json::to_string_pretty(&short).unwrap());
     if !v.passed {
         std::process::exit(1);
     }
+}
+
+/// The O-117 receipt: PASS / FAIL per clause, row counts, scope label, the evidence of every arm,
+/// per-position rows and the reference rows.
+fn receipt(r: &Report, v: &Verdict, g: &Gate, scope_label: &str) -> serde_json::Value {
+    fn pf(s: &'static str) -> &'static str {
+        if s.is_empty() {
+            "n/a"
+        } else {
+            s
+        }
+    }
+    let verdict = |b: bool| if b { "PASS" } else { "FAIL" };
+    let st = |s: &fused_ref::Stats| json!({"rows": s.rows, "mean": s.mean, "p50": s.p50, "p90": s.p90, "p99": s.p99, "max": s.max, "top1_agreement": s.top1});
+    let arms: Vec<_> = r.arms.iter().map(|x| json!({"role": x.role, "path": x.path, "decode_steps": x.decode_steps, "fused_decode": x.fused, "pf_kernel": pf(x.pf_kernel),
+        "batched_prefill": {"passes": x.pf.passes, "rows": x.pf.rows, "max_rows_per_pass": x.pf.max_rows,
+            "attention_units": {"tiled": x.pf.units_tiled, "per_head": x.pf.units_per_head, "fa2": x.pf.units_fa2, "fa2x": x.pf.units_fa2x, "f32_reference": x.pf.units_ref}}})).collect();
+    let per_position: Vec<_> = r.rows.iter().zip(&r.control_rows).map(|(c, k)| json!([c.position, c.kld, c.top1, c.inc_top1, k.kld, k.top1, c.finite && k.finite])).collect();
+    let refs: Vec<_> = r.refs.iter().map(|x| json!({"index": x.index, "position": x.position, "sampled": x.sampled, "disagreement": x.disagreement,
+        "ref_top1": x.ref_top1, "ref_margin": x.ref_margin, "ref_absmax": x.ref_absmax, "tiled_top1": x.inc_top1, "cand_top1": x.cand_top1,
+        "tiled_rms": x.inc_rms, "cand_rms": x.cand_rms, "tiled_kld_vs_ref": x.inc_kld_vs_ref, "cand_kld_vs_ref": x.cand_kld_vs_ref,
+        "fork_replay_exact": x.fork_replay_exact, "finite": x.all_finite(), "tiled_attn_err2_ref2": [x.inc_attn.0, x.inc_attn.1], "cand_attn_err2_ref2": [x.cand_attn.0, x.cand_attn.1]})).collect();
+    json!({
+        "kind": "o117-quality/v1", "scope": fused_ref::SCOPE, "scope_label": scope_label, "candidate": r.candidate.name(),
+        "passed": v.passed, "verdict": verdict(v.passed),
+        "clauses": {
+            "a": {"verdict": verdict(v.pass_a), "rule": "mean KLD(cand || tiled) <= factor x mean KLD(control || tiled), measured on the same state and positions",
+                  "kld_direction": "KL(P_cand || P_tiled)", "cand_mean": v.cand.mean, "control_mean": v.control.mean, "factor": g.kld_factor, "max_allowed": v.kld_max},
+            "b": {"verdict": verdict(v.pass_b), "rule": "top-1 agreement(cand, tiled) >= control agreement - slack",
+                  "cand_top1": v.cand.top1, "control_top1": v.control.top1, "slack_pp": g.top1_slack * 100.0, "min_allowed": v.top1_min},
+            "c": {"verdict": verdict(v.pass_c), "rule": "f32-attention reference: median and p90 logit RMS error <= ratio x tiled; jumps <= tiled + max(jump_tol_min, ceil(jump_tol_frac x samples)); attention-output rel-L2 <= ratio x tiled",
+                  "samples": v.ref_samples, "ratio": g.ref_ratio_max, "jump_threshold": g.jump_threshold, "jump_allowance": v.jump_allowance,
+                  "jump_allowance_rule": format!("max({}, ceil({} x {}))", g.jump_tol_min, g.jump_tol_frac, v.ref_samples),
+                  "logit_rms": {"tiled": {"p50": v.inc_rms_p50, "p90": v.inc_rms_p90, "mean": v.inc_rms_mean, "jumps": v.inc_jumps},
+                                "cand": {"p50": v.cand_rms_p50, "p90": v.cand_rms_p90, "mean": v.cand_rms_mean, "jumps": v.cand_jumps}},
+                  "attention_rel_l2": {"tiled": v.inc_attn_rel_l2, "cand": v.cand_attn_rel_l2},
+                  "p50": verdict(v.pass_c_p50), "p90": verdict(v.pass_c_p90), "jumps": verdict(v.pass_c_jumps), "attention": verdict(v.pass_c_attn)},
+            "d": {"verdict": "NOT RUN HERE", "rule": "tool-JSON 100% on one long-session closed-loop replay at >= 48K (closed-loop runner)"}},
+        "rows": {"compared": v.cand.rows, "control": v.control.rows, "same_positions": v.same_positions, "ref_samples": v.ref_samples,
+                 "ref_forced_forks": v.ref_forced, "min_positions": g.min_positions, "min_ref_samples": g.min_ref_samples},
+        "scope_met": v.scope_met, "fork_replay_exact": v.fork_replay_exact,
+        "finite": {"verdict": verdict(v.finite_ok), "nonfinite_rows": v.nonfinite_rows, "nonfinite_ref_rows": v.nonfinite_refs,
+                   "rule": "every compared logit row (candidate, incumbent, control) and every reference row / metric finite; any NaN or inf fails"},
+        "path": {"ok": v.path_ok, "problems": v.path_problems, "ubatch": r.ubatch, "arms": arms},
+        "candidate_kld": st(&v.cand),
+        "control": {"kind": r.control.name(), "kld_direction": "KL(P_control || P_tiled)", "kld": st(&v.control)},
+        "per_position": {"columns": ["position", "kld_cand_to_tiled", "cand_top1", "tiled_top1", "kld_control_to_tiled", "control_top1", "finite"], "rows": per_position},
+        "refs": refs})
 }

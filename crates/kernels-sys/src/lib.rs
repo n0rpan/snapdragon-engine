@@ -269,6 +269,32 @@ pub mod ffi {
             out: *mut f32,
             ml: *mut f32,
         );
+        /// v0.1.3 APPEND-PREFILL (fa2x): bytes of scratch for `oxe_pfa2x_unit` (ncol columns of hd
+        /// dims, chunks of up to ch positions).
+        pub fn oxe_pfa2x_scratch_bytes(hd: c_int, ncol: c_int, ch: c_int) -> i64;
+        /// v0.1.3 APPEND-PREFILL (fa2x): one register-blocked flash-attention-2 prefill unit (8x16
+        /// f16 FMLA micro-kernel, f16 chains of `fold` folded into f32; see csrc/oxe_pfa2x.cpp).
+        /// Column c: token pos0 + c / group, query q16 + c*hd; K rows k + p*hd; V^T rows
+        /// vt + d*v_stride (finite up to n_ctx); out[c*hd + d] normalised, ungated. Returns 0, or -1
+        /// when a requirement fails (hd % 32, n_ctx % 32, ch % 32 <= 512, fold 8/16/32, ncol <= 256,
+        /// scratch size).
+        pub fn oxe_pfa2x_unit(
+            hd: c_int,
+            ncol: c_int,
+            group: c_int,
+            pos0: c_int,
+            scale: f32,
+            k: *const u16,
+            vt: *const u16,
+            v_stride: i64,
+            n_ctx: c_int,
+            q16: *const u16,
+            ch: c_int,
+            fold: c_int,
+            scratch: *mut u8,
+            scratch_bytes: i64,
+            out: *mut f32,
+        ) -> c_int;
         /// O-70: merge one column's chunk partials (part + ch*ps, m/l at ch*mls) for dims [d0, d1):
         /// out[d] = (sum_ch exp(m_ch - M) part[ch][d]) / (sum_ch exp(m_ch - M) l_ch) * gate[d], in
         /// chunk order (independent of the dim range and of trailing empty chunks).

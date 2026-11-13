@@ -9,7 +9,7 @@
 //! compared in constant time; else 401.
 
 use crate::engine::Engine;
-use crate::service::{handle_session, Reply, State};
+use crate::service::{handle_policy, Reply, State};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
@@ -189,6 +189,24 @@ impl Access {
     }
 }
 
+/// `X-Oxe-State-Policy` (LAN share): absent = the normal state handling; `ephemeral` = RAM-only,
+/// request-scoped state for a request from another device (see `GenParams::ephemeral`). Read only
+/// after [`Access::check`] passed (loopback listener, the per-launch key when one is set: in
+/// production only the controller can send it, and the controller removes the header from client
+/// input and sets it itself). Any other value, or the header twice, is refused rather than ignored.
+pub fn state_policy(headers: &HeaderMap) -> Result<bool, &'static str> {
+    let mut values = headers.get_all("x-oxe-state-policy").iter();
+    let Some(v) = values.next() else { return Ok(false) };
+    if values.next().is_some() {
+        return Err("X-Oxe-State-Policy given more than once");
+    }
+    if v.as_bytes().eq_ignore_ascii_case(b"ephemeral") {
+        Ok(true)
+    } else {
+        Err("X-Oxe-State-Policy must be \"ephemeral\"")
+    }
+}
+
 /// Parse an API key file (llama-server's `--api-key-file` format): every non-empty line,
 /// whitespace trimmed, is a key. An empty result is an error (fail closed).
 pub fn parse_key_file(text: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -197,6 +215,30 @@ pub fn parse_key_file(text: &str) -> Result<Vec<Vec<u8>>, String> {
         return Err("API key file holds no key".into());
     }
     Ok(keys)
+}
+
+/// Whether a `--host` bind address keeps the port on this machine: a loopback IP (`127.0.0.0/8`,
+/// `::1`, also written `[::1]`) or the name `localhost`. Anything else (a LAN address, `0.0.0.0`,
+/// `::`, or a host name that may resolve anywhere) exposes the port to other machines.
+pub fn bind_is_loopback(host: &str) -> bool {
+    let h = host.trim();
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let h = h.strip_prefix('[').and_then(|x| x.strip_suffix(']')).unwrap_or(h);
+    h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// Audit S12: refuse to listen beyond loopback without an API key. The Host check only stops
+/// DNS rebinding; it does not authenticate anyone, so an open LAN bind would serve every device.
+pub fn check_bind(host: &str, has_key: bool) -> Result<(), String> {
+    if has_key || bind_is_loopback(host) {
+        return Ok(());
+    }
+    Err(format!(
+        "--host {host} is not a loopback address and no API key is set; \
+         give --api-key-file PATH (or OXE_API_KEY_FILE) or bind to 127.0.0.1"
+    ))
 }
 
 /// Serve with the default access rules for the listener's port (no key).
@@ -228,13 +270,21 @@ pub async fn serve_with<E: Engine>(st: Arc<State<E>>, listener: TcpListener, acc
                         let r = Response::builder().status(204).header("Allow", "GET, POST, OPTIONS").body(RBody::Full(None)).unwrap();
                         return Ok::<_, Infallible>(r);
                     }
+                    // LAN share: the controller's state policy for a request from another device
+                    let ephemeral = match state_policy(req.headers()) {
+                        Ok(e) => e,
+                        Err(msg) => return Ok(json_resp(400, &crate::api::error_json(400, msg))),
+                    };
                     // CACHE-PERFECT: the controller's session hint (a hint, never a cache key)
                     let session = req.headers().get("x-oxe-session").and_then(|v| v.to_str().ok()).map(|s| s.chars().take(128).collect::<String>()).filter(|s| !s.is_empty());
+                    // v0.1.3 CACHE-DEEP: the controller's turn label (chat | compaction | post-compaction);
+                    // places checkpoints only (the compaction cut), never a cache key
+                    let turn_kind = req.headers().get("x-oxe-turn-kind").and_then(|v| v.to_str().ok()).map(|s| s.chars().take(32).collect::<String>()).filter(|s| !s.is_empty());
                     let body = match collect(req.into_body()).await {
                         Ok(b) => b,
                         Err(e) => return Ok(json_resp(400, &crate::api::error_json(400, &e))),
                     };
-                    let reply = handle_session(st, &method, &path, &query, &body, session).await;
+                    let reply = handle_policy(st, &method, &path, &query, &body, session, turn_kind, ephemeral).await;
                     Ok(match reply {
                         Reply::Json(code, v) => json_resp(code, &v),
                         Reply::Stream(rx) => Response::builder()

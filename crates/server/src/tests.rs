@@ -1946,7 +1946,11 @@ async fn idle_reprefill_serves_the_next_user_turn() {
         // ubatch boundaries (ubatch 16) of every multi-token prefill since turn 2 ended: the idle
         // job's plus turn 3's, or turn 3's alone without SX-2
         let w = st.worker.lock().unwrap();
-        let mut bounds: Vec<usize> = w.engine.calls[calls0..]
+        // up to turn 3's last decode: with SX-2 on, turn 3 itself ends with "stop" and spawns the
+        // next idle job, which may already have run when the lock is taken here; its prefills are
+        // not turn 3's (v0.1.3: the remaining race of this test, now deterministic)
+        let end = w.engine.calls.iter().rposition(|c| c.0 == "decode").map_or(w.engine.calls.len(), |i| i + 1).max(calls0);
+        let mut bounds: Vec<usize> = w.engine.calls[calls0..end]
             .iter()
             .filter(|c| c.0 == "prefill" && c.2 > 1)
             .flat_map(|c| (c.1..c.1 + c.2).step_by(16))

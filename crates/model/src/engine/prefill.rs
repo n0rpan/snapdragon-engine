@@ -27,6 +27,7 @@
 //! output element depends on how the work is split, so the result is thread-count invariant.
 
 use super::kv8::{self, Kv8Scratch, KvType};
+use super::pfattn;
 use super::*;
 use crate::plan::Tid;
 use kernels_sys::{gemm_mmid_raw, gemm_raw, interleave_rows4_raw, quantize_mat4_raw, quantize_row_raw};
@@ -428,6 +429,8 @@ struct PfThread {
     iscr: Vec<i32>,
     /// int8 KV reads (O-13; empty in f16 mode)
     kv8s: Kv8Scratch,
+    /// PREFILL-LONG fa2 unit scratch (O(chunk); empty unless the scratch was built for fa2)
+    fa2: pfattn::Scratch,
     step: usize,
 }
 
@@ -444,6 +447,18 @@ pub(super) struct Pf {
     lub: AtomicUsize,
     /// PF_DYN_SPLIT of the prefill in flight (off when tracing)
     dyn_split: std::sync::atomic::AtomicBool,
+    /// positions the context-sized thread scratch (akq / ap16 tiles, kq / p16 / wp / mask rows)
+    /// holds: the engine's n_ctx, or the fa2 cutoff (PFA_MIN_KV, or PREFILL-POLICY's auto cutoff;
+    /// at most n_ctx) when built for fa2
+    cap: usize,
+    /// built for PREFILL-LONG fa2 (f16 KV, no trace / f32 reference): attention units whose last
+    /// token's padded n_kv exceeds `cap` (the cutoff) run `pfattn::Tile`, the others the tiled kernel
+    fa2: bool,
+    /// APPEND-PREFILL: the fa2 units of the prefill in flight run the fa2x kernel: 0 = no (fa2),
+    /// else `fold << 16 | ch` ([`pfattn::XParams`]); stored once per `prefill` call
+    fa2x: AtomicUsize,
+    /// THREADS-BY-PHASE: threads (tid < this) that take attention-core units in the prefill in flight
+    attn_nth: AtomicUsize,
     x: Sb<f32>,
     x1: Sb<f32>,
     xn: Sb<f32>,
@@ -558,10 +573,25 @@ fn split(n: usize, tid: usize, nth: usize) -> Range<usize> {
 
 /// LONG-CTX: context-sized bytes of one prefill thread's scratch (`PfThread` akq / ap16 tiles
 /// and kq / p16 / wp / mask rows) at capacity `n_ctx` (>= head_chunk, ff_exp, n_expert, as at
-/// every real context); the same expressions as [`Pf::new`].
-pub(super) fn pf_ctx_bytes(d: &ModelDesc, n_ctx: usize, att_tt: usize) -> usize {
-    let tile = att_tt * (d.n_head / d.n_head_kv) * (n_ctx + ATT_PAD);
-    tile * (4 + 2) + n_ctx * 4 + (n_ctx + d.head_dim) * 2 + n_ctx * 4 + n_ctx * 4
+/// every real context); the same expressions as [`Pf::new`]. PREFILL-LONG: with fa2 units beyond
+/// `cut` (PFA_MIN_KV, or the PREFILL-POLICY auto cutoff) the rows and tiles hold at most `cut`
+/// positions and the fa2 unit scratch (O(chunk)) is added, so the result stops growing with the
+/// context beyond the cutoff.
+pub(super) fn pf_ctx_bytes(d: &ModelDesc, n_ctx: usize, att_tt: usize, cut: Option<usize>) -> usize {
+    let fa2 = cut.is_some();
+    let cap = pf_scratch_cap(n_ctx, cut);
+    let group = d.n_head / d.n_head_kv;
+    let tile = att_tt * group * (cap + ATT_PAD);
+    let f = if fa2 { pfattn::Scratch::bytes(att_tt * group, d.head_dim) } else { 0 };
+    tile * (4 + 2) + cap * 4 + (cap + d.head_dim) * 2 + cap * 4 + cap * 4 + f
+}
+
+/// Positions of the context-sized prefill thread scratch (see `Pf::cap`).
+/// Under fa2 (`cut` Some) the capacity is the cutoff (or n_ctx when that is smaller: then no unit
+/// exceeds it):
+/// `Pf::cap` is what the attention compares a unit's n_kv with.
+pub(super) fn pf_scratch_cap(n_ctx: usize, cut: Option<usize>) -> usize {
+    cut.map_or(n_ctx, |c| n_ctx.min(c))
 }
 
 fn max_act(k: usize) -> usize {
@@ -569,7 +599,10 @@ fn max_act(k: usize) -> usize {
 }
 
 impl Pf {
-    fn new(d: &ModelDesc, ub: usize, nth: usize, n_ctx: usize, head_chunk: usize, mask: u32, kv: KvType, reference:bool) -> Pf {
+    /// `n_ctx`: positions of the context-sized thread scratch ([`pf_scratch_cap`]); `fa2`: also
+    /// the fa2 unit scratch (the caller passes the capped size then).
+    #[allow(clippy::too_many_arguments)]
+    fn new(d: &ModelDesc, ub: usize, nth: usize, n_ctx: usize, head_chunk: usize, mask: u32, kv: KvType, reference:bool, fa2: bool) -> Pf {
         #[cfg(not(feature="f32-reference"))]
         let _=reference;
         let att_tt = att_tt_want(d, mask);
@@ -585,6 +618,10 @@ impl Pf {
             mask: std::sync::atomic::AtomicU32::new(0),
             lub: AtomicUsize::new(UBATCH),
             dyn_split: std::sync::atomic::AtomicBool::new(false),
+            cap: n_ctx,
+            fa2,
+            fa2x: AtomicUsize::new(0),
+            attn_nth: AtomicUsize::new(nth),
             x: Sb::new(ub * d.n_embd),
             x1: Sb::new(ub * d.n_embd),
             xn: Sb::new(ub * d.n_embd),
@@ -652,6 +689,7 @@ impl Pf {
                         zs: vec![0.0; hv],
                         iscr: vec![0; d.n_expert],
                         kv8s: if kv.any8() { Kv8Scratch::new(d.head_dim, att_tt * (d.n_head / d.n_head_kv)) } else { Kv8Scratch::empty() },
+                        fa2: if fa2 { pfattn::Scratch::new(att_tt * (d.n_head / d.n_head_kv), d.head_dim) } else { pfattn::Scratch::empty() },
                         step: 0,
                     })
                 })
@@ -781,6 +819,47 @@ impl<'a> Engine<'a> {
         self.pf.iter().filter_map(|slot| slot.lock().unwrap().as_ref().map(|p| p.ub)).max().unwrap_or(0)
     }
 
+    /// PREFILL-LONG: whether batched prefill builds its scratch for fa2 ([`pfattn`]): the
+    /// engine's mode (`OXE_PF_ATTN`, [`Engine::set_pf_attn`]) selects fa2 at this n_ctx, f16 KV
+    /// (int8 KV keeps its own kernels), no trace and no f32 reference (both read whole score rows).
+    pub(super) fn pf_fa2(&self) -> bool {
+        self.pf_path().fa2()
+    }
+
+    /// PREFILL-POLICY: the resolved path (see [`Engine::pf_attn_path`]).
+    pub(super) fn pf_path(&self) -> pfattn::PfPath {
+        #[cfg(feature = "f32-reference")]
+        if self.f32_reference.is_some() {
+            return pfattn::PfPath::TILED;
+        }
+        if self.kv.any8() || self.trace.is_some() {
+            return pfattn::PfPath::TILED;
+        }
+        self.pf_attn.path(self.n_ctx, self.pf_auto)
+    }
+
+    /// APPEND-PREFILL: the fa2x kernel parameters when the fa2 units run fa2x
+    /// (`OXE_PF_ATTN=fa2x` / [`Engine::set_pf_attn`] with [`PfAttn::Fa2x`], and [`Engine::pf_fa2`]).
+    pub(super) fn pf_fa2x(&self) -> Option<pfattn::XParams> {
+        (self.pf_path().kernel == pfattn::PfKernel::Fa2x).then_some(self.pf_xparams)
+    }
+
+    /// Context-dependent bytes one thread of the prefill scratch holds right now (the buffers
+    /// `CtxMem::prefill_per_thread` accounts for), largest over the two scratch slots; None before
+    /// the first batched prefill. Tests hold it equal to [`Engine::ctx_mem`].
+    pub fn prefill_ctx_bytes_allocated(&self) -> Option<usize> {
+        self.pf
+            .iter()
+            .filter_map(|slot| {
+                let g = slot.lock().unwrap();
+                let pf = g.as_ref()?;
+                // SAFETY: the `pf` lock is held and no run is in flight; lengths only.
+                let t = unsafe { &*pf.th[0].get() };
+                Some(t.akq.len() * 4 + t.ap16.len() * 2 + t.kq.len() * 4 + t.p16.len() * 2 + t.wp.len() * 4 + t.mask.len() * 4 + t.fa2.bytes_allocated())
+            })
+            .max()
+    }
+
     pub fn reset_prefill_profile(&self) {
         for slot in &self.pf {
             let mut guard = slot.lock().unwrap();
@@ -818,16 +897,23 @@ impl<'a> Engine<'a> {
         let gsz = ubatch * group;
         let ub_cap = gsz.min(tokens.len());
         let mask = pf_tiles(); // one sample for the whole call
-        let fits = matches!(&*guard, Some(p) if p.ub >= ub_cap && p.nth == nth && p.att_tt == att_tt_want(&self.plan.desc, mask));
+        let path = self.pf_path();
+        let fa2 = path.fa2();
+        let cap = pf_scratch_cap(self.n_ctx, path.cut_opt());
+        let fits = matches!(&*guard, Some(p) if p.ub >= ub_cap && p.nth == nth && p.att_tt == att_tt_want(&self.plan.desc, mask) && p.fa2 == fa2 && p.cap == cap);
         if !fits {
             #[cfg(feature="f32-reference")]
             let reference=self.f32_reference.is_some();
             #[cfg(not(feature="f32-reference"))]
             let reference=false;
-            *guard = Some(Box::new(Pf::new(&self.plan.desc, ub_cap, nth, self.n_ctx, self.plan.head_chunk, mask, self.kv,reference)));
+            // drop the old scratch first: at 256K two of them would not fit side by side
+            *guard = None;
+            *guard = Some(Box::new(Pf::new(&self.plan.desc, ub_cap, nth, cap, self.plan.head_chunk, mask, self.kv, reference, fa2)));
         }
         let pf: &Pf = guard.as_ref().unwrap();
         pf.mask.store(mask, Relaxed);
+        pf.fa2x.store(self.pf_fa2x().map_or(0, |xp| xp.fold << 16 | xp.ch), Relaxed);
+        pf.attn_nth.store(if self.pf_attn_threads == 0 { nth } else { self.pf_attn_threads.min(nth) }, Relaxed);
         pf.lub.store(ubatch, Relaxed);
         pf.dyn_split.store(mask & PF_DYN_SPLIT != 0 && self.trace.is_none(), Relaxed);
         let de = self.plan.desc.n_embd;
@@ -886,6 +972,8 @@ impl<'a> Engine<'a> {
             // SAFETY: no run in flight.
             unsafe { (*t.get()).step = 0 };
         }
+        #[cfg(any(test, feature = "f32-reference"))]
+        self.pf_count_pass(n);
         pool.run_job(&|ctx: &mut Ctx| self.pf_thread(ctx, pf, toks, p0, last, all_rows, redo_last));
         if !last {
             return None;
@@ -1603,23 +1691,40 @@ impl<'a> Engine<'a> {
             self.bar(ctx,pf,PH_ATT_CORE);
             return self.pf_mixer_out(ctx,pf,ts,l,n,out,att_w,"attn_output",PH_ATT_OUT_QUANT,PH_ATT_OUT_DENSE,None);
         }
-        if (self.attn_tiled && !trace) || self.kv.any8() {
+        // O-117 quality runner (bench / tests): the f32-attention reference for every row
+        #[cfg(any(test, feature = "f32-reference"))]
+        if self.pf_ref {
+            self.pf_attention_ref(pf, ts, l, n, p0);
+            self.bar(ctx, pf, PH_ATT_CORE);
+            return self.pf_mixer_out(ctx, pf, ts, l, n, out, att_w, "attn_output", PH_ATT_OUT_QUANT, PH_ATT_OUT_DENSE, None);
+        }
+        // PREFILL-LONG: fa2 units exist only when a token of this pass reaches beyond the cutoff
+        // (`pf.cap` under fa2: PFA_MIN_KV or the auto cutoff; pf.fa2 implies f16 KV, no trace, no
+        // f32 reference); the rest stays on today's kernels
+        let fa2 = pf.fa2 && padded_n_kv(p0 + n - 1, self.n_ctx) > pf.cap;
+        if fa2 || (self.attn_tiled && !trace) || self.kv.any8() {
             // n_kv of the llama.cpp ubatch (of `lub` tokens, from p0) that holds token t
             let lub = pf.lub.load(Relaxed).max(1);
             let n_ctx = self.n_ctx;
-            self.pf_attention_tiled(pf, ts, l, n, p0, |t| padded_n_kv(p0 + ((t / lub + 1) * lub).min(n) - 1, n_ctx));
+            self.pf_attention_tiled(pf, ts, l, n, p0, tid, fa2, |t| padded_n_kv(p0 + ((t / lub + 1) * lub).min(n) - 1, n_ctx));
             self.bar(ctx, pf, PH_ATT_CORE_TILED);
+            #[cfg(any(test, feature = "f32-reference"))]
+            self.pf_attn_check(ctx, pf, ts, l, n, p0);
             return self.pf_mixer_out(ctx, pf, ts, l, n, out, att_w, "attn_output", PH_ATT_OUT_QUANT, PH_ATT_OUT_DENSE, None);
         }
         let nb = n.div_ceil(ATT_TB);
         let ctr = step_ctr(pf, ts);
+        // THREADS-BY-PHASE: only the first attn_nth threads take units (same bits: dynamic units)
+        let mine = tid < pf.attn_nth.load(Relaxed);
         loop {
-            let u = ctr.fetch_add(1, Relaxed);
+            let u = if mine { ctr.fetch_add(1, Relaxed) } else { usize::MAX };
             if u >= nh * nb {
                 break;
             }
             let (h, b) = (u / nb, u % nb);
             let (t0, t1) = (b * ATT_TB, ((b + 1) * ATT_TB).min(n));
+            #[cfg(any(test, feature = "f32-reference"))]
+            self.pf_count_unit(PFU_PER_HEAD);
             let kvh = h / group;
             let kbase = ai * kv_len + kvh * self.n_ctx * hd;
             let vbase = self.vrow(ai, kvh * hd);
@@ -1663,6 +1768,8 @@ impl<'a> Engine<'a> {
             }
         }
         self.bar(ctx, pf, PH_ATT_CORE);
+        #[cfg(any(test, feature = "f32-reference"))]
+        self.pf_attn_check(ctx, pf, ts, l, n, p0);
 
         // [5] attn_output (+ residual)
         self.pf_mixer_out(ctx, pf, ts, l, n, out, att_w, "attn_output", PH_ATT_OUT_QUANT, PH_ATT_OUT_DENSE, None);
@@ -1673,7 +1780,12 @@ impl<'a> Engine<'a> {
     /// and every V^T row (outputs). Each score / output is one `ggml_vec_dot_f16` with the
     /// reference's arithmetic, each softmax row is `soft_max_f32` over the token's padded n_kv
     /// (`n_kv_of(t)`), so the result is bitwise the per-(token, head) path. No barrier.
-    fn pf_attention_tiled(&self, pf: &Pf, ts: &mut PfThread, l: usize, n: usize, p0: usize, n_kv_of: impl Fn(usize) -> usize) {
+    ///
+    /// PREFILL-LONG (`fa2`): a unit whose last token's padded n_kv exceeds the cutoff (`pf.cap`) runs the
+    /// fa2 kernel ([`pfattn::Tile`], O(chunk) scratch) instead; the others are unchanged. Only
+    /// threads with tid < `attn_nth` take units (THREADS-BY-PHASE; any value gives the same bits).
+    #[allow(clippy::too_many_arguments)]
+    fn pf_attention_tiled(&self, pf: &Pf, ts: &mut PfThread, l: usize, n: usize, p0: usize, tid: usize, fa2: bool, n_kv_of: impl Fn(usize) -> usize) {
         let d = &self.plan.desc;
         let hd = d.head_dim;
         let nh = d.n_head;
@@ -1693,19 +1805,31 @@ impl<'a> Engine<'a> {
         }
         let nb = n.div_ceil(tt);
         let ctr = step_ctr(pf, ts);
+        let mine = tid < pf.attn_nth.load(Relaxed);
         let mut nf = [0i32; 64];
-        // moe-prefill switches (same bits either way): scratch column stride, V^T . p blocking
+        // moe-prefill switches (same bits either way): scratch column stride, V^T . p blocking.
+        // The stride is the scratch capacity (n_ctx, or PFA_MIN_KV under fa2: tiled units then
+        // never reach beyond it); only addresses depend on it.
         let mask = pf.mask.load(Relaxed);
-        let cs = if mask & PF_ATTN_PAD != 0 { n_ctx + ATT_PAD } else { n_ctx };
+        let cs = if mask & PF_ATTN_PAD != 0 { pf.cap + ATT_PAD } else { pf.cap };
         let pb = if mask & PF_ATTN_PB != 0 { attn_pb() } else { 0 };
         loop {
-            let u = ctr.fetch_add(1, Relaxed);
+            let u = if mine { ctr.fetch_add(1, Relaxed) } else { usize::MAX };
             if u >= nkv * nb {
                 break;
             }
             let (kvh, b) = (u / nb, u % nb);
             let (t0, t1) = (b * tt, ((b + 1) * tt).min(n));
             let ncol = (t1 - t0) * group;
+            if fa2 && n_kv_of(t1 - 1) > pf.cap {
+                #[cfg(any(test, feature = "f32-reference"))]
+                self.pf_count_unit(if pf.fa2x.load(Relaxed) == 0 { PFU_FA2 } else { PFU_FA2X });
+                self.pf_fa2_unit(pf, ts, ai, kvh, t0, t1, p0);
+                continue;
+            }
+            #[cfg(any(test, feature = "f32-reference"))]
+            self.pf_count_unit(PFU_TILED);
+            debug_assert!(n_kv_of(t1 - 1) <= pf.cap && p0 + t1 <= pf.cap, "tiled unit beyond the prefill scratch");
             let rows = p0 + t1; // K rows 0..=p0+t1-1 (rows beyond a token's pos are masked)
             let n32 = rows.div_ceil(32) * 32;
             let kbase = ai * kv_len + kvh * n_ctx * hd;
@@ -1821,6 +1945,57 @@ impl<'a> Engine<'a> {
                     for dd in 0..hd {
                         o[dd] = ts.aot[dd * ncol + col] * ts.gsig[dd];
                     }
+                }
+            }
+        }
+    }
+
+    /// PREFILL-LONG: one fa2 unit (KV head `kvh`, tokens t0..t1 of the pass at p0): the
+    /// [`pfattn::Tile`] kernel over K / V^T of the cache (rows < p0 + t1 complete after step [3]),
+    /// then the sigmoid gate as in the tiled path.
+    #[allow(clippy::too_many_arguments)]
+    fn pf_fa2_unit(&self, pf: &Pf, ts: &mut PfThread, ai: usize, kvh: usize, t0: usize, t1: usize, p0: usize) {
+        let d = &self.plan.desc;
+        let hd = d.head_dim;
+        let nkv = d.n_head_kv;
+        let group = d.n_head / nkv;
+        let att_w = d.n_head * hd;
+        let n_ctx = self.n_ctx;
+        let ncol = (t1 - t0) * group;
+        let c0 = (kvh * pf.ub + t0) * group;
+        let tile = pfattn::Tile {
+            hd,
+            ncol,
+            group,
+            pos0: p0 + t0,
+            scale: 1.0 / (hd as f32).sqrt(),
+            k: self.kcache.ptr_at(ai * nkv * n_ctx * hd + kvh * n_ctx * hd),
+            vt: self.vcache.ptr_at(self.vrow(ai, kvh * hd)),
+            v_stride: self.v_stride,
+            n_ctx,
+            q16: pf.q16.p(c0 * hd),
+        };
+        let x = pf.fa2x.load(Relaxed);
+        // SAFETY: K / V^T cache rows < p0 + t1 complete (step [3]) and read-only; V^T rows beyond
+        // them finite up to n_ctx (zero pages or earlier rows); q16 columns of the unit complete;
+        // the fa2 scratch is this thread's; O elements (t0..t1, heads of kvh) owned by the unit.
+        unsafe {
+            if x == 0 {
+                tile.run(&mut ts.fa2);
+            } else {
+                tile.run_x(&mut ts.fa2, pfattn::XParams { fold: x >> 16, ch: x & 0xffff });
+            }
+            for col in 0..ncol {
+                let (t, h) = (t0 + col / group, kvh * group + col % group);
+                let gsrc = pf.qkv.s(t * 2 * att_w + h * 2 * hd + hd..t * 2 * att_w + (h + 1) * 2 * hd);
+                ops::sigmoid(gsrc, &mut ts.gsig);
+                let o = pf.o.s(t * att_w + h * hd..t * att_w + (h + 1) * hd);
+                for (dd, x) in ts.fa2.out(col).iter().enumerate() {
+                    o[dd] = x * ts.gsig[dd];
+                }
+                #[cfg(test)]
+                if self.pf_degrade != 0.0 {
+                    o.iter_mut().for_each(|x| *x *= 1.0 + self.pf_degrade);
                 }
             }
         }
@@ -2276,5 +2451,282 @@ impl<'a> Engine<'a> {
         }
         // SAFETY: argmax slot tid is ours.
         unsafe { pf.argmax.s(tid * 16..tid * 16 + 1)[0] = best };
+    }
+}
+
+// ------------------------------------------------------------ O-117 quality runner hooks
+// (bench / tests only: `cfg(test)` or the `f32-reference` feature; never in a production build)
+
+/// O-117: the positions whose batched-prefill attention outputs are compared with the
+/// f32-attention reference on the same inputs, and the per-position (sum of squared errors, sum
+/// of squared reference values) over every attention layer and query head.
+#[cfg(any(test, feature = "f32-reference"))]
+pub(super) struct PfCheck {
+    positions: Vec<usize>,
+    acc: Mutex<std::collections::BTreeMap<usize, (f64, f64)>>,
+}
+
+/// O-117: batched-prefill evidence (only counted in bench / test builds).
+#[cfg(any(test, feature = "f32-reference"))]
+#[derive(Default)]
+pub(super) struct PfCounters {
+    passes: AtomicU64,
+    rows: AtomicU64,
+    max_rows: AtomicU64,
+    /// attention units: tiled kernel, per-(head, block) kernel, fa2, fa2x, f32-attention reference
+    units: [AtomicU64; 5],
+}
+
+/// O-117: snapshot of the batched-prefill counters since [`Engine::reset_pf_counts`].
+#[cfg(any(test, feature = "f32-reference"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PfCounts {
+    /// batched passes (one pool job each: a ubatch, or a group of ubatches)
+    pub passes: u64,
+    /// token rows through batched passes
+    pub rows: u64,
+    /// most rows of one pass (> 1: genuinely batched)
+    pub max_rows: u64,
+    /// attention units per kernel: (KV head, token block) of the tiled kernel
+    pub units_tiled: u64,
+    /// (query head, token block) of the per-head prefill kernel (no tiled attention / trace)
+    pub units_per_head: u64,
+    pub units_fa2: u64,
+    pub units_fa2x: u64,
+    /// (token, KV head) of the f32-attention reference ([`Engine::set_pf_ref`])
+    pub units_ref: u64,
+}
+
+#[cfg(any(test, feature = "f32-reference"))]
+const PFU_TILED: usize = 0;
+#[cfg(any(test, feature = "f32-reference"))]
+const PFU_PER_HEAD: usize = 1;
+#[cfg(any(test, feature = "f32-reference"))]
+const PFU_FA2: usize = 2;
+#[cfg(any(test, feature = "f32-reference"))]
+const PFU_FA2X: usize = 3;
+#[cfg(any(test, feature = "f32-reference"))]
+const PFU_REF: usize = 4;
+
+/// O-117: the vocabulary logits of one output-normed hidden row (a [`Engine::prefill_ext`] row)
+/// through the production head: activation quantisation of the row and the head GEMV, the same
+/// kernels and inputs as the batched prefill's own head (`pf_head`), split over `pool`'s threads
+/// (every output row is one independent dot product: the bits do not depend on the split).
+#[cfg(any(test, feature = "f32-reference"))]
+pub fn head_logits<P: Team + ?Sized>(plan: &crate::plan::Plan, ws: &crate::weights::WeightStore, pool: &P, xn: &[f32], out: &mut [f32]) {
+    let (de, nv) = (plan.desc.n_embd, plan.desc.n_vocab);
+    assert!(xn.len() == de && out.len() >= nv, "head_logits: one n_embd row into n_vocab logits");
+    // a plain-data copy of the head's reference (pointer as usize): shared by the workers
+    let w: crate::weights::WeightRef = *ws.get(plan.output);
+    let qt = w.qtype();
+    let at = qt.act();
+    // (u64 words: the quantised blocks start with an f32 / f16 scale, keep them aligned)
+    let mut act = vec![0u64; at.bytes(de).div_ceil(8)];
+    // SAFETY: de floats in, at.bytes(de) bytes out.
+    unsafe { quantize_row_raw(at, xn.as_ptr(), act.as_mut_ptr() as *mut u8, de) };
+    let g = qt.nr();
+    let nth = pool.nthreads();
+    let (outp, actp) = (out.as_mut_ptr() as usize, act.as_ptr() as usize);
+    let chunk = plan.head_chunk;
+    pool.run_job(&|ctx: &mut Ctx| {
+        let rows = split(nv / g, ctx.tid, nth);
+        let (mut r0, end) = (rows.start * g, rows.end * g);
+        while r0 < end {
+            let nn = chunk.min(end - r0);
+            // SAFETY: this thread owns out[r0..r0 + nn]; the activation row is read-only.
+            unsafe { gemv_raw(qt, de, (outp as *mut f32).add(r0), w.rows_ptr(0, r0), actp as *const u8, nn) };
+            r0 += nn;
+        }
+    });
+}
+
+#[cfg(any(test, feature = "f32-reference"))]
+impl<'a> Engine<'a> {
+    /// O-117: batched prefill attention through the f32-attention reference (f64 accumulation
+    /// over the roped f32 query and the stored f16 K / V, [`crate::fused_ref::ref_attn_f64`]'s
+    /// arithmetic) for every row; f16 KV only. Takes precedence over tiled / fa2 / fa2x.
+    pub fn set_pf_ref(&mut self, on: bool) {
+        assert!(!on || !self.kv.any8(), "the prefill f32-attention reference reads the f16 KV cache");
+        self.pf_ref = on;
+    }
+
+    /// O-117: compare the gated batched-prefill attention outputs of these absolute positions with
+    /// the f32-attention reference on the same inputs (None = off). Resets the accumulators.
+    pub fn set_pf_check(&mut self, positions: Option<Vec<usize>>) {
+        assert!(positions.is_none() || !self.kv.any8(), "the prefill attention check reads the f16 KV cache");
+        self.pf_check = positions.map(|mut p| {
+            p.sort_unstable();
+            p.dedup();
+            PfCheck { positions: p, acc: Mutex::new(Default::default()) }
+        });
+    }
+
+    /// O-117: (position, sum of squared errors, sum of squared reference values) of every checked
+    /// position a batched prefill reached since the last call; resets.
+    pub fn take_pf_check(&self) -> Vec<(usize, f64, f64)> {
+        self.pf_check.as_ref().map_or_else(Vec::new, |c| std::mem::take(&mut *c.acc.lock().unwrap()).into_iter().map(|(p, (e, r))| (p, e, r)).collect())
+    }
+
+    /// O-117: the engine's weights (the quality runner's [`head_logits`] of hidden rows).
+    pub fn weight_store(&self) -> &'a crate::weights::WeightStore {
+        self.ws
+    }
+
+    /// O-117: the batched-prefill counters since the last reset.
+    pub fn pf_counts(&self) -> PfCounts {
+        let c = &self.pf_ctr;
+        let u = |i: usize| c.units[i].load(Relaxed);
+        PfCounts {
+            passes: c.passes.load(Relaxed),
+            rows: c.rows.load(Relaxed),
+            max_rows: c.max_rows.load(Relaxed),
+            units_tiled: u(PFU_TILED),
+            units_per_head: u(PFU_PER_HEAD),
+            units_fa2: u(PFU_FA2),
+            units_fa2x: u(PFU_FA2X),
+            units_ref: u(PFU_REF),
+        }
+    }
+
+    pub fn reset_pf_counts(&self) {
+        let c = &self.pf_ctr;
+        for a in [&c.passes, &c.rows, &c.max_rows].into_iter().chain(c.units.iter()) {
+            a.store(0, Relaxed);
+        }
+    }
+
+    /// Tests: degrade the fa2 / fa2x prefill units by scaling their outputs by (1 + eps).
+    #[cfg(test)]
+    pub(crate) fn set_pf_degrade(&mut self, eps: f32) {
+        self.pf_degrade = eps;
+    }
+
+    #[inline]
+    fn pf_count_unit(&self, kind: usize) {
+        self.pf_ctr.units[kind].fetch_add(1, Relaxed);
+    }
+
+    fn pf_count_pass(&self, n: usize) {
+        let c = &self.pf_ctr;
+        c.passes.fetch_add(1, Relaxed);
+        c.rows.fetch_add(n as u64, Relaxed);
+        c.max_rows.fetch_max(n as u64, Relaxed);
+    }
+
+    /// O-117: the f32-attention reference of one query head `q` (roped f32) at attention layer
+    /// `ai`, KV head `kvh`, over the stored f16 K / V^T rows of positions < `npos`: f64 scores,
+    /// softmax and V accumulation in position order, output rounded to f32. Bit for bit
+    /// [`crate::fused_ref::ref_attn_f64`] over the widened rows ([`Engine::kv_head_f32`]), read in
+    /// place (no O(n_ctx) f32 copy per unit). `s`: scratch of at least `npos`.
+    pub(crate) fn pf_ref_head(&self, ai: usize, kvh: usize, q: &[f32], npos: usize, s: &mut [f64], out: &mut [f32]) {
+        let d = &self.plan.desc;
+        let hd = d.head_dim;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let kb = ai * d.n_head_kv * self.n_ctx * hd + kvh * self.n_ctx * hd;
+        let mut m = f64::NEG_INFINITY;
+        // SAFETY: K rows / V^T entries of positions < npos are complete (written before the
+        // attention barrier of this pass, or by an earlier pass) and read-only here.
+        unsafe {
+            for p in 0..npos {
+                let kr = self.kcache.at(kb + p * hd..kb + (p + 1) * hd);
+                let mut a = 0f64;
+                for j in 0..hd {
+                    a += q[j] as f64 * kv8::h2f(kr[j]) as f64;
+                }
+                s[p] = a * scale as f64;
+                m = m.max(s[p]);
+            }
+            let mut sum = 0f64;
+            for x in s[..npos].iter_mut() {
+                *x = (*x - m).exp();
+                sum += *x;
+            }
+            for j in 0..hd {
+                let at = self.vrow(ai, kvh * hd + j);
+                let vr = self.vcache.at(at..at + npos);
+                let mut acc = 0f64;
+                for p in 0..npos {
+                    acc += s[p] * kv8::h2f(vr[p]) as f64;
+                }
+                out[j] = (acc / sum) as f32;
+            }
+        }
+    }
+
+    /// O-117 ([`Engine::set_pf_ref`]): every (token, KV head) of the pass through the
+    /// f32-attention reference, gated as the kernels gate (dynamic units, no barrier).
+    fn pf_attention_ref(&self, pf: &Pf, ts: &mut PfThread, l: usize, n: usize, p0: usize) {
+        let d = &self.plan.desc;
+        let (hd, nh, nkv) = (d.head_dim, d.n_head, d.n_head_kv);
+        let (group, att_w, ai) = (nh / nkv, nh * hd, self.att_index[l]);
+        let ctr = step_ctr(pf, ts);
+        let mut s = vec![0f64; p0 + n];
+        let mut out = vec![0f32; hd];
+        let mut gate = vec![0f32; hd];
+        loop {
+            let u = ctr.fetch_add(1, Relaxed);
+            if u >= n * nkv {
+                break;
+            }
+            let (t, kvh) = (u / nkv, u % nkv);
+            self.pf_count_unit(PFU_REF);
+            for h in kvh * group..(kvh + 1) * group {
+                // SAFETY: q / gate rows complete after step [3]; O elements (t, h) owned by this unit.
+                unsafe {
+                    let q = pf.qf.s(t * att_w + h * hd..t * att_w + (h + 1) * hd);
+                    self.pf_ref_head(ai, kvh, q, p0 + t + 1, &mut s, &mut out);
+                    ops::sigmoid(pf.qkv.s(t * 2 * att_w + h * 2 * hd + hd..t * 2 * att_w + (h + 1) * 2 * hd), &mut gate);
+                    let o = pf.o.s(t * att_w + h * hd..t * att_w + (h + 1) * hd);
+                    for j in 0..hd {
+                        o[j] = out[j] * gate[j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// O-117 ([`Engine::set_pf_check`]): after the attention core's barrier, the gated outputs of
+    /// the checked positions of this pass vs the f32-attention reference over the same q and
+    /// stored KV; ends with a barrier (only when a check is set: the same on every thread).
+    fn pf_attn_check(&self, ctx: &mut Ctx, pf: &Pf, ts: &mut PfThread, l: usize, n: usize, p0: usize) {
+        let Some(chk) = &self.pf_check else { return };
+        let d = &self.plan.desc;
+        let (hd, nh, nkv) = (d.head_dim, d.n_head, d.n_head_kv);
+        let (group, att_w, ai) = (nh / nkv, nh * hd, self.att_index[l]);
+        let lo = chk.positions.partition_point(|&p| p < p0);
+        let hi = chk.positions.partition_point(|&p| p < p0 + n);
+        let mine = &chk.positions[lo..hi];
+        let ctr = step_ctr(pf, ts);
+        let mut s = vec![0f64; p0 + n];
+        let mut out = vec![0f32; hd];
+        let mut gate = vec![0f32; hd];
+        loop {
+            let u = ctr.fetch_add(1, Relaxed);
+            if u >= mine.len() * nkv {
+                break;
+            }
+            let (pos, kvh) = (mine[u / nkv], u % nkv);
+            let t = pos - p0;
+            let (mut e2, mut r2) = (0f64, 0f64);
+            for h in kvh * group..(kvh + 1) * group {
+                // SAFETY: q, gate and O rows complete after the core barrier; read only.
+                unsafe {
+                    let q = pf.qf.s(t * att_w + h * hd..t * att_w + (h + 1) * hd);
+                    self.pf_ref_head(ai, kvh, q, pos + 1, &mut s, &mut out);
+                    ops::sigmoid(pf.qkv.s(t * 2 * att_w + h * 2 * hd + hd..t * 2 * att_w + (h + 1) * 2 * hd), &mut gate);
+                    let o = pf.o.s(t * att_w + h * hd..t * att_w + (h + 1) * hd);
+                    for j in 0..hd {
+                        let r = (out[j] * gate[j]) as f64;
+                        e2 += (o[j] as f64 - r).powi(2);
+                        r2 += r * r;
+                    }
+                }
+            }
+            let mut g = chk.acc.lock().unwrap();
+            let a = g.entry(pos).or_insert((0.0, 0.0));
+            a.0 += e2;
+            a.1 += r2;
+        }
+        self.bar(ctx, pf, PH_ATT_CORE);
     }
 }

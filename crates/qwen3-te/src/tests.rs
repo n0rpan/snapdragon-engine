@@ -585,3 +585,39 @@ fn o46_gate_passes_closer_candidates_only() {
     assert!(!ok && why.len() == 6, "{why:?}");
     assert!(metrics::gate_vs_installed(&rep(&inst), &rep(&inst), 1.0).0, "equal distance passes");
 }
+
+#[test]
+fn ggml_backend_matches_q8_emulation_and_is_thread_invariant() {
+    let st = Store::new(tiny_cfg(), 31);
+    let w = st.weights();
+    let spec = tiny_spec();
+    // 43 real tokens: 10 full 4-row groups plus a 3-row gemv tail
+    let e = input(43, &spec, 40);
+    let q = run(&w, &spec, &e, &CpuLinears { w: &w, threads: 2, mode: CpuMode::Q8 }, 2);
+    let f = run(&w, &spec, &e, &CpuLinears { w: &w, threads: 2, mode: CpuMode::F32 }, 2);
+    let g1 = crate::ggml::GgmlLinears::new(&w, 1).unwrap();
+    let g5 = crate::ggml::GgmlLinears::new(&w, 5).unwrap();
+    let a = run(&w, &spec, &e, &g1, 1);
+    let b = run(&w, &spec, &e, &g5, 5);
+    assert!(a == b, "ggml: thread count changed bits");
+    let rq = rel(&a, &q);
+    assert!(rq < 1e-4, "ggml vs q8 emulation rel {rq}");
+    assert!(rel(&a, &f) < 0.03);
+    assert_eq!(g1.bytes(), st.mats.iter().flatten().map(|m| m.len()).sum::<usize>() - st.mats[4].iter().map(|m| m.len()).sum::<usize>() + st.mats[4].iter().map(|m| m.len()).sum::<usize>());
+}
+
+#[test]
+fn encoder_identity_names_arith_file_and_size() {
+    let dir = std::env::temp_dir().join(format!("qwen3-te-id-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("te.gguf");
+    std::fs::write(&p, [0u8; 123]).unwrap();
+    assert_eq!(crate::encoder_identity(&p, "cpu-ggml").unwrap(), format!("{};cpu-ggml;te.gguf;123", crate::ENCODER_VERSION));
+    assert!(crate::encoder_identity(&p, "gpu").is_err());
+    assert_ne!(crate::encoder_identity(&p, "npu-fp16").unwrap(), crate::encoder_identity(&p, "npu-w8").unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// v0.1.3 lane H tests live in their own file (conflict rule: new tests in new files)
+#[path = "tests_v013.rs"]
+mod v013;

@@ -715,3 +715,9 @@ fn numerics_epoch_golden_state() {
         None => panic!("kernel path {key} [{kp}] is not allowlisted: add (\"{key}\", {EPOCH}, \"{got}\") to GOLDEN in numerics_epoch_golden_state (one commit), or this platform's state cache identity is unguarded"),
     }
 }
+
+// v0.1.3 PREFILL-LONG: fa2 prefill attention, O-70 policy, LC-6 / LC-8, deep golden (new file)
+mod pfattn;
+
+// O-117 quality runner: batched prefill candidates (fa2 / fa2x) vs tiled, control, reference
+mod fused_ref_o117;

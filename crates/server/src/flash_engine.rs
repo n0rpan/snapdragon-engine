@@ -147,7 +147,14 @@ pub fn cache_decide_now(n_ctx: usize, harness_gib: Option<f64>, pref_gib: Option
             }
         );
     }
+    // F127-3: one stable token the controller can read from the first start-up line (before /props exists)
+    line += &format!(" [swap-guard mode={}]", d.swap_guard_mode());
     (d, line)
+}
+
+/// `OXE_FLASH_PF_PROTECT_HOT=1` (F123 next; validated at start by startup_check: 0 or 1).
+pub fn pf_protect_hot_from_env() -> bool {
+    std::env::var("OXE_FLASH_PF_PROTECT_HOT").is_ok_and(|v| v.trim() == "1")
 }
 
 fn hot_bytes(hot: &[(u16, u16)]) -> Vec<u8> {
@@ -240,6 +247,12 @@ impl FlashEngine {
         // W4-I prefill policy, set before the stream is shared (fast path only, like the G4 switches)
         stb.pf_order = o.pf_order && !o.exact;
         stb.pf_order_last = o.pf_order_last && !o.exact;
+        // F123 next: hot-resident protection inside an overflowing batched op (opt-in until its ABBA after a short
+        // prefill; default off). Environment switch until the server has a flag for it (main.rs is lane B's).
+        stb.pf_protect_hot = stb.pf_order && pf_protect_hot_from_env();
+        if stb.pf_protect_hot {
+            eprintln!("oxe-server: flash: hot-resident protection in batched ops ON (OXE_FLASH_PF_PROTECT_HOT=1; F123)");
+        }
         match if o.exact { Some(0) } else { o.pf_readahead } {
             None => {
                 stb.pf_readahead = 64;
@@ -251,7 +264,7 @@ impl FlashEngine {
             }
         }
         let st: &'static Stream = Box::leak(stb);
-        let mut ctx = GraphCtx::new(gm, o.n_ctx as u32);
+        let mut ctx = GraphCtx::try_new(gm, o.n_ctx as u32)?;
         // the per-token expert op needs every expert of a chunk resident at once: chunks that could exceed the
         // smallest layer pool go to the batched (wave) op, which sizes its waves from the pool (QC-052: a 6 GiB
         // cache panicked "no evictable slot" on the first multi-token prefill; 18-21 GiB pools are 137-155 slots
@@ -444,13 +457,12 @@ impl Engine for FlashEngine {
     }
     fn save_state(&mut self, w: &mut dyn std::io::Write) -> Result<()> {
         let e = |e: std::io::Error| EngineError(format!("save state: {e}"));
-        let (toks, b) = self.ctx.save_compact();
-        w.write_all(&(b.len() as u64).to_le_bytes()).map_err(e)?;
-        for t in &toks {
-            w.write_all(&t.to_le_bytes()).map_err(e)?;
+        // FP-2: streamed region by region (same bytes as save_state_vec): a streaming caller (state store, session
+        // cache, PrefixStore::save_stream) never holds the ~285 MB anchor state in RAM
+        self.ctx.save_compact_to(w).map_err(e)?;
+        for c in self.logits.chunks(16384) {
+            w.write_all(&c.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(e)?;
         }
-        w.write_all(&b).map_err(e)?;
-        w.write_all(&self.logits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(e)?;
         // SAFETY: engine thread, no compute in progress.
         let hot = unsafe { self.st.hot_list() };
         w.write_all(&hot_bytes(&hot)).map_err(e)

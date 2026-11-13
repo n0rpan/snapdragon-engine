@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // F-CI9: `| head` ends with status 0, not a core dump
     let mut args = std::env::args().skip(1);
     let mut threads = vec![4usize, 6, 8, 12];
     let mut reps = 200_000usize;

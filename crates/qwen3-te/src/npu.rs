@@ -49,6 +49,39 @@ pub struct NpuLinears<'w, 'a> {
     pub placed_bytes: u64,
 }
 
+/// Backend wrapper that counts every byte the accelerator allocates (activation, output and weight
+/// buffers): the ACTUAL DMA allocation of the encoder, reported for admission.
+pub struct CountingBackend {
+    inner: Box<dyn Backend>,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CountingBackend {
+    pub fn new(inner: Box<dyn Backend>, bytes: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        CountingBackend { inner, bytes }
+    }
+}
+
+impl Backend for CountingBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn sessions(&self) -> usize {
+        self.inner.sessions()
+    }
+    fn vtcm_bytes(&self) -> u32 {
+        self.inner.vtcm_bytes()
+    }
+    fn alloc(&mut self, session: usize, bytes: usize) -> Result<oxn::Buf, String> {
+        let b = self.inner.alloc(session, bytes)?;
+        self.bytes.fetch_add(b.len as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(b)
+    }
+    fn gemm(&mut self, session: usize, a: &oxn::GemmArgs) -> Result<oxn::GemmStats, String> {
+        self.inner.gemm(session, a)
+    }
+}
+
 /// Largest |x| an fp16 activation can hold.
 const F16_MAX: f32 = 65504.0;
 

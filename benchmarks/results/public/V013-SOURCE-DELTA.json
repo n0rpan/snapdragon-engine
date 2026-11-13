@@ -1,0 +1,91 @@
+{
+ "schema": "snapdragon-local-ai-lab/receipt/v1",
+ "kind": "runq-export",
+ "ticket": "V013-SOURCE-DELTA",
+ "title": "Audited non-numeric release-source deltas",
+ "created_utc": "2026-11-13T07:48:39Z",
+ "hardware": null,
+ "engine": {
+  "name": "oxe",
+  "commit": "23189a7e4d053299adcbab681b42ed4fdabbad75",
+  "binary_sha256": null
+ },
+ "model": {
+  "name": null,
+  "quant": null,
+  "files": []
+ },
+ "config": {
+  "n_ctx": null,
+  "threads": null,
+  "threads_batch": null
+ },
+ "evidence": {
+  "class": null,
+  "n": null,
+  "quality_class": null
+ },
+ "notes": [
+  "Two optional diagnostics and two non-loopback test fixtures changed. Full string inventory is local only; old values are represented by hashes here. Default arithmetic and state identity unchanged. Exact exported-tree CI required."
+ ],
+ "sources": [
+  {
+   "name": "V013-SOURCE-DELTA.json",
+   "data": {
+    "qualified_commit": "6940301eae7f96ac6000f379289317eff035a212",
+    "audited_code_commit": "23189a7e4d053299adcbab681b42ed4fdabbad75",
+    "workflow_comment_only": true,
+    "no_gate_or_scanner_exemptions": true,
+    "default_arithmetic_changed": false,
+    "state_identity_changed": false,
+    "ci_arm64_exact_export_required": true,
+    "changed_string_entries": [
+     {
+      "name": "build_diagnostic",
+      "before_sha256": "b3ebc13020a615374110c1f778c3fe18023d7fdffec2628ac3a4db743bc17ea4",
+      "after_sha256": "3fe49f18a923ec3204899df838f500c330a8feeb3e90aa52752da5852852d012",
+      "note": "oxn: the device feature needs FASTRPC_INC pointing at the open-source FastRPC ABI include directory",
+      "arithmetic_changed": false,
+      "state_identity_changed": false
+     },
+     {
+      "name": "native_framework_diagnostic",
+      "before_sha256": "2b8de9ff0131b7bded7a0ef8ec8ad0cfe2cfe9d30509309023a1e66a0e762cdd",
+      "after_sha256": "9ca478ea4fbc67468172821c2091444e9e12c395cc5ee6fa07458c0e4289e7f9",
+      "note": "remote framework error (raw code retained)",
+      "arithmetic_changed": false,
+      "state_identity_changed": false
+     },
+     {
+      "name": "bind_fixture_1",
+      "before_sha256": "552354592821b7e6b76f87d10c0cb4ff512ffed049dde0e40769a0bcf9f50c8d",
+      "after_sha256": "2d459f9e8eb3f880e28a2b04c5749f4802511d3ecb07d83472ce9af6c7a60ebf",
+      "note": "192.0.2.20",
+      "arithmetic_changed": false,
+      "state_identity_changed": false
+     },
+     {
+      "name": "bind_fixture_2",
+      "before_sha256": "0546412d61ba57f140cbc562c81ed83fb1b8aae26b57bb1ac00d5eddc798ac0f",
+      "after_sha256": "8959edf6884f2c2e223a9319e83a69820ff7a9c39ecd7ebe6413e5297d4347dd",
+      "note": "198.51.100.5",
+      "arithmetic_changed": false,
+      "state_identity_changed": false
+     }
+    ]
+   },
+   "private_file_sha256": "58a20f555563e6fa78661a2c6fc3bb446adc2d4dabd12d0bd5df70d134609fee"
+  }
+ ],
+ "export": {
+  "scanner": "export_receipt/1",
+  "values_kept": 34,
+  "dropped": {},
+  "files_not_read": {},
+  "prompt_hashes": false
+ },
+ "public_safe": {
+  "scanner": "export_receipt/1",
+  "hits": 0
+ }
+}

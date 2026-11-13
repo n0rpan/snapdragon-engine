@@ -85,6 +85,7 @@ fn cgroup_file(name: &str) -> Option<String> {
 }
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // F-CI9: `| head` ends with status 0, not a core dump
     let argv: Vec<String> = std::env::args().collect();
     let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
     let a = Args::parse(&argv[2.min(argv.len())..]);

@@ -177,18 +177,41 @@ impl Weights {
 }
 
 /// Shared f32 buffer written in disjoint ranges between barriers.
-struct SBuf(UnsafeCell<Vec<f32>>);
+/// Shared f32 scratch written by the team on disjoint ranges between barriers.
+///
+/// S7 (REVIEW-v0.1.1): slices are built from a raw pointer + length taken once at construction; no thread ever
+/// forms a `&mut Vec` (the old `UnsafeCell<Vec>` handed every thread a `&mut` to the same Vec header). Writers that
+/// split work by rows take only their range with [`SBuf::range`].
+struct SBuf {
+    ptr: *mut f32,
+    len: usize,
+}
 unsafe impl Sync for SBuf {}
+unsafe impl Send for SBuf {}
 impl SBuf {
     fn new(n: usize) -> SBuf {
-        SBuf(UnsafeCell::new(vec![0.0; n]))
+        let b: Box<[f32]> = vec![0.0; n].into_boxed_slice();
+        SBuf { len: b.len(), ptr: Box::into_raw(b) as *mut f32 }
     }
+    /// The whole buffer, mutable. Callers write only the elements their phase owns (disjoint between threads).
     #[allow(clippy::mut_from_ref)]
     unsafe fn m(&self) -> &mut [f32] {
-        &mut *self.0.get()
+        std::slice::from_raw_parts_mut(self.ptr, self.len)
+    }
+    /// Elements `r0..r1` only (bounds checked: cold relative to the GEMV it feeds).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn range(&self, r0: usize, r1: usize) -> &mut [f32] {
+        assert!(r0 <= r1 && r1 <= self.len, "SBuf range {r0}..{r1} of {}", self.len);
+        std::slice::from_raw_parts_mut(self.ptr.add(r0), r1 - r0)
     }
     unsafe fn r(&self) -> &[f32] {
-        &*self.0.get()
+        std::slice::from_raw_parts(self.ptr, self.len)
+    }
+}
+impl Drop for SBuf {
+    fn drop(&mut self) {
+        // SAFETY: ptr/len come from Box::into_raw of a boxed slice of exactly this length, dropped once.
+        unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.len))) }
     }
 }
 
@@ -469,11 +492,11 @@ impl<'a> Engine<'a> {
             kf::oxe_rms_norm_mul_f32(x.as_ptr(), hc.norm, ts.xn.as_mut_ptr(), (N_HC * N_EMBD) as i64, EPS);
             quantize_act(ActType::Q8_0, &ts.xn, &mut ts.a);
             let (r0, r1) = part(HC_RANK, nt, tid, 8);
-            hc.down.gemv(r0, r1, &ts.a, &ts.xn, &mut self.low.m()[r0..r1]);
+            hc.down.gemv(r0, r1, &ts.a, &ts.xn, self.low.range(r0, r1));
             if let Some(inj) = hc.inject {
                 if tid < N_HC.min(nt) {
                     let (i0, i1) = if nt >= N_HC { (tid, tid + 1) } else { part(N_HC, nt, tid, 1) };
-                    inj.gemv(i0, i1, &ts.a, &ts.xn, &mut self.hcw.m()[i0..i1]);
+                    inj.gemv(i0, i1, &ts.a, &ts.xn, self.hcw.range(i0, i1));
                 }
             }
         }
@@ -486,7 +509,7 @@ impl<'a> Engine<'a> {
             kf::oxe_rms_norm_f32(low.as_ptr(), ts.tmp.as_mut_ptr(), HC_RANK as i64, EPS);
             quantize_act(ActType::Q8_0, &ts.tmp[..HC_RANK], &mut ts.a);
             let (r0, r1) = part(N_HC * N_EMBD, nt, tid, 8);
-            hc.up.gemv(r0, r1, &ts.a, &ts.tmp[..HC_RANK], &mut self.hup.m()[r0..r1]);
+            hc.up.gemv(r0, r1, &ts.a, &ts.tmp[..HC_RANK], self.hup.range(r0, r1));
         }
         self.end_phase(c, ts, t0, Kind::Hc, s, 0, 0);
     }
@@ -534,7 +557,7 @@ impl<'a> Engine<'a> {
             let (r0, r1) = part(mq.n, nt, tid, 8);
             mq.gemv(r0, r1, &ts.a, xin, &mut q[r0..r1]);
             let (r0, r1) = part(mz.n, nt, tid, 8);
-            mz.gemv(r0, r1, &ts.a, xin, &mut self.z.m()[r0..r1]);
+            mz.gemv(r0, r1, &ts.a, xin, self.z.range(r0, r1));
             let ab = self.ab.m();
             let (r0, r1) = part(ma.n, nt, tid, 1);
             ma.gemv(r0, r1, &ts.a, xin, &mut ab[r0..r1]);
@@ -739,7 +762,7 @@ impl<'a> Engine<'a> {
         quantize_act(ActType::Q8K, &ts.xn[..N_EMBD], &mut ts.a);
         let xin = &ts.xn[..N_EMBD];
         let (r0, r1) = part(N_EXPERT, nt, tid, 1);
-        lw.router.gemv(r0, r1, &ts.a, xin, &mut self.logits.m()[r0..r1]);
+        lw.router.gemv(r0, r1, &ts.a, xin, self.logits.range(r0, r1));
         let sh = self.sh.m();
         let (r0, r1) = part(FF_EXP, nt, tid, 8);
         lw.sh_gate.gemv(r0, r1, &ts.a, xin, &mut sh[r0..r1]);
@@ -871,7 +894,7 @@ impl<'a> Engine<'a> {
         kf::oxe_rms_norm_f32(sh.as_ptr(), ts.tmp.as_mut_ptr(), FF_EXP as i64, EPS);
         quantize_act(ActType::Q8_0, &ts.tmp[..FF_EXP], &mut ts.a);
         let (r0, r1) = part(N_EMBD, nt, tid, 8);
-        let moe = &mut self.moe.m()[r0..r1];
+        let moe = self.moe.range(r0, r1);
         let t = &mut ts.tmp[..r1 - r0];
         lw.sh_down.gemv(r0, r1, &ts.a, &[], t);
         let sg = self.xin.r()[0];

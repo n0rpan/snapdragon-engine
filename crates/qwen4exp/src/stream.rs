@@ -113,6 +113,8 @@ struct Shared {
     b_have_last: Vec<bool>,
     b_ra: usize,                   // W4-I: read-ahead in effect for the current pass (decided at layer 0 when auto)
     b_wave_max: usize,             // experts per wave of the current op (thread 0 publishes it before the first barrier)
+    b_keep: [u64; 8],              // F123: hot residents protected for the whole current op (bitset; empty = off)
+    b_keep_n: usize,
 }
 
 /// Spin barrier for the graph threads inside one custom op (all `nth` threads call the op).
@@ -195,6 +197,15 @@ pub struct Stream {
     /// (062: residents-first + id sort cost +4.4% decode after a 75-token prefill). Order only: values unchanged.
     /// Default off. Replay: order_sim_f123.py in the private lab notes.
     pub pf_order_last: bool,
+    /// F123 next (`OXE_FLASH_PF_PROTECT_HOT=1`, with `pf_order` on; default off): in a batched op that overflows its
+    /// pool, the residents the op uses whose LFU count is >= 2 (hot before this op: decode experts) are never evicted
+    /// by the op's misses; at most a quarter of the pool, the most-used first, and the waves shrink by that many
+    /// slots. Same reads inside the op (residents still come first, every miss is read once) and the same output
+    /// bits; the op ends with the hot residents still in the pool (062: order 1 evicted them, +4.4% decode after a
+    /// short prefill). LFU only (CLOCK keeps no counts: nothing protected).
+    pub pf_protect_hot: bool,
+    /// hot residents protected over all batched ops so far (diagnostic)
+    pub pf_protect_hot_n: AtomicU64,
     /// PREFILL IO (a): after layer L's batched op, read ahead up to this many experts of layer L+1 at prefetch
     /// priority while L finishes and L+1's dense / attention part runs: into empty slots, or over residents the last
     /// op of that layer did not use (targets = the experts it did use). 0 = off. Default 64, under `pf_readahead_auto`.
@@ -319,6 +330,8 @@ impl Stream {
                 b_have_last: vec![false; N_LAYER],
                 b_ra: 0,
                 b_wave_max: 1,
+                b_keep: [0u64; 8],
+                b_keep_n: 0,
             }),
             scratch: (0..MAX_THREADS).map(|_| Line(UnsafeCell::new(vec![0u8; max_aq]))).collect(),
             pending: (0..MAX_THREADS).map(|_| Line(UnsafeCell::new(Vec::new()))).collect(),
@@ -329,6 +342,8 @@ impl Stream {
             batch_tile: false,
             pf_order: true,
             pf_order_last: false,
+            pf_protect_hot: false,
+            pf_protect_hot_n: AtomicU64::new(0),
             pf_readahead: 64,
             pf_readahead_auto: true,
             pf_ra_warm: 0.5,
@@ -798,7 +813,28 @@ impl Stream {
             // two waves are protected at a time; with the layer read-ahead on, up to b_ra more slots may hold reads in
             // flight that this op does not need (never evictable while pending): leave room for them
             // (a layer's read-ahead never exceeds a quarter of its pool: small pools keep useful waves)
-            sh.b_wave_max = ((self.cache.quota[l].saturating_sub(4 + sh.b_ra.min(self.cache.quota[l] / 4))) / 2).max(1);
+            let q = self.cache.quota[l];
+            let ra_slots = sh.b_ra.min(q / 4);
+            // F123: protect hot residents for the whole op, only when the op overflows what the waves can hold
+            sh.b_keep = [0u64; 8];
+            sh.b_keep_n = 0;
+            if self.pf_order && self.pf_protect_hot && sh.b_experts.len() > q.saturating_sub(4 + ra_slots) {
+                let mut hot: Vec<(u32, u32)> = sh
+                    .b_experts
+                    .iter()
+                    .filter(|&&e| self.cache.resident(l, e as usize))
+                    .map(|&e| (self.cache.lfu_count(l, e as usize), e))
+                    .filter(|&(c, _)| c >= 2)
+                    .collect();
+                hot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                hot.truncate(q / 4);
+                for &(_, e) in &hot {
+                    sh.b_keep[e as usize / 64] |= 1 << (e % 64);
+                }
+                sh.b_keep_n = hot.len();
+                self.pf_protect_hot_add(hot.len());
+            }
+            sh.b_wave_max = ((q.saturating_sub(4 + ra_slots + sh.b_keep_n)) / 2).max(1);
             let wave_max = sh.b_wave_max;
             // PREFILL IO: residents first, then the misses in file order; remember the set for the next read-ahead
             if self.pf_order && self.pf_order_last {
@@ -820,8 +856,9 @@ impl Stream {
             let n0 = sh.b_experts.len().min(wave_max);
             let mut ents = std::mem::take(&mut sh.b_wave_entries[0]);
             ents.clear();
+            let keep = (sh.b_keep_n > 0).then_some(sh.b_keep);
             for &e in &sh.b_experts[..n0] {
-                ents.push(self.cache.lookup_protect(&self.io, l, e as usize, st, st, ReqClass::Demand).0);
+                ents.push(self.cache.lookup_protect_keep(&self.io, l, e as usize, st, st, ReqClass::Demand, keep.as_ref()).0);
             }
             sh.b_wave_entries[0] = ents;
             self.counters.fetch_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
@@ -850,9 +887,10 @@ impl Stream {
                 let (n0, n1) = ((w + 1) * wave_max, ((w + 2) * wave_max).min(n_exp));
                 let mut ents = std::mem::take(&mut sh.b_wave_entries[(w + 1) % 2]);
                 ents.clear();
+                let keep = (sh.b_keep_n > 0).then_some(sh.b_keep);
                 for i in n0..n1 {
                     let e = sh.b_experts[i] as usize;
-                    ents.push(self.cache.lookup_protect(&self.io, l, e, st, cur, ReqClass::Demand).0);
+                    ents.push(self.cache.lookup_protect_keep(&self.io, l, e, st, cur, ReqClass::Demand, keep.as_ref()).0);
                 }
                 sh.b_wave_entries[(w + 1) % 2] = ents;
             }
@@ -996,6 +1034,10 @@ impl Stream {
 }
 
 impl Stream {
+    fn pf_protect_hot_add(&self, n: usize) {
+        self.pf_protect_hot_n.fetch_add(n as u64, Relaxed);
+    }
+
     /// W4-I per-phase IO core: move the running IO worker threads (named `oxf-io`, `oxf-io1`, ...) to `cpus`
     /// (worker i -> cpus[i % len]); e.g. another core for a batched prefill than for decode. Placement only. Returns
     /// the number of threads moved. SQPOLL kernel threads, if any, are not touched.
@@ -1259,12 +1301,16 @@ unsafe extern "C" fn stream_expert_cb(call: *const FgExpertCall, ud: *mut c_void
 }
 
 #[cfg(test)]
+#[path = "tests_v013_stream.rs"]
+mod tests_v013;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// Synthetic IQ2_S / IQ4_NL layout (every layer alike) + a sparse sidecar with random experts 0..n_exp of layers
     /// 0 and 1, on the target directory's file system (O_DIRECT; on this machine dm-crypt). None if O_DIRECT is refused.
-    fn synth_stream(tag: &str, n_exp: usize, quota: usize) -> Option<(Stream, std::path::PathBuf)> {
+    pub(super) fn synth_stream(tag: &str, n_exp: usize, quota: usize) -> Option<(Stream, std::path::PathBuf)> {
         use crate::ffi::W;
         use std::os::unix::fs::FileExt;
         let (gw, dw) = (W::Iq2S, W::Iq4Nl);
@@ -1504,7 +1550,7 @@ mod tests {
     }
 
     /// One batched expert op (single graph thread) on layer `l`: the down outputs [n_embd, TOP_K, nt].
-    fn batch_op(st: &Stream, l: usize, ids: &[i32], x: &[f32]) -> Vec<f32> {
+    pub(super) fn batch_op(st: &Stream, l: usize, ids: &[i32], x: &[f32]) -> Vec<f32> {
         let nt = ids.len() / TOP_K;
         let mut dst = vec![f32::NAN; N_EMBD * TOP_K * nt];
         let c = FgExpertCall {

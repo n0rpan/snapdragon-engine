@@ -21,6 +21,7 @@
 //! (`tests/fattn.rs`, `tests/fattn_kbench.rs`).
 
 use kernels_sys::ffi;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::MAX_LANES;
 
@@ -122,6 +123,19 @@ impl Fa {
     /// the chunk end (min(chunk start + ch, n_ctx)), q16 and gates complete and not written during the call; the partial
     /// slots of this thread's items are written by no one else; `ch % 32 == 0`, nl <= MAX_LANES.
     pub unsafe fn chunks(&self, tid: usize, nth: usize, scr: &mut FaScratch) {
+        self.chunks_stats(tid, nth, scr, None)
+    }
+
+    /// [`Self::chunks`] that also counts `OXE_ATTN_STATS` (O70-KEEP): per column, the 32-position
+    /// blocks of the chunk entirely inside the column's valid prefix (total, all f16 weights exactly
+    /// zero, all below 2^-10). The weights seen here are the chunk-local exp(x - m_chunk), the
+    /// values a fused zero-block skip would test; since m_chunk <= the row max, a block that is zero
+    /// here is zero in the normalised row too (the count is exact for "zero", and "< 2^-10" is
+    /// relative to the chunk max). Totals equal the tiled path's (floor((pos + 1) / 32) per column).
+    ///
+    /// # Safety
+    /// As [`Self::chunks`].
+    pub unsafe fn chunks_stats(&self, tid: usize, nth: usize, scr: &mut FaScratch, stats: Option<&[AtomicU64; 3]>) {
         let (hd, group, nl, pos0) = (self.hd, self.group, self.nl, self.pos0);
         let ncol = self.ncol();
         let last = self.last();
@@ -198,6 +212,24 @@ impl Fa {
                 self.part.add(idx * ncol * hd),
                 self.ml.add(idx * 2 * ncol),
             );
+            if let Some(st) = stats {
+                // weights of column c at p[c * len ..], valid prefix nv[c] (a multiple of 32 except
+                // in the column's last chunk; only whole blocks are counted)
+                let (mut full, mut z, mut t) = (0u64, 0u64, 0u64);
+                for c in 0..ncol {
+                    let nv = scr.nv[c].max(0) as usize;
+                    let w = &scr.p[c * len..c * len + nv];
+                    for b in w.chunks_exact(32) {
+                        let m = b.iter().map(|&x| x & 0x7fff).max().unwrap_or(0);
+                        full += 1;
+                        z += (m == 0) as u64;
+                        t += (m < 0x1400) as u64; // < 2^-10
+                    }
+                }
+                st[0].fetch_add(full, Relaxed);
+                st[1].fetch_add(z, Relaxed);
+                st[2].fetch_add(t, Relaxed);
+            }
         }
     }
 

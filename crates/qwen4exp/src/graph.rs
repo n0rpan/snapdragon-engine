@@ -98,6 +98,7 @@ extern "C" {
     fn fg_pf_stats(out2: *mut std::ffi::c_long, reset: c_int);
     fn fg_selftest_dense(nth: c_int) -> c_int;
     fn fg_selftest_split(nth: c_int) -> c_int;
+    fn fg_selftest_mm_cols(nth: c_int, max_w: c_int, bitwise_out: *mut c_int, maxd_out: *mut f64) -> c_int;
     fn fg_pf_bench_dense(ty: c_int, k: std::ffi::c_long, r: std::ffi::c_long, t: std::ffi::c_long, nth: c_int, reps: c_int, out3: *mut f64) -> c_int;
     fn fg_ctx_copy_state(dst: *mut FgCtx, src: *const FgCtx) -> c_int;
     fn fg_ctx_pos(c: *const FgCtx) -> u32;
@@ -107,6 +108,7 @@ extern "C" {
     fn fg_ctx_recurrent_bytes(c: *const FgCtx) -> usize;
     fn fg_ctx_compact_bytes(c: *mut FgCtx, pos: u32) -> usize;
     fn fg_ctx_save_compact(c: *mut FgCtx, buf: *mut c_void);
+    fn fg_ctx_save_compact_cb(c: *mut FgCtx, cb: extern "C" fn(*mut c_void, *const c_char, usize) -> c_int, user: *mut c_void) -> c_int;
     fn fg_ctx_load_compact(c: *mut FgCtx, buf: *const c_void, pos: u32) -> c_int;
     fn fg_ctx_save_recurrent(c: *const FgCtx, buf: *mut c_void);
     fn fg_ctx_restore_recurrent(c: *mut FgCtx, buf: *const c_void, pos: u32) -> c_int;
@@ -238,9 +240,20 @@ pub struct Dump {
 }
 
 impl GraphCtx {
+    /// A context of `n_ctx` positions; panics when the C side cannot allocate it (CLI tools). Servers use
+    /// [`GraphCtx::try_new`].
     pub fn new(m: &GraphModel, n_ctx: u32) -> GraphCtx {
+        Self::try_new(m, n_ctx).unwrap_or_else(|e| panic!("{e}"))
+    }
+    /// S9 (REVIEW-v0.1.1): `fg_ctx_new` returns null when the context cannot be allocated; every later call would
+    /// dereference it. Checked here, like `fg_model_new`.
+    pub fn try_new(m: &GraphModel, n_ctx: u32) -> Result<GraphCtx, String> {
         // SAFETY: valid model.
-        GraphCtx { c: unsafe { fg_ctx_new(m.m, n_ctx) }, abort: None }
+        let c = unsafe { fg_ctx_new(m.m, n_ctx) };
+        if c.is_null() {
+            return Err(format!("fg_ctx_new failed (n_ctx {n_ctx}): context allocation"));
+        }
+        Ok(GraphCtx { c, abort: None })
     }
     pub fn clear(&mut self) {
         unsafe { fg_ctx_clear(self.c) }
@@ -402,6 +415,48 @@ impl GraphCtx {
             out.resize(at + nb, 0);
             fg_ctx_save_compact(self.c, out[at..].as_mut_ptr() as *mut c_void);
         }
+    }
+    /// FP-2: the bytes of [`GraphCtx::save_compact_append`] (u64 compact length, the token ids, the compact state) written
+    /// to `w` region by region: no buffer of the whole state (~285 MB at 5.5K tokens).
+    pub fn save_compact_to(&mut self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        struct St<'a> {
+            w: &'a mut dyn std::io::Write,
+            err: Option<std::io::Error>,
+            n: usize,
+        }
+        extern "C" fn put(user: *mut c_void, d: *const c_char, n: usize) -> c_int {
+            // SAFETY: `user` is the St below, alive for the call; `d` points at `n` readable bytes of the context.
+            let st = unsafe { &mut *(user as *mut St) };
+            let b = unsafe { std::slice::from_raw_parts(d as *const u8, n) };
+            match st.w.write_all(b) {
+                Ok(()) => {
+                    st.n += n;
+                    0
+                }
+                Err(e) => {
+                    st.err = Some(e);
+                    1
+                }
+            }
+        }
+        let n = self.pos();
+        let nb = self.compact_bytes();
+        let mut toks = vec![0i32; n];
+        // SAFETY: n tokens.
+        unsafe { fg_ctx_get_tokens(self.c, toks.as_mut_ptr()) };
+        w.write_all(&(nb as u64).to_le_bytes())?;
+        let tb: Vec<u8> = toks.iter().flat_map(|t| t.to_le_bytes()).collect();
+        w.write_all(&tb)?;
+        let mut st = St { w, err: None, n: 0 };
+        // SAFETY: valid context; the callback only reads the regions it is handed.
+        let rc = unsafe { fg_ctx_save_compact_cb(self.c, put, &mut st as *mut St as *mut c_void) };
+        if let Some(e) = st.err {
+            return Err(e);
+        }
+        if rc != 0 || st.n != nb {
+            return Err(std::io::Error::other(format!("compact state stream: {} of {nb} bytes (rc {rc})", st.n)));
+        }
+        Ok(())
     }
     /// Load a state saved by `save_compact` (the context's other cells are left as they are).
     pub fn load_compact(&mut self, toks: &[i32], b: &[u8]) -> Result<(), String> {
@@ -577,6 +632,17 @@ pub fn selftest_dense(nth: usize) -> bool {
 pub fn selftest_split(nth: usize) -> bool {
     // SAFETY: self-contained.
     unsafe { fg_selftest_split(nth as c_int) == 0 }
+}
+
+/// F87 (model-free): for the Flash dense weight types [Q6_K, Q8_0] and widths w = 1..=max_w, how many columns of one
+/// w-column `ggml_mul_mat` equal the same token computed as a 1-column call, bit for bit, and the max |diff|.
+pub fn selftest_mm_cols(nth: usize, max_w: usize) -> [Vec<(usize, f64)>; 2] {
+    let mut b = vec![0 as c_int; 2 * max_w];
+    let mut d = vec![0f64; 2 * max_w];
+    // SAFETY: self-contained; both arrays hold 2 x max_w entries.
+    unsafe { fg_selftest_mm_cols(nth as c_int, max_w as c_int, b.as_mut_ptr(), d.as_mut_ptr()) };
+    let row = |t: usize| (0..max_w).map(|w| (b[t * max_w + w] as usize, d[t * max_w + w])).collect::<Vec<_>>();
+    [row(0), row(1)]
 }
 
 /// Model-free timing of one shape (ggml type id): (ms ggml_mul_mat, ms multi-column, bitwise equal).

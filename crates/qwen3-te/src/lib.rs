@@ -9,11 +9,14 @@
 //! - [`weights`]: borrowed GGUF linears (row readers), only the 27 blocks klein needs.
 //! - [`encoder`]: the graph, with a [`encoder::Linears`] backend: CPU f32 reference, CPU Q8
 //!   (sd.cpp arithmetic emulation), or [`npu::NpuLinears`] (oxn emulator or device).
+//!   [`ggml::GgmlLinears`] (`cpu-ggml`, sd.cpp's ggml Q8_0 kernels: the production CPU path).
 //! - [`metrics`]: hidden-state agreement and the gate.
 
+pub mod attn_gqa;
 pub mod config;
 pub mod cpu;
 pub mod encoder;
+pub mod ggml;
 pub mod metrics;
 pub mod npu;
 pub mod prompt;
@@ -54,7 +57,37 @@ impl From<String> for TeError {
 pub enum TeBackend {
     CpuF32,
     CpuQ8,
+    /// sd.cpp's ggml Q8_0 kernels (repacked weights): the production CPU path
+    CpuGgml,
     Npu { backend: Box<dyn oxn::Backend>, opts: npu::NpuOpts },
+}
+
+impl TeBackend {
+    /// Arithmetic class, part of the encoder identity (cache namespace).
+    pub fn arith(&self) -> String {
+        match self {
+            TeBackend::CpuF32 => "cpu-f32".into(),
+            TeBackend::CpuQ8 => "cpu-q8".into(),
+            TeBackend::CpuGgml => "cpu-ggml".into(),
+            TeBackend::Npu { opts, .. } => {
+                format!("npu-{}", if opts.weights == oxn::wfmt::WFmt::Fp16 { "fp16" } else { "w8" })
+            }
+        }
+    }
+}
+
+/// Version of the native graph + prompt handling. Bump on any change that can alter the context.
+pub const ENCODER_VERSION: &str = "qwen3-te/1";
+
+/// Encoder identity for cache provenance: graph version, arithmetic class and the TE file
+/// (name and size, like the DiT part of the key). Computable without loading the model.
+pub fn encoder_identity(te: &Path, arith: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(te).map_err(|e| format!("{}: {e}", te.display()))?;
+    let name = te.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("text encoder path has no file name")?;
+    if !["cpu-f32", "cpu-q8", "cpu-ggml", "npu-fp16", "npu-w8"].contains(&arith) {
+        return Err(format!("unknown encoder arithmetic '{arith}'"));
+    }
+    Ok(format!("{ENCODER_VERSION};{arith};{name};{}", meta.len()))
 }
 
 pub struct TeOutput {
@@ -67,10 +100,22 @@ pub struct TeOutput {
     pub summary: Value,
 }
 
+/// `VmRSS` and `VmHWM` of this process in KiB (Linux; `None` elsewhere).
+pub fn rss_kib() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let f = |k: &str| s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok());
+    Some((f("VmRSS:")?, f("VmHWM:")?))
+}
+
 /// Open `gguf`, tokenize `prompt` with its vocabulary, and encode it for klein.
-pub fn encode_prompt(gguf: &Path, prompt: &str, backend: TeBackend, threads: usize) -> Result<TeOutput, TeError> {
+/// `max_n` > 0: a prompt whose padded length exceeds it is refused as `NeedsReference` (the
+/// native path is gated at n_txt 512). Every accelerator session is released before return
+/// (`summary.release_s`), so the DiT can place its weights afterwards (one at a time).
+pub fn encode_prompt(gguf: &Path, prompt: &str, backend: TeBackend, threads: usize, max_n: usize) -> Result<TeOutput, TeError> {
     let t_all = Instant::now();
+    let rss0 = rss_kib();
     let spec = KleinSpec::klein();
+    let arith = backend.arith();
     let t = Instant::now();
     let tok = tokenizer::Tokenizer::from_gguf(gguf).map_err(|e| TeError::Other(format!("tokenizer: {}", e.0)))?;
     let enc = match prompt::klein_tokens(&tok, &spec, prompt) {
@@ -78,43 +123,57 @@ pub fn encode_prompt(gguf: &Path, prompt: &str, backend: TeBackend, threads: usi
         Err(prompt::PromptError::NeedsReference(s)) => return Err(TeError::NeedsReference(s)),
         Err(e) => return Err(TeError::Other(e.to_string())),
     };
+    drop(tok);
+    if max_n > 0 && enc.tokens.len() > max_n {
+        return Err(TeError::NeedsReference(format!("{} tokens, the native path is gated at {max_n}", enc.tokens.len())));
+    }
     let tokenize_s = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let g = gguf::Gguf::open(gguf).map_err(|e| TeError::Other(e.0))?;
     let w = weights::TeWeights::from_gguf(&g, spec.layers_needed())?;
     let open_s = t.elapsed().as_secs_f64();
     let encd = Encoder::new(&w, spec.clone(), threads)?;
-    let cpu;
-    let npu_lin;
-    let lin: &dyn Linears = match backend {
-        TeBackend::CpuF32 | TeBackend::CpuQ8 => {
-            let mode = if matches!(backend, TeBackend::CpuF32) { CpuMode::F32 } else { CpuMode::Q8 };
-            cpu = CpuLinears { w: &w, threads, mode };
-            &cpu
-        }
-        TeBackend::Npu { backend, opts } => {
-            npu_lin = npu::NpuLinears::new(&w, backend, opts, threads)?;
-            &npu_lin
-        }
+    let dma = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (ctx, tm, name, lsum, prep_s) = {
+        let t = Instant::now();
+        let lin: Box<dyn Linears + '_> = match backend {
+            TeBackend::CpuF32 => Box::new(CpuLinears { w: &w, threads, mode: CpuMode::F32 }),
+            TeBackend::CpuQ8 => Box::new(CpuLinears { w: &w, threads, mode: CpuMode::Q8 }),
+            TeBackend::CpuGgml => Box::new(ggml::GgmlLinears::new(&w, threads)?),
+            TeBackend::Npu { backend, opts } => {
+                let counted = Box::new(npu::CountingBackend::new(backend, dma.clone()));
+                Box::new(npu::NpuLinears::new(&w, counted, opts, threads)?)
+            }
+        };
+        let prep_s = t.elapsed().as_secs_f64();
+        let (ctx, tm) = encd.encode(&*lin, &enc)?;
+        (ctx, tm, lin.name(), lin.summary(), prep_s)
+        // `lin` (accelerator sessions and buffers, or the repacked weights) is dropped here
     };
-    let (ctx, tm) = encd.encode(lin, &enc)?;
+    let release_s = t_all.elapsed().as_secs_f64() - tokenize_s - open_s - prep_s - tm.total_s;
+    let rss1 = rss_kib();
     let summary = json!({
-        "backend": lin.name(),
+        "backend": name,
+        "encoder_identity": encoder_identity(gguf, &arith).ok(),
         "n": enc.tokens.len(),
         "n_real": enc.n_real,
         "ctx_dim": spec.ctx_dim(&w.cfg),
         "out_layers": spec.out_layers,
         "tokenize_s": tokenize_s,
         "open_s": open_s,
+        "prepare_s": prep_s,
         "encode": tm.json(),
-        "linears": lin.summary(),
+        "release_s": release_s,
+        "linears": lsum,
+        "dma_allocated_bytes": dma.load(std::sync::atomic::Ordering::Relaxed),
+        "host": {"rss_start_kib": rss0.map(|r| r.0), "rss_end_kib": rss1.map(|r| r.0), "hwm_kib": rss1.map(|r| r.1)},
         "wall_s": t_all.elapsed().as_secs_f64(),
     });
     Ok(TeOutput { ctx, n: enc.tokens.len(), n_real: enc.n_real, ctx_dim: spec.ctx_dim(&w.cfg), tokens: enc.tokens, summary })
 }
 
 /// Backend from command-line style options (shared by the `qwen3-te` binary and `oxi`):
-/// `te-backend` cpu-f32 (default) | cpu-q8 | npu; for npu: `te-npu` emu|device (default emu),
+/// `te-backend` cpu-f32 (default) | cpu-q8 | cpu-ggml | npu; for npu: `te-npu` emu|device (default emu),
 /// `te-npu-weights` fp16|w8 (default fp16), `te-npu-sessions` 1..4 (default 3),
 /// `te-npu-budget-mib` (default 6144), `te-npu-kc` (default 0 = whole K),
 /// `te-io-threads` (default 8).
@@ -128,6 +187,7 @@ pub fn backend_from_opts(get: &dyn Fn(&str) -> Option<String>) -> Result<TeBacke
     match get("te-backend").as_deref().unwrap_or("cpu-f32") {
         "cpu-f32" => Ok(TeBackend::CpuF32),
         "cpu-q8" => Ok(TeBackend::CpuQ8),
+        "cpu-ggml" => Ok(TeBackend::CpuGgml),
         "npu" => {
             let sessions = num("te-npu-sessions", 3)?;
             if !(1..=4).contains(&sessions) {
@@ -151,7 +211,7 @@ pub fn backend_from_opts(get: &dyn Fn(&str) -> Option<String>) -> Result<TeBacke
             let opts = npu::NpuOpts { budget_bytes: budget, weights, kc_max, pack_threads: 0, io_threads: num("te-io-threads", 8)? };
             Ok(TeBackend::Npu { backend, opts })
         }
-        o => Err(format!("--te-backend must be cpu-f32, cpu-q8 or npu, got '{o}'")),
+        o => Err(format!("--te-backend must be cpu-f32, cpu-q8, cpu-ggml or npu, got '{o}'")),
     }
 }
 

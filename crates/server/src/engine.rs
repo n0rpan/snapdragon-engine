@@ -224,6 +224,8 @@ pub struct StubEngine {
     pub calls: Vec<(&'static str, usize, usize)>,
     /// tokens processed in total by prefill/decode
     pub n_evaluated: usize,
+    /// LONG-APPEND tests: wall time per prefilled token (a fake slow engine; zero by default)
+    pub prefill_sleep_per_token: std::time::Duration,
 }
 
 /// Stub snapshot: the token prefix it was taken at (checked on restore).
@@ -247,6 +249,7 @@ impl StubEngine {
             logits: vec![0.0; n_vocab],
             calls: Vec::new(),
             n_evaluated: 0,
+            prefill_sleep_per_token: std::time::Duration::ZERO,
         }
     }
 
@@ -294,6 +297,9 @@ impl Engine for StubEngine {
             return Err(EngineError(format!("token {t} out of vocab")));
         }
         self.calls.push(("prefill", self.tokens.len(), tokens.len()));
+        if !self.prefill_sleep_per_token.is_zero() {
+            std::thread::sleep(self.prefill_sleep_per_token * tokens.len() as u32);
+        }
         self.n_evaluated += tokens.len();
         self.tokens.extend_from_slice(tokens);
         // a new prompt (first prefill after a reset/restore/decode): start the next script

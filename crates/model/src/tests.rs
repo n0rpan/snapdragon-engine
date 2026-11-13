@@ -2198,6 +2198,7 @@ fn run_mini_fused(path: &std::path::Path, opt: &LoadOptions, n: usize, steps: us
         let mut eng = Engine::new(&plan, &ws, EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false }).unwrap();
         eng.set_attn_tiled_min_kv(0);
         eng.set_attn_fused(fused);
+        eng.set_attn_fused_min_kv(0, 0); // v0.1.3: fused has its own cutoffs now (0 = always, as before at tiled-min 0)
         eng.set_attn_fused_chunk(ch);
         assert_eq!(eng.attn_fused(), fused);
         let mut ids = Vec::new();
@@ -2260,6 +2261,7 @@ fn mini_fused_verify_lanes_are_batch_invariant_with_rollback() {
         let mut r = Engine::new(&plan, &ws, cfg.clone()).unwrap();
         r.set_attn_tiled_min_kv(0);
         r.set_attn_fused(true);
+        r.set_attn_fused_min_kv(0, 0); // v0.1.3: fused has its own cutoffs now (0 = always, as before at tiled-min 0)
         r.set_attn_fused_chunk(128);
         let mut want = Vec::new();
         for &t in &seq {
@@ -2270,6 +2272,7 @@ fn mini_fused_verify_lanes_are_batch_invariant_with_rollback() {
         let mut e = Engine::with_options(&plan, &ws, cfg.clone(), crate::engine::EngineOptions { verify_lanes: 4, mtp: Some(&mw), kv_type: None }).unwrap();
         e.set_attn_tiled_min_kv(0);
         e.set_attn_fused(true);
+        e.set_attn_fused_min_kv(0, 0); // v0.1.3: fused has its own cutoffs now (0 = always, as before at tiled-min 0)
         e.set_attn_fused_chunk(128);
         let mut p = 0usize;
         let mut it = 0u32;
@@ -2425,10 +2428,11 @@ fn mini_npu_shared_overlap_is_bitwise_and_fault_stable(){
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// One `fused_ref::run` on the mini model per sample set (prefix 200, 250 teacher-forced
-/// positions); `degrade` scales the fused attention output by (1 + degrade) on both engines.
+/// One O-117 fused-decode run on the mini model per sample set (prefix 200, 250 teacher-forced
+/// positions; control: the tiled batched prefill in ubatches of 64 vs the tiled decode);
+/// `degrade` scales the fused attention output by (1 + degrade) on both engines.
 fn fused_ref_mini(tag: &str, sample_sets: &[Vec<usize>], degrade: f32) -> Vec<crate::fused_ref::Report> {
-    use crate::fused_ref::{configure, run};
+    use crate::fused_ref::{run_fused_decode, Control};
     let (dir, path) = mini_paths(tag);
     std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
     let opt = mini_opts(&dir);
@@ -2440,20 +2444,25 @@ fn fused_ref_mini(tag: &str, sample_sets: &[Vec<usize>], degrade: f32) -> Vec<cr
     let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
     let prefix: Vec<u32> = (0..200u32).map(|i| (i * 13 + 7) % 64).collect();
     let cont: Vec<u32> = (0..250u32).map(|i| (i * 29 + 5) % 64).collect();
+    let mut st = Vec::new();
+    {
+        let e = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+        e.prefill(&pool, &prefix, 64).unwrap();
+        e.write_state(&mut st).unwrap();
+    }
     let out = sample_sets
         .iter()
         .map(|samples| {
             let mut a = Engine::new(&plan, &ws, cfg.clone()).unwrap();
             let mut b = Engine::new(&plan, &ws, cfg.clone()).unwrap();
-            a.prefill(&pool, &prefix, 64).unwrap();
-            let mut st = Vec::new();
-            a.write_state(&mut st).unwrap();
-            b.read_state(&mut &st[..], prefix.len()).unwrap();
-            configure(&mut a, &mut b);
             a.set_fused_degrade(degrade);
             b.set_fused_degrade(degrade);
-            let r = run(&mut a, &mut b, &pool, &cont, samples, &mut |_, _| {});
-            assert_eq!((r.positions.len(), r.positions[0].position), (cont.len(), prefix.len()));
+            let mut load = |e: &Engine| {
+                e.reset();
+                e.read_state(&mut &st[..], prefix.len()).unwrap();
+            };
+            let r = run_fused_decode(&mut a, &mut b, &pool, &mut load, &cont, Control::Ubatch(64), samples, &mut |_| {});
+            assert_eq!((r.rows.len(), r.control_rows.len(), r.rows[0].position), (cont.len(), cont.len(), prefix.len()));
             r
         })
         .collect();
@@ -2461,21 +2470,22 @@ fn fused_ref_mini(tag: &str, sample_sets: &[Vec<usize>], degrade: f32) -> Vec<cr
     out
 }
 
-fn print_verdict(name: &str, v: &crate::fused_ref::Verdict) {
+pub(crate) fn print_verdict(name: &str, v: &crate::fused_ref::Verdict) {
     println!(
-        "fused-ref mini {name}: kld mean {:.3e} top1 {:.4}; logit rms vs f32-attn p50/p90 tiled {:.2e}/{:.2e} fused {:.2e}/{:.2e}, jumps tiled {} fused {} (tol {}), attention rel-L2 tiled {:.2e} fused {:.2e}; mean tiled {:.2e} fused {:.2e}",
-        v.kld_mean, v.top1_agreement, v.tiled_rms_p50, v.tiled_rms_p90, v.fused_rms_p50, v.fused_rms_p90, v.tiled_jumps, v.fused_jumps,
-        v.jump_tolerance, v.tiled_attn_rel_l2, v.fused_attn_rel_l2, v.tiled_rms_mean, v.fused_rms_mean
+        "fused-ref {name}: rows {} control {} | (a) kld cand {:.3e} control {:.3e} max {:.3e} {} | (b) top1 cand {:.4} control {:.4} min {:.4} {} | (c) {} samples: rms p50/p90 tiled {:.2e}/{:.2e} cand {:.2e}/{:.2e}, jumps tiled {} cand {} (allowance {}), attention rel-L2 tiled {:.2e} cand {:.2e} {} | path_ok {} {:?} scope {} passed {}",
+        v.cand.rows, v.control.rows, v.cand.mean, v.control.mean, v.kld_max, v.pass_a, v.cand.top1, v.control.top1, v.top1_min, v.pass_b, v.ref_samples,
+        v.inc_rms_p50, v.inc_rms_p90, v.cand_rms_p50, v.cand_rms_p90, v.inc_jumps, v.cand_jumps, v.jump_allowance, v.inc_attn_rel_l2, v.cand_attn_rel_l2, v.pass_c,
+        v.path_ok, v.path_problems, v.scope_met, v.passed
     );
 }
 
-/// `oxe fused-ref` core (model-free, mini model): the forked reference steps leave engine A's
+/// O-117 fused decode (model-free, mini model): the forked reference steps leave engine A's
 /// continuation bit-identical (every fork replays exactly; forking at 20, 200 or every position
-/// gives the same (a) numbers), and the CURRENT fused kernel passes the whole gate with 200
-/// samples: median / p90 logit error and jump count vs tiled, and the attention-level rel-L2
-/// (the logit error is heavy-tailed; the earlier 20-sample mean was an artefact, see fprec.rs).
+/// gives the same candidate and control rows), every position is compared for the candidate AND
+/// the control (250 rows each, the same positions), the arms ran what they claim, and the
+/// CURRENT fused kernel passes clause (c) with 200 samples (as before O-117).
 #[test]
-fn mini_fused_ref_fork_is_transparent_and_current_fused_passes() {
+fn mini_fused_ref_fork_is_transparent_and_current_fused_passes_c() {
     use crate::fused_ref::{sample_positions, Gate};
     let few = sample_positions(250, 20);
     let mid = sample_positions(250, 200);
@@ -2485,36 +2495,42 @@ fn mini_fused_ref_fork_is_transparent_and_current_fused_passes() {
     let r = fused_ref_mini("fusedref", &[few, mid, all], 0.0);
     assert!(r.iter().all(|x| x.refs.iter().all(|f| f.fork_replay_exact)), "a fork did not replay exactly");
     for x in &r[1..] {
-        for (p, q) in r[0].positions.iter().zip(&x.positions) {
-            assert!(p.kld.to_bits() == q.kld.to_bits() && p.tiled_top1 == q.tiled_top1 && p.fused_top1 == q.fused_top1, "forking changed position {}", p.position);
+        for (p, q) in r[0].rows.iter().zip(&x.rows).chain(r[0].control_rows.iter().zip(&x.control_rows)) {
+            assert!(p.kld.to_bits() == q.kld.to_bits() && p.top1 == q.top1 && p.inc_top1 == q.inc_top1, "forking changed position {}", p.position);
         }
     }
     for f in &r[2].refs {
-        assert!(f.tiled_rms.is_finite() && f.fused_rms.is_finite() && f.ref_absmax > 0.0);
-        assert!(f.tiled_rms / (f.ref_absmax as f64) < 3e-2 && f.fused_rms / (f.ref_absmax as f64) < 3e-2, "position {} far from the reference", f.position);
-        assert!(f.tiled_attn.1 > 0.0 && f.fused_attn.1 > 0.0);
+        assert!(f.inc_rms.is_finite() && f.cand_rms.is_finite() && f.ref_absmax > 0.0);
+        assert!(f.inc_rms / (f.ref_absmax as f64) < 3e-2 && f.cand_rms / (f.ref_absmax as f64) < 3e-2, "position {} far from the reference", f.position);
+        assert!(f.inc_attn.1 > 0.0 && f.cand_attn.1 > 0.0);
     }
     let gate = Gate { min_positions: 250, ..Gate::default() };
     let v = r[1].verdict(&gate);
-    print_verdict("current, 200 samples", &v);
-    assert_eq!(v.ref_samples, 200);
-    assert!(v.passed && v.pass_ref_p50 && v.pass_ref_p90 && v.pass_ref_jumps && v.pass_ref_attn, "{v:?}");
-    print_verdict("current, every position", &r[2].verdict(&gate));
-    // 20 samples do not meet the scope (>= 200)
+    print_verdict("mini fused-decode, 200 samples", &v);
+    assert_eq!((v.ref_samples, v.cand.rows, v.control.rows), (200, 250, 250));
+    assert!(v.same_positions && v.scope_met && v.path_ok && v.fork_replay_exact, "{v:?}");
+    assert!(v.pass_c && v.pass_c_p50 && v.pass_c_p90 && v.pass_c_jumps && v.pass_c_attn, "{v:?}");
+    // the dynamic floors are the measured control's
+    assert_eq!(v.kld_max.to_bits(), (gate.kld_factor * v.control.mean).to_bits());
+    assert_eq!(v.top1_min.to_bits(), (v.control.top1 - 0.005).to_bits());
+    assert!(v.control.mean.is_finite() && v.control.top1 > 0.5);
+    let arms: Vec<&str> = r[1].arms.iter().map(|a| a.role).collect();
+    assert_eq!(arms, ["incumbent", "candidate", "reference", "control"]);
+    let ctl = r[1].arms.iter().find(|a| a.role == "control").unwrap();
+    assert!(ctl.pf.rows == 250 && ctl.pf.max_rows == 64 && ctl.pf.units_fa2 + ctl.pf.units_fa2x + ctl.pf.units_ref == 0, "{ctl:?}");
+    print_verdict("mini fused-decode, every position", &r[2].verdict(&gate));
+    // 20 samples do not meet the scope (>= 200); the default gate also needs >= 1000 rows
     let s = r[0].verdict(&gate);
     assert!(!s.scope_met && !s.passed);
-    // the default gate also needs >= 1000 positions
     assert!(!r[1].verdict(&Gate::default()).scope_met);
-    // a zero noise floor fails (a) unless the two arms are bit-identical
-    let z = r[1].verdict(&Gate { noise_floor_kld: 0.0, ..gate.clone() });
-    assert!(!z.pass_kld || v.kld_mean == 0.0);
 }
 
-/// `oxe fused-ref --control`: the tiled decode path vs the tiled batched-prefill path from one
-/// state; the chunk-end positions are compared and both engines end at the same position.
+/// O-117 KLD direction (decode core): every candidate row is KL(P_fused || P_tiled) of the two
+/// continuous logit rows, bit for bit, and the direction matters (KL is asymmetric here).
 #[test]
-fn mini_fused_ref_control_measures_decode_vs_batched_prefill() {
-    let (dir, path) = mini_paths("fusedrefctl");
+fn mini_fused_ref_decode_kld_direction_is_cand_to_tiled() {
+    use crate::fused_ref::{configure, kld, run_decode};
+    let (dir, path) = mini_paths("fusedrefdir");
     std::env::set_var("OXE_MODEL_SHA256", "0".repeat(64));
     let opt = mini_opts(&dir);
     let g = gguf::Gguf::open(&path).unwrap();
@@ -2524,35 +2540,37 @@ fn mini_fused_ref_control_measures_decode_vs_batched_prefill() {
     let pool = sched::Pool::new(&test_cpus(2), Duration::from_micros(100)).unwrap();
     let cfg = EngineConfig { n_ctx: 512, logits: true, trace: false, profile: false };
     let prefix: Vec<u32> = (0..200u32).map(|i| (i * 13 + 7) % 64).collect();
-    let cont: Vec<u32> = (0..250u32).map(|i| (i * 29 + 5) % 64).collect();
+    let cont: Vec<u32> = (0..60u32).map(|i| (i * 29 + 5) % 64).collect();
     let mut a = Engine::new(&plan, &ws, cfg.clone()).unwrap();
-    let mut c = Engine::new(&plan, &ws, cfg.clone()).unwrap();
+    let mut b = Engine::new(&plan, &ws, cfg.clone()).unwrap();
     a.prefill(&pool, &prefix, 64).unwrap();
     let mut st = Vec::new();
     a.write_state(&mut st).unwrap();
-    c.read_state(&mut &st[..], prefix.len()).unwrap();
-    crate::fused_ref::configure(&mut a, &mut c);
-    c.set_attn_fused(false);
-    let v = crate::fused_ref::control(&a, &c, &pool, &cont, 4, &mut |_| {});
-    assert_eq!(v.len(), 62);
-    assert_eq!((v[0].position, a.pos(), c.pos()), (203, 448, 448));
-    let (n, mean, _, _, _, max, top1) = crate::fused_ref::control_summary(&v);
-    println!("fused-ref mini control (decode vs prefill ubatch 4): n {n} kld mean {mean:.3e} max {max:.3e} top1 {top1:.4}");
-    assert!(mean.is_finite() && max < 1e-1 && top1 >= 0.9);
+    b.read_state(&mut &st[..], prefix.len()).unwrap();
+    configure(&mut a, &mut b);
+    // a visibly different candidate, so both directions are non-zero and differ
+    b.set_fused_degrade(5e-2);
+    let mut want = Vec::new();
+    let (rows, _) = run_decode(&mut a, &mut b, &pool, &cont, &[], &mut |_, la, lb| want.push((kld(lb, la), kld(la, lb))), &mut |_, _| {});
+    assert_eq!(rows.len(), cont.len());
+    for (r, (fwd, _)) in rows.iter().zip(&want) {
+        assert_eq!(r.kld.to_bits(), fwd.to_bits(), "row {} is not KL(P_cand || P_tiled)", r.index);
+    }
+    assert!(want.iter().any(|(f, r)| *f > 0.0 && f.to_bits() != r.to_bits()), "the fixture cannot tell the two directions apart");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A deliberately degraded fused path (output scaled by 1 + 1e-2, ~100x the kernels' own
-/// attention error) fails (b): attention-level rel-L2 and the logit-error median / p90.
+/// attention error) fails (c): attention-level rel-L2 and the logit-error median / p90.
 #[test]
 fn mini_fused_ref_degraded_fused_fails_the_reference_gate() {
     use crate::fused_ref::{sample_positions, Gate};
     let r = fused_ref_mini("fusedrefbad", &[sample_positions(250, 200)], 1e-2);
-    let v = r[0].verdict(&Gate { min_positions: 250, noise_floor_kld: 1.0, min_top1: 0.0, ..Gate::default() });
-    print_verdict("degraded 1e-2", &v);
-    assert!(v.scope_met && v.fork_replay_exact);
-    assert!(!v.pass_ref_attn && !v.pass_ref_p50 && !v.pass_ref && !v.passed, "{v:?}");
-    assert!(v.fused_attn_rel_l2 > 10.0 * v.tiled_attn_rel_l2);
+    let v = r[0].verdict(&Gate { min_positions: 250, ..Gate::default() });
+    print_verdict("mini fused-decode degraded 1e-2", &v);
+    assert!(v.scope_met && v.fork_replay_exact && v.path_ok);
+    assert!(!v.pass_c_attn && !v.pass_c_p50 && !v.pass_c && !v.passed, "{v:?}");
+    assert!(v.cand_attn_rel_l2 > 10.0 * v.inc_attn_rel_l2);
 }
 
 /// The f32-attention reference (f64 accumulation) agrees with a plain f32 attention and sees an

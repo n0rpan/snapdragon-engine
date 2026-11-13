@@ -41,6 +41,20 @@ pub const PRIO_TAIL: u8 = 0;
 pub const PRIO_TURN: u8 = 1;
 pub const PRIO_QUERY: u8 = 2;
 pub const PRIO_ANCHOR: u8 = 3;
+/// v0.1.3 class tags (not ranks; see [`rank`]): a pre-think point (the prompt position just before
+/// the generation prompt's `<think>`, RAM only, at most `max_pre`), and the compaction cut (the start
+/// of a compaction request's instruction message, at most one, persisted as class "cut").
+pub const PRIO_PRETHINK: u8 = 4;
+pub const PRIO_CUT: u8 = 5;
+
+/// Eviction rank of a priority tag: a pre-think point ranks with turn points, a cut with anchors.
+pub fn rank(prio: u8) -> u8 {
+    match prio {
+        PRIO_PRETHINK => PRIO_TURN,
+        PRIO_CUT => PRIO_ANCHOR,
+        p => p,
+    }
+}
 
 struct Snap<S> {
     pos: usize,
@@ -59,6 +73,12 @@ struct Parked<S> {
     clean: bool,
     prompt_len: usize,
     used: u64,
+}
+
+/// A live session taken out for the length of one ephemeral (LAN share) request.
+pub struct Held<S> {
+    p: Parked<S>,
+    low_water: usize,
 }
 
 impl<S> Parked<S> {
@@ -100,6 +120,11 @@ pub struct PrefixCache<S> {
     pub park_min: usize,
     /// turn checkpoints kept at most (the least recently used one goes first)
     pub max_turn: usize,
+    /// v0.1.3 pre-think checkpoints kept at most (RAM only; `--pre-think-snapshots`, 0 = off)
+    pub max_pre: usize,
+    /// bumped on every change of the live state (tokens appended, a restore, a reset, an adopt):
+    /// the off-lock state write commits only what still describes the live state (generate.rs)
+    pub epoch: u64,
     pub stats: CacheStats,
     /// keep parked sessions evicted from RAM in `spilled` (the worker writes them to the
     /// session cache on disk)
@@ -131,7 +156,7 @@ fn persist_points<S>(snaps: Vec<Snap<S>>, n: usize) -> Vec<(usize, S)> {
     let mut hi: Option<Snap<S>> = None;
     let mut lo: Option<Snap<S>> = None;
     for s in snaps.into_iter().filter(|s| s.pos < n) {
-        let slot = if s.prio >= PRIO_QUERY { &mut hi } else { &mut lo };
+        let slot = if rank(s.prio) >= PRIO_QUERY { &mut hi } else { &mut lo };
         if slot.as_ref().is_none_or(|b| s.pos > b.pos) {
             *slot = Some(s);
         }
@@ -160,6 +185,8 @@ impl<S> PrefixCache<S> {
             park_budget: 0,
             park_min: 512,
             max_turn: 4,
+            max_pre: 2,
+            epoch: 0,
             stats: CacheStats::default(),
             spill: false,
             spilled: Vec::new(),
@@ -284,6 +311,37 @@ impl<S> PrefixCache<S> {
         Ok(n)
     }
 
+    /// LAN share: take the whole live session out of the engine (state copy and checkpoints) for
+    /// [`PrefixCache::restore_held`] after an ephemeral request. Not a park: the parked list, its
+    /// LRU and its evictions are untouched, so a shared request never pushes a parked local session
+    /// out. None when there is nothing live or the copy would exceed the park budget (the caller
+    /// then relies on the state store's park write).
+    pub fn hold_live<E: Engine<Snapshot = S>>(&mut self, eng: &mut E) -> Option<Held<S>> {
+        if self.tokens.is_empty() || self.park_budget == 0 || eng.state_size_hint() > self.park_budget {
+            return None;
+        }
+        let mut state = Vec::with_capacity(eng.state_size_hint());
+        if let Err(e) = eng.save_state(&mut state) {
+            eprintln!("oxe-server: hold before a shared request: {}", e.0);
+            return None;
+        }
+        let snaps = std::mem::take(&mut self.snaps);
+        let p = Parked { tokens: self.tokens.clone(), state, snaps, clean: self.clean, prompt_len: self.prompt_len, used: self.clock };
+        Some(Held { p, low_water: self.low_water })
+    }
+
+    /// LAN share: put a held session back as the live one, bit for bit (as an unpark of its whole
+    /// length); its low-water mark too, so the next state write knows what is already on disk.
+    /// Returns its length (0: the load failed and the cache is reset).
+    pub fn restore_held<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, h: Held<S>) -> Result<usize> {
+        let n = h.p.tokens.len();
+        let got = self.unpark(eng, h.p, n)?;
+        if got == n {
+            self.low_water = h.low_water.min(n);
+        }
+        Ok(got)
+    }
+
     /// Restore the live checkpoint at `pos` (0: start over).
     fn restore_live<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, pos: usize) -> Result<usize> {
         if pos == 0 {
@@ -295,6 +353,7 @@ impl<S> PrefixCache<S> {
         s.used = clock;
         eng.restore(&s.s)?;
         self.clean = s.clean;
+        self.epoch += 1;
         self.tokens.truncate(pos);
         self.low_water = self.low_water.min(pos);
         self.prompt_len = self.prompt_len.min(pos);
@@ -362,6 +421,7 @@ impl<S> PrefixCache<S> {
         }
         self.snaps.clear();
         self.low_water = 0;
+        self.epoch += 1;
         self.tokens = p.tokens.clone();
         self.prompt_len = p.prompt_len;
         self.clean = p.clean;
@@ -413,6 +473,7 @@ impl<S> PrefixCache<S> {
 
     pub fn reset<E: Engine<Snapshot = S>>(&mut self, eng: &mut E) {
         eng.reset();
+        self.epoch += 1;
         self.tokens.clear();
         self.low_water = 0;
         self.snaps.clear();
@@ -424,6 +485,7 @@ impl<S> PrefixCache<S> {
     /// computed elsewhere, so no in-memory checkpoint matches its KV any more.
     pub fn adopt(&mut self, tokens: &[u32], clean: bool) {
         self.low_water = 0;
+        self.epoch += 1;
         self.tokens.clear();
         self.tokens.extend_from_slice(tokens);
         self.snaps.clear();
@@ -439,6 +501,7 @@ impl<S> PrefixCache<S> {
     /// Record tokens that were just appended to the engine state.
     pub fn appended(&mut self, toks: &[u32]) {
         self.tokens.extend_from_slice(toks);
+        self.epoch += 1;
     }
 
     /// Take a checkpoint at the current position (LRU of the end-of-turn kind).
@@ -450,7 +513,14 @@ impl<S> PrefixCache<S> {
     /// Take a checkpoint at the current position with an eviction priority. When full, the
     /// lowest-priority, least recently used checkpoint goes (possibly the new one's peer).
     pub fn checkpoint_with<E: Engine<Snapshot = S>>(&mut self, eng: &mut E, prio: u8, clean: bool) -> Result<()> {
-        if self.max_snapshots == 0 || (prio == PRIO_TURN && self.max_turn == 0) {
+        // classes with a count cap of their own (the least recently used one of the class goes)
+        let cap = match prio {
+            PRIO_TURN => Some(self.max_turn),
+            PRIO_PRETHINK => Some(self.max_pre),
+            PRIO_CUT => Some(1),
+            _ => None,
+        };
+        if self.max_snapshots == 0 || cap == Some(0) {
             return Ok(());
         }
         let pos = self.tokens.len();
@@ -459,20 +529,24 @@ impl<S> PrefixCache<S> {
         }
         self.clock += 1;
         if let Some(s) = self.snaps.iter_mut().find(|s| s.pos == pos) {
-            s.prio = s.prio.max(prio);
+            if rank(prio) > rank(s.prio) {
+                s.prio = prio;
+            }
             s.used = self.clock;
             return Ok(());
         }
         // an evicted checkpoint's buffers are reused for the new one
         let mut spare: Option<S> = None;
-        if prio == PRIO_TURN && self.snaps.iter().filter(|s| s.prio == PRIO_TURN).count() >= self.max_turn {
-            let (i, _) = self.snaps.iter().enumerate().filter(|(_, s)| s.prio == PRIO_TURN).min_by_key(|(_, s)| s.used).unwrap();
-            spare = Some(self.snaps.remove(i).s);
+        if let Some(cap) = cap {
+            if self.snaps.iter().filter(|s| s.prio == prio).count() >= cap {
+                let (i, _) = self.snaps.iter().enumerate().filter(|(_, s)| s.prio == prio).min_by_key(|(_, s)| s.used).unwrap();
+                spare = Some(self.snaps.remove(i).s);
+            }
         }
         if self.snaps.len() >= self.max_snapshots {
             // never evict for a lower-priority snapshot than everything kept
-            let (i, low) = self.snaps.iter().enumerate().min_by_key(|(_, s)| (s.prio, s.used)).map(|(i, s)| (i, s.prio)).unwrap();
-            if low > prio {
+            let (i, low) = self.snaps.iter().enumerate().min_by_key(|(_, s)| (rank(s.prio), s.used)).map(|(i, s)| (i, rank(s.prio))).unwrap();
+            if low > rank(prio) {
                 return Ok(());
             }
             spare = Some(self.snaps.remove(i).s);

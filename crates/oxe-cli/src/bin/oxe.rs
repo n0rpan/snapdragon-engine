@@ -30,12 +30,14 @@
 //!   (a 128K-id --prompt-ids exceeds the 128 KiB argument limit). n_ctx is checked against the GGUF
 //!   context_length (262144 for Ornith / Qwen3.6).
 //!
-//!   oxe fused-ref --model M --prefix-len P (--prefix-ids-file F | --text-file F) --state-file S --noise-floor-kld X --out R
-//!               [--n 1000 --ref-samples 200 --continuation-file T --ref-ratio-max 1.1 --margin 5 --control [--control-ubatch 4] --dry-run]
-//!                                                                         (--features f32-reference, bench only) fused vs
-//!                                                                         tiled attention, teacher-forced from one saved
-//!                                                                         state, + f32-attention reference over the stored
-//!                                                                         KV (FUSED-REF.md; NOT a full-model f32 ref)
+//!   oxe fused-ref --candidate prefill-fa2|prefill-fa2x|fused-decode --model M --prefix-len P
+//!               (--prefix-ids-file F | --text-file F) --state-file S --out R
+//!               [--n 1000 --ref-samples 200 --ubatch 256 --control decode|ubatch:N --continuation-file T
+//!                --kld-factor 1.0 --top1-slack-pp 0.5 --ref-ratio-max 1.1 --jump-threshold 1e-3 --dry-run]
+//!                                                                         (--features f32-reference, bench only) O-117
+//!                                                                         quality runner: candidate vs tiled from one saved
+//!                                                                         state, every position, measured control, f32-attention
+//!                                                                         reference (FUSED-REF.md; NOT a full-model f32 ref)
 //!
 //! Common: --cpu-list 0-7 (default) | --threads N (cpus 0..N), --ctx 4096, --weights file|anon,
 //! --verify sample|full|none, --cache-dir D, --thp-collapse, --profile, --out FILE (bench JSON).
@@ -63,6 +65,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Options that take no value (`--name`). Every boolean the commands read with `Args::flag` must be listed
+/// here (scanned by the test below), or the parser would swallow the next argument as its value (`bool_flags_cover_every_flag_read`).
+const BOOL_FLAGS: &[&str] = &["profile", "thp-collapse", "all", "logits", "batched-prompt", "mlock", "state-hash", "check-args", "dry-run", "plain-steps"];
+
 struct Args {
     cmd: String,
     kv: HashMap<String, String>,
@@ -71,7 +77,12 @@ struct Args {
 
 impl Args {
     fn parse() -> Args {
-        let mut it = std::env::args().skip(1);
+        Args::parse_from(std::env::args().skip(1).collect())
+    }
+
+    /// [`Args::parse`] of the arguments after the program name.
+    fn parse_from(args: Vec<String>) -> Args {
+        let mut it = args.into_iter();
         let cmd = it.next().unwrap_or_else(|| usage());
         let mut kv = HashMap::new();
         let mut flags = Vec::new();
@@ -80,7 +91,7 @@ impl Args {
         while i < rest.len() {
             let a = &rest[i];
             let Some(k) = a.strip_prefix("--") else { die(&format!("unexpected argument {a}")) };
-            if ["profile", "thp-collapse", "all", "logits", "batched-prompt", "mlock", "state-hash", "check-args", "dry-run", "control"].contains(&k) {
+            if BOOL_FLAGS.contains(&k) {
                 flags.push(k.to_string());
                 i += 1;
             } else {
@@ -101,7 +112,7 @@ impl Args {
             "idle-spin-us", "json", "kv", "lanes", "load-threads", "model", "mtp-from", "n", "ours", "out", "pf-group", "pf-tiles", "pos",
             "prefill", "prefix-len", "prefix-ids-file", "prompt-ids", "prompt-ids-file", "prompt-len", "state-file", "ref", "refs", "reps", "runs", "score", "spec-draft-n-max", "text-file",
             "threads", "tokens", "trace-out", "ubatch", "verify", "warmup", "weights", "cmd",
-            "continuation-file", "ref-samples", "noise-floor-kld", "ref-ratio-max", "margin", "fused-chunk", "jump-threshold", "control-ubatch", "control-factor",
+            "continuation-file", "ref-samples", "ref-ratio-max", "fused-chunk", "jump-threshold", "candidate", "control", "kld-factor", "top1-slack-pp",
         ];
         let mut unknown: Vec<&String> = self.kv.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect();
         unknown.sort();
@@ -505,7 +516,9 @@ fn load_mtp(a: &Args, s: &Setup) -> MtpWeights {
     let mtp_src = a.get("mtp-from").map(PathBuf::from).unwrap_or_else(|| a.model());
     // W4-4 b: a sidecar head is hashed from its own bytes (OXE_MODEL_SHA256 names the model)
     let head_opt = LoadOptions { sha_from_env: mtp_src == a.model(), ..a.load_opts() };
-    let mut m = MtpWeights::load(&mtp_src, &s.loaded.plan, &head_opt).unwrap_or_else(|e| die(&format!("MTP head: {e}")));
+    // F-VAE1: setup() built the pool, so this (worker-0) thread is pinned to one CPU; the head's scoped
+    // copy / verify threads would inherit that mask. Load with the original mask (decode timing unchanged).
+    let mut m = s.pool.unpinned(|| MtpWeights::load(&mtp_src, &s.loaded.plan, &head_opt)).unwrap_or_else(|e| die(&format!("MTP head: {e}")));
     // --draft-vocab RANKING [--draft-k K]: restricted-vocabulary draft head (WP-D3b); without it,
     // a sidecar head's stored vocabulary (oxe.draft_vocab.ids) is used if present
     let rk = a.get("draft-vocab").map(PathBuf::from);
@@ -1061,6 +1074,14 @@ fn cmd_prefill_bench(a: &Args) {
     } else {
         None
     };
+    // `attn` below is the decode selection. Bind prefill timing to the resolved prefill
+    // kernel and its cutoff/parameters, so a requested fa2/fa2x arm cannot be mislabelled.
+    let pf_path = eng.pf_attn_path();
+    let prefill_attention = json!({
+        "kernel": pf_path.name(),
+        "cutoff": pf_path.cut_opt(),
+        "fa2x": eng.pf_attn_fa2x().map(|p| json!({ "fold": p.fold, "chunk": p.ch })),
+    });
     let mut arms = Vec::new();
     let mut all_same = true;
     let mut state_same = true;
@@ -1132,6 +1153,7 @@ fn cmd_prefill_bench(a: &Args) {
             let mut arm = json!({
                 "prompt_tokens": prompt.len(),
                 "prefix_tokens": prefix,
+                "prefill_attention": prefill_attention.clone(),
                 "pf_tiles": masks[mi].0,
                 "pf_group": masks[mi].1,
                 // what the timed call ran with: the by-size setting resolved, 1 when the start is not on a 256 boundary
@@ -1554,8 +1576,9 @@ fn cmd_kbench_mt(a: &Args) {
     }
 }
 
-/// Engine construction-time switches an arm of `bench --arms` may set.
-const ARM_KEYS: [&str; 5] = ["OXE_DEC_ATTN_PAD", "OXE_DEC_FUSED_DN", "OXE_KV_TYPE", "OXE_KV8_FUSED", "OXE_ATTN_STATS"];
+/// Engine construction-time switches an arm of `bench --arms` may set. OXE_VL (F96 b): the lane-GEMV mask is read
+/// by `Engine::new` (`dec_vl`), so VL arms share one process and one prefill instead of re-prefilling per process.
+const ARM_KEYS: [&str; 6] = ["OXE_DEC_ATTN_PAD", "OXE_DEC_FUSED_DN", "OXE_KV_TYPE", "OXE_KV8_FUSED", "OXE_ATTN_STATS", "OXE_VL"];
 
 /// `name[:KEY=V[,KEY=V..]]|name2..` -> arms (dies on an unknown switch or a malformed entry).
 fn parse_arms(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
@@ -1585,7 +1608,7 @@ fn parse_arms(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
 /// `oxe bench --arms SPEC`: several decode switch arms in ONE process (test economy: the 8K / 16K
 /// decode arms of ticket 049 re-prefilled the prompt in every process for ~4 s of timed decode).
 /// SPEC = `name[:KEY=V[,KEY=V..]]|name2..`, KEY from the engine's construction-time switches
-/// (OXE_DEC_ATTN_PAD, OXE_DEC_FUSED_DN, OXE_KV_TYPE, OXE_KV8_FUSED, OXE_ATTN_STATS). One engine per
+/// (OXE_DEC_ATTN_PAD, OXE_DEC_FUSED_DN, OXE_KV_TYPE, OXE_KV8_FUSED, OXE_ATTN_STATS, OXE_VL). One engine per
 /// arm on the same weights. The prompt is prefilled ONCE per KV type; the other arms of that type
 /// load the written state (bit-identical for layout / scheduling switches; an int8 arm prefills
 /// itself). Then `--reps` rounds (default 4, the first `--drop` = 1 dropped): every arm restores
@@ -1595,7 +1618,7 @@ fn parse_arms(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
 /// `--profile`: the decode phase profile of each arm's last round.
 fn cmd_bench_arms(a: &Args, spec: &str) {
     let arms = parse_arms(spec);
-    const KEYS: [&str; 5] = ARM_KEYS;
+    const KEYS: [&str; 6] = ARM_KEYS;
     let tokens = a.num("tokens", 128);
     let warmup = a.num("warmup", 16);
     let reps = a.num("reps", 4).max(1);
@@ -2384,9 +2407,15 @@ fn cmd_npu_prefill_check(a:&Args){
 }
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // F-CI9: `| head` ends with status 0, not a core dump
     let a = Args::parse();
     if let Some(mode)=a.get("shared-experts") {
         if a.cmd != "bench" || mode != "dma" { die("experimental --shared-experts dma is limited to bench"); }
+    }
+    // fused-ref: validate its own values (candidate, control, gate numbers) before the generic check
+    #[cfg(feature = "f32-reference")]
+    if a.flag("check-args") && a.cmd == "fused-ref" {
+        fused_ref_cmd::check_args(&a);
     }
     if a.flag("check-args") && a.cmd != "prefill-bench" {
         a.check_known();
@@ -2407,6 +2436,40 @@ fn main() {
 mod n3_tests {
     use super::*;
 
+    /// Table-driven: every boolean flag any command reads (`flag("..")` in the CLI sources, the
+    /// feature-gated command files included) is a parser boolean, and parses as one.
+    #[test]
+    fn bool_flags_cover_every_flag_read() {
+        let sources = [
+            include_str!("oxe.rs"),
+            include_str!("../fused_ref_cmd.rs"),
+            include_str!("../f32_proof.rs"),
+            include_str!("../expert_dma.rs"),
+            include_str!("../expert_price.rs"),
+        ];
+        let mut read = Vec::new();
+        for src in sources {
+            for part in src.split("flag(\"").skip(1) {
+                let name = &part[..part.find('"').unwrap()];
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+                    read.push(name.to_string());
+                }
+            }
+        }
+        read.sort();
+        read.dedup();
+        for must in ["plain-steps", "batched-prompt", "check-args", "dry-run", "profile"] {
+            assert!(read.iter().any(|r| r == must), "scanner missed flag(\"{must}\")");
+        }
+        let missing: Vec<&String> = read.iter().filter(|r| !BOOL_FLAGS.contains(&r.as_str())).collect();
+        assert!(missing.is_empty(), "flags read but not parsed as booleans: {missing:?}");
+        // and the parser treats each as a boolean: the next option is not swallowed
+        for f in BOOL_FLAGS {
+            let args = Args::parse_from(vec!["bench".into(), format!("--{f}"), "--n".into(), "7".into()]);
+            assert!(args.flag(f) && args.get("n") == Some("7") && args.kv.len() == 1, "--{f}");
+        }
+    }
+
     #[test]
     fn usage_lists_every_dispatched_command_once() {
         let line = usage_line();
@@ -2418,5 +2481,14 @@ mod n3_tests {
         unique.dedup();
         assert_eq!(unique.len(), names.len());
         assert_eq!(names.len(), 24);
+    }
+
+    #[test]
+    fn bench_arms_accept_oxe_vl() {
+        let arms = parse_arms("base|vl:OXE_VL=15|pad0:OXE_DEC_ATTN_PAD=0,OXE_VL=4");
+        assert_eq!(arms.len(), 3);
+        assert_eq!(arms[1].1, vec![("OXE_VL".to_string(), "15".to_string())]);
+        assert_eq!(arms[2].1.len(), 2);
+        assert!(ARM_KEYS.contains(&"OXE_VL"));
     }
 }

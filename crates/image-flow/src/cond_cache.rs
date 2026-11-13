@@ -6,6 +6,12 @@
 //! bytes, the model file name, the model file size, width, height and steps. The prompt text is never
 //! written to disk outside the hashed key input; `meta.json` holds only its SHA-256.
 //!
+//! Encoder provenance: an entry written from a native text encoder carries its encoder identity
+//! (`qwen3_te::encoder_identity`: graph version, arithmetic, TE file name and size) in the key and in
+//! `meta.json`. Legacy entries (sd.cpp hand-over context) keep the exact legacy key and are marked
+//! `"encoder": "sd.cpp-handover"`. The two can never replace or be read for each other, so switching
+//! the encoder setting back (rollback) finds the untouched legacy entries again.
+//!
 //! Corrupt or inconsistent entries are errors, never silently used. The noise is not cached: it
 //! comes from the seed (`noise.rs`) or from a hand-over.
 
@@ -16,6 +22,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub const FORMAT: &str = "oxi-cond-v1";
+/// `meta.json` "encoder" of an entry whose context came from an sd.cpp hand-over.
+pub const LEGACY_ENCODER: &str = "sd.cpp-handover";
 
 /// What the key is computed from.
 pub struct KeyInputs<'a> {
@@ -27,6 +35,8 @@ pub struct KeyInputs<'a> {
     pub width: usize,
     pub height: usize,
     pub steps: usize,
+    /// Encoder identity of a native context; `None` = the sd.cpp hand-over context (legacy key).
+    pub encoder: Option<&'a str>,
 }
 
 /// One cached conditioning entry.
@@ -62,6 +72,11 @@ pub fn cache_key(k: &KeyInputs) -> String {
     buf.extend_from_slice(&(k.width as u64).to_le_bytes());
     buf.extend_from_slice(&(k.height as u64).to_le_bytes());
     buf.extend_from_slice(&(k.steps as u64).to_le_bytes());
+    if let Some(e) = k.encoder {
+        // appended only for native entries: legacy keys stay byte-identical
+        push_bytes(&mut buf, b"encoder");
+        push_bytes(&mut buf, e.as_bytes());
+    }
     hex(&sha256(&buf))
 }
 
@@ -117,6 +132,7 @@ pub fn put(root: &Path, k: &KeyInputs, c: &Conditioning) -> Result<PathBuf, Stri
         "grid": [c.grid.0, c.grid.1],
         "ctx_dim": n,
         "pe_half": c.pe_half,
+        "encoder": k.encoder.unwrap_or(LEGACY_ENCODER),
     });
     // meta.json is written last: an entry without it is incomplete, not valid
     let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
@@ -203,6 +219,10 @@ pub fn get(root: &Path, k: &KeyInputs) -> Result<Option<Conditioning>, String> {
     if meta.get("prompt_sha256").and_then(|v| v.as_str()) != Some(prompt_sha(k.prompt).as_str()) {
         return Err(bad("prompt hash does not match"));
     }
+    let enc = meta.get("encoder").and_then(|v| v.as_str()).unwrap_or(LEGACY_ENCODER);
+    if enc != k.encoder.unwrap_or(LEGACY_ENCODER) {
+        return Err(bad("encoder provenance does not match the key"));
+    }
     if uint("steps")? != k.steps || uint("width")? != k.width || uint("height")? != k.height {
         return Err(bad("steps or size do not match the key"));
     }
@@ -242,6 +262,38 @@ fn read_f32(path: &Path, count: usize) -> Result<Vec<f32>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn encoder_namespace_keeps_legacy_keys_and_never_crosses() {
+        let root = tmp("enc");
+        let legacy = inputs(b"a cat", "dit.gguf", 7, 32, 48, 4);
+        // the legacy key must not change (existing caches stay valid; rollback finds them)
+        let mut buf = Vec::new();
+        push_bytes(&mut buf, FORMAT.as_bytes());
+        push_bytes(&mut buf, b"a cat");
+        push_bytes(&mut buf, b"dit.gguf");
+        for v in [7u64, 32, 48, 4] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(cache_key(&legacy), hex(&sha256(&buf)));
+        let native = KeyInputs { encoder: Some("qwen3-te/1;cpu-ggml;te.gguf;9"), ..inputs(b"a cat", "dit.gguf", 7, 32, 48, 4) };
+        let other = KeyInputs { encoder: Some("qwen3-te/1;npu-fp16;te.gguf;9"), ..inputs(b"a cat", "dit.gguf", 7, 32, 48, 4) };
+        assert_ne!(cache_key(&legacy), cache_key(&native));
+        assert_ne!(cache_key(&native), cache_key(&other));
+        let mut a = sample();
+        put(&root, &legacy, &a).unwrap();
+        a.txt.iter_mut().for_each(|v| *v += 1.0);
+        put(&root, &native, &a).unwrap();
+        assert_eq!(get(&root, &legacy).unwrap().unwrap(), sample(), "native write left the legacy entry alone");
+        assert_eq!(get(&root, &native).unwrap().unwrap(), a);
+        assert!(get(&root, &other).unwrap().is_none());
+        // a legacy-keyed entry whose meta claims another encoder is refused, never used
+        let dir = root.join(cache_key(&legacy));
+        let m = std::fs::read_to_string(dir.join("meta.json")).unwrap().replace(LEGACY_ENCODER, "qwen3-te/1;cpu-ggml;te.gguf;9");
+        std::fs::write(dir.join("meta.json"), m).unwrap();
+        assert!(get(&root, &legacy).unwrap_err().contains("encoder provenance"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("image-flow-cond-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -250,7 +302,7 @@ mod tests {
     }
 
     fn inputs<'a>(prompt: &'a [u8], name: &'a str, size: u64, w: usize, h: usize, steps: usize) -> KeyInputs<'a> {
-        KeyInputs { prompt, model_name: name, model_size: size, width: w, height: h, steps }
+        KeyInputs { prompt, model_name: name, model_size: size, width: w, height: h, steps, encoder: None }
     }
 
     /// 32 x 48 px image: grid (3, 2), 6 image tokens; 3 text tokens of width 4; pe_half 2.

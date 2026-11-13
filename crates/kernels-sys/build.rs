@@ -51,6 +51,7 @@ fn main() {
         .flag("-std=gnu++17")
         .file(upstream.join("src/ggml-cpu/vec.cpp"))
         .file(csrc.join("oxe_ops.cpp"))
+        .file(csrc.join("oxe_pfa2x.cpp"))
         .compile("oxe_ggml_ops");
 
     // ggml-base items (no -march), C. Compiled (and so linked) LAST: oxe_ggml_cpp calls

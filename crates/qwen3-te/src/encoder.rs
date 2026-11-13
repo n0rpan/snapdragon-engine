@@ -3,7 +3,8 @@
 //! oxn NPU in `npu.rs`).
 
 use crate::config::KleinSpec;
-use crate::cpu::{self, attention, rms_norm_rows, rope_neox, rope_tables, silu};
+use crate::attn_gqa::attention_gqa;
+use crate::cpu::{self, rms_norm_rows, rope_neox, rope_tables, silu};
 use crate::prompt::Encoded;
 use crate::weights::{Kind, TeWeights};
 use oxn::linear::WeightRows;
@@ -135,7 +136,8 @@ impl<'w, 'a> Encoder<'w, 'a> {
             }
             tm.norm_rope_s += t.elapsed().as_secs_f64();
             let t = Instant::now();
-            attention(&qkv[0], &qkv[1], &qkv[2], &e.mask, n, c.n_heads, c.n_kv_heads, hd, &mut att, self.threads);
+            // GQA-grouped attention: bitwise the reference `cpu::attention` (tests_v013), K/V read once per group
+            attention_gqa(&qkv[0], &qkv[1], &qkv[2], &e.mask, n, c.n_heads, c.n_kv_heads, hd, &mut att, self.threads);
             tm.attn_s += t.elapsed().as_secs_f64();
             let t = Instant::now();
             lin.project(l, &[Kind::O], &att, n, &mut one)?;

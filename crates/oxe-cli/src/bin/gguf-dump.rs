@@ -2,6 +2,7 @@
 //! in the same row format as tests/fixtures (name, type, shape, offset, bytes).
 
 fn main() {
+    sched::cli::exit_zero_on_epipe(); // F-CI9: `| head` ends with status 0, not a core dump
     let args: Vec<String> = std::env::args().collect();
     let meta = args.iter().any(|a| a == "--meta");
     let path = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| {

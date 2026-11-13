@@ -1,137 +1,135 @@
-# FUSED-REF: long-context numeric reference for the fused attention
+# FUSED-REF: the O-117 quality runner (fa2 / fa2x prefill, fused decode)
 
-`oxe fused-ref` is the numeric gate for the O-70 fused decode attention (`OXE_ATTN=fused`) at 32K and 64K.
+`oxe fused-ref --candidate prefill-fa2 | prefill-fa2x | fused-decode` is the quality gate O-117 pre-registers
+for v0.1.3: clauses (a)-(c) at 32K and 64K. Clause (d) (tool-JSON 100% on one long-session closed-loop
+replay at ≥ 48K) is run separately by the closed-loop runner.
+
 It is a bench command. It is built only with `--features f32-reference` and is never a server setting.
-Production builds do not change: the reference hook (`Engine::set_attn_ref`) exists only under `cfg(test)`
-or that feature, and it is `None` unless this command sets it.
+Production builds do not change: every hook it uses (`Engine::set_pf_ref`, `set_pf_check`, the prefill
+counters, `head_logits`, `set_attn_ref`, `set_attn_check`) exists only under `cfg(test)` or that feature.
 
 ## Scope statement (for the receipt)
 
-> f32-attention reference with production weights (fused vs tiled attention over the same stored f16 KV
-> and the same saved prefix state; weights, matmuls and recurrent layers are the production CPU path);
-> NOT a full-model f32 reference.
+> O-117 quality runner: teacher-forced from one saved prefix state, every position compared (candidate vs
+> tiled incumbent, and a measured control of the incumbent on the same positions); f32-attention reference
+> with production weights (f64-accumulated attention over the same q and stored f16 KV; weights, matmuls and
+> recurrent layers are the production CPU path); NOT a full-model f32 reference; clause (d) tool-JSON is run
+> separately
 
-A full-model f32 reference is not feasible at 32K-64K. A 35B model needs about 140 GB of f32 weights, and
-`f32-export` stays limited to a prompt of 512 or less, 256 rows or less, and a context of 4096 or less.
-This command therefore does not claim end-to-end exact-f32 numerics. It isolates the one thing that
-changes, the attention core, and measures it at the real depth on the real model.
+Each receipt also carries a `scope_label` naming the candidate, the prefix, the row counts and the control.
+A full-model f32 reference is not feasible at 32K-64K (a 35B model needs about 140 GB of f32 weights).
 
-## What it measures
+## What it runs
 
-Two engines (f16 KV, no MTP, the tiled path at every depth) load the same saved prefix state:
-A is the incumbent (tiled), B is the candidate (fused). Both then step the same fixed continuation, teacher-forced.
+All arms start from the SAME saved prefix state (`--state-file`, built once by the tiled prefill and read
+back before every arm) and take the same teacher-forced continuation of `--n` tokens (default 1000).
 
-**(a) Candidate vs incumbent.** At each of the `--n` positions (default 1000) the command records:
+**Prefill candidates (`prefill-fa2`, `prefill-fa2x`): one engine, four arms.**
 
-- KL(P_tiled ‖ P_fused), as mean, p50, p90, p99 and max;
-- top-1 agreement.
-
-**(b) f32-attention reference.** This runs at `--ref-samples` evenly spaced positions (default 200), and also
-at every position where A and B disagree on top-1. At each of these positions, engine A's state is forked: a
-recurrent snapshot plus KV truncation. The same step then runs three ways over the same stored KV:
-
-1. f32 attention math (f32 K/V widened from the stored f16, f64 accumulation of scores, softmax and V);
-2. fused;
-3. tiled.
-
-The per-position logit error is the RMS logit difference over the full vocabulary. KL(ref ‖ arm) is also
-recorded. During the fused and tiled forked steps, every attention core is also checked at the attention
-level: its gated output is compared with the f32-attention reference computed on the same roped query and the
-same stored KV, summed over all layers and heads (rel-L2). Each fork is checked: the tiled step is replayed afterwards and must be bit-identical to the
-un-forked one (`fork_replay_exact`).
-
-## Gate (all must hold; exit 1 otherwise)
-
-| check | rule |
+| arm | what runs |
 |---|---|
-| scope | at least 1000 positions and at least 200 reference samples |
-| (a) KLD | mean KL(P_tiled ‖ P_fused) ≤ the noise floor. With `--control` the floor is MEASURED on the same state (below; `noise_floor_source: measured`). `--noise-floor-kld X` alone is labelled "provided (not measured)": Ornith 0.027 is a measurement from elsewhere, and Qwen 0.01 is provisional |
-| (a) top-1 | agreement ≥ 99.5% |
-| wrong top-1 | 0 positions where the continuous fused top-1 differs from the reference top-1 and the reference's top-1 margin is above 5 logits (`--margin`). The tiled count is reported next to it |
-| (b) logit error | over the ≥ 200 sampled positions: fused median ≤ `--ref-ratio-max` (default 1.1) × tiled median, and the same for p90 |
-| (b) jumps | positions with logit RMS error > 1e-3 (`--jump-threshold`): fused count ≤ tiled count + max(2, 3% of samples) |
-| (b) attention | fused attention-level rel-L2 ≤ 1.1 × tiled |
-| fork | every fork replays exactly |
+| incumbent | batched prefill of the continuation, `OXE_PF_ATTN=tiled`, `--ubatch` (default 256, production) |
+| candidate | the same batched prefill with `fa2` or `fa2x` (every unit beyond `PFA_MIN_KV` = 8192; at 32K / 64K that is every unit) |
+| reference | the same batched prefill with the f32-attention reference as the attention core of every row |
+| control | `--control decode` (default): tiled decode, one token per step; or `--control ubatch:N`: tiled batched prefill at another ubatch |
 
-Why median, p90 and jump counts, and not the mean: the per-position logit error is heavy-tailed. About 10%
-of positions jump to 1e-2..1e-1 RMS after ANY attention change of ~1e-4, in both arms; these are most likely
-MoE top-2 routing flips. A mean over a few samples measures where the jumps landed, not the kernel. The first
-version of this gate used the mean over 20 samples and reported fused as ~1000× further from the reference
-(1e-2 vs 1.3e-5): two jumps had landed on fused. The fused-precision probe (`tests/fprec.rs`, branch
-`claude/fused-precision` 968d97a) showed that fused has no defect.
+The batched arms use `Engine::prefill_ext`: the production ubatch / grouping, plus every row's output-normed
+hidden state. The logits of every row come from the production head (`head_logits`: activation quantisation
+and the head GEMV, bit-identical to the batched prefill's own head, tested). So all `--n` positions are
+compared, for the candidate AND for the control, at the same positions. This replaces the earlier
+`--control`, which compared only the 250 chunk ends of 1000 positions.
 
-Mini model (model-free test), 200 samples, current kernels:
+**Proof that the batched path ran.** In bench / test builds the engine counts batched passes, rows per pass
+and attention units per kernel (tiled, per-head, fa2, fa2x, f32 reference). The receipt lists them per arm
+(`path.arms`). The verdict requires all of the following (`path.ok`, problems in `path.problems`):
 
-| | logit RMS p50 | logit RMS p90 | jumps | attention rel-L2 |
-|---|---|---|---|---|
-| tiled | 1.1e-5 | 1.5e-2 | 21 | 1.43e-4 |
-| fused | 9.5e-6 | 5.9e-5 | 17 | 1.20e-4 |
+- every candidate row came from a batched pass;
+- the largest candidate pass is more than 1 row;
+- the candidate kernel ran units and the other kernel did not;
+- the incumbent ran only tiled units;
+- the reference ran only reference units;
+- the control covered every position.
 
-The gate passes. Over all 250 positions: tiled p50 1.05e-5, mean 5.98e-3; fused p50 8.8e-6, mean 5.06e-3.
-A deliberately degraded fused path (output × 1.01, `mini_fused_ref_degraded_fused_fails_the_reference_gate`)
-fails: attention rel-L2 1.0e-2, logit p50 0.10, 189 jumps.
+A scalar-step fa2 run (ubatch 1, or decode) can never be labelled a pass.
 
-With a ~10% jump rate, the p90 sits on the edge of the jump tail. Read it together with the jump counts.
+**`fused-decode`: two engines.** A (tiled decode) and B (fused decode, cutoffs 0) step the continuation. A is
+forked at the sampled positions and at every top-1 disagreement: one step runs three ways over A's stored
+state (f32-attention reference, fused, tiled), and the replayed tiled step must equal the un-forked one bit
+for bit. The control must be batched (`--control ubatch:N`, default `ubatch:256`). It is the tiled batched
+prefill of the same tokens, compared at every position with the decode incumbent.
 
-## `--control`: the measured noise floor
+## The clauses (all must hold, plus scope and path; exit 1 otherwise)
 
-`--control` measures the incumbent's own numerical noise on the same saved state, before the fused
-comparison. Engine A steps the continuation through the decode path (one token per step, as for generated
-tokens). Engine B takes the same tokens through the batched prefill path, in chunks of `--control-ubatch`
-(default 4), as for prompt tokens. Both use tiled attention and both are teacher-forced from the same state.
+| | rule |
+|---|---|
+| scope | ≥ 1000 compared rows, control rows at the same positions, ≥ 200 sampled reference positions |
+| (a) KLD | mean KL(P_cand ‖ P_tiled) ≤ `--kld-factor` (1.0) × mean KL(P_control ‖ P_tiled). Both use the same direction and the same positions |
+| (b) top-1 | agreement(cand, tiled) ≥ agreement(control, tiled) − `--top1-slack-pp` (0.5) pp. The floor is the measured control's (dynamic, not absolute) |
+| (c) logit error | over the sampled positions, the RMS logit error vs the reference: candidate median ≤ 1.1 × tiled median, and the same for p90 |
+| (c) jumps | positions with RMS error > 1e-3: candidate jumps ≤ tiled jumps + max(2, ceil(3% × sampled positions)). 200 samples: allowance 6. 1000 samples: 30 |
+| (c) attention | candidate attention-output rel-L2 ≤ 1.1 × tiled |
+| (d) | not run here (closed-loop runner) |
 
-At each chunk end the command records KL(P_decode ‖ P_prefill_batch) and top-1 agreement. With n = 1000
-and ubatch 4, that is 250 positions. Both engines are then reloaded from the state file and the fused run
-proceeds.
+How the attention level of (c) is measured for prefill: in the incumbent's and the candidate's own batched
+passes, the gated attention outputs of the sampled rows are compared with the f32-attention reference
+computed on THEIR OWN q and stored K/V (all layers and heads). The result is sqrt(Σ err² / Σ ref²).
 
-The floor is `--control-factor` (default 1.0) × the control's mean KLD. It is reported under `control`, and
-the gate is labelled `noise_floor_source: measured`. A KLD gate counts as "measured" only with `--control`.
-Cost: one more 1000-step decode pass plus 250 small prefills, about +1.5 min at 32K and +3 min at 64K.
+Jump allowance: the code had max(2, ceil(0.03 × samples)), as Codex assumed. It is kept, with one fix: a
+1e-9 guard so that float rounding never adds one. 0.03 × 100 is 3.0000000000000004 in floating point, so
+the old code gave 4 instead of 3. Results at 200 and 1000 samples are unchanged.
 
-## Commands
+Why median, p90 and jumps, and not the mean: the per-position logit error is heavy-tailed. About 10% of
+positions jump to 1e-2..1e-1 after any ~1e-4 attention change; these are most likely MoE routing flips
+(`tests/fprec.rs`).
 
-Build once (bench binary, no production change; `-j 2`, nice 19, under build.lock):
+## Model-free tests (CI)
+
+On the mini model:
+
+- `tests/longctx/fused_ref_o117.rs`: prefill. Covers the full 1000-row shape with the counters, independent
+  recomputation of the KLD direction and the head, a degraded fa2 that fails (c), ubatch 1 that is never a
+  pass, the in-place f16 reference bit-identical to `ref_attn_f64`, and the gate arithmetic.
+- `tests.rs` `mini_fused_ref_*`: fused decode. Covers fork transparency, the 250 + 250 rows, the KLD
+  direction, and a degraded fused path that fails.
+
+## Commands (Snapdragon, under the inference lease, one model at a time)
 
 ```sh
-R=<engine checkout at claude/gate-tools>
-cd $R && CC="sccache cc" CXX="sccache c++" nice -n 19 cargo build --release -p oxe-cli --features f32-reference --bin oxe -j 2
-```
-
-Run under the inference lease, one model at a time, with nothing else loaded:
-
-```sh
-M=~/.local/share/ai-stack/models/llm/Ornith-1.5-35B-A3B-APEX-MTP-Compact.gguf   # Qwen: Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf (same flags; --control measures its floor)
-ST=<0700 state dir>; S=<result dir>; IDS=<ids file of >=65536 real long agent/code text ids; the first $C are the prefix>
+# build (bench binary only)
+cargo build --release -p oxe-cli --features f32-reference --bin oxe
+M=<model gguf>; ST=<0700 state dir>; S=<result dir>; IDS=<ids file, >= 65536 real long agent/code ids>
 for C in 32768 65536; do
-  $R/target/release/oxe fused-ref --model $M --cpu-list 0-7 --prefix-len $C --prefix-ids-file $IDS \
-     --state-file $ST/pf-f16-$C.state --n 1000 --ref-samples 200 --control \
-     --out $S/fused-ref-ornith-$C.json
+  for K in prefill-fa2 prefill-fa2x; do
+    oxe fused-ref --candidate $K --model $M --cpu-list 0-7 --prefix-len $C --prefix-ids-file $IDS \
+      --state-file $ST/pf-f16-$C.state --n 1000 --ref-samples 200 --ubatch 256 --control decode \
+      --out $S/o117-$K-$C.json
+  done
+  oxe fused-ref --candidate fused-decode --model $M --cpu-list 0-7 --prefix-len $C --prefix-ids-file $IDS \
+    --state-file $ST/pf-f16-$C.state --n 1000 --ref-samples 200 --control ubatch:256 \
+    --out $S/o117-fused-decode-$C.json
 done
 ```
 
-- The state header kind is `prefill-bench-prefix`. A `prefill-bench --prefix-len $C --prefix-ids-file …
-  --state-file …` state of the same model and ids is reused as is. A missing state is built once, chunked,
-  and saved.
-- `--text-file F` (for example wikitext-2 train) can replace `--prefix-ids-file`.
-- The continuation defaults to the built-in synthetic mixed fixture
-  (`crates/oxe-cli/fixtures/fused-ref-continuation.txt`: chat markup, tool-call JSON, code, logs and prose,
-  parsed with special tokens). `--continuation-file T` replaces it.
-- `--dry-run` reads the tokenizer only. It prints the plan (token counts, id hashes, n_ctx) without loading
-  weights.
+- `--dry-run` reads only the tokenizer and prints the plan.
+- The state kind is `prefill-bench-prefix`, so a prefill-bench state of the same ids is reused. The state is
+  built with the tiled prefill.
+- `OXE_PF_FA2X_FOLD` / `OXE_PF_FA2X_CH` tune fa2x as in production.
 
-## Cost estimate (Ornith; Qwen similar)
+## Cost estimate (Ornith / Qwen 35B-A3B; estimates, not measured)
 
-These are estimates, not measured.
-
-| | 32K | 64K |
+| per run, state reused | 32K | 64K |
 |---|---|---|
-| state build (if not reused) | ~3-4 min | ~11 min |
-| (a) 1000 positions, 2 engines + a 63 MiB recurrent snapshot per position | ~2 min | ~4 min |
-| (b) ~200+ forks (reference step ~0.8 s / ~1.6 s, plus fused and tiled steps) | ~4 min | ~8 min |
-| total with a reused state | ~6-8 min | ~12-15 min |
-| RAM beyond the mmapped weights | ~2.5 GiB | ~4.5 GiB |
+| prefill-fa2 / -fa2x: 3 batched passes + 4-5 state reads | ~1-2 min | ~2-3 min |
+| reference pass (f32 attention for all 1000 rows; ~2.7 / 5.4 T f64 MAC) | ~6 min | ~12 min |
+| attention checks (200 rows × 2 arms) | ~2.5 min | ~5 min |
+| control decode (1000 steps) + 3000 head GEMVs | ~1.5 min | ~2.5 min |
+| **prefill candidate total** | **~11-12 min** | **~21-23 min** |
+| fused-decode (2 engines, 200+ forks, batched control) | ~7-9 min | ~13-16 min |
+| state build, once per context (if not reused) | ~3-4 min | ~11 min |
 
-The RAM figure covers 2 KV caches, plus up to 8 × 2 × n·head_dim f32 transient per reference step.
+All three candidates at both contexts come to about 1.5-1.8 h with the states reused.
 
-128K is not in scope. Two 128K engines plus the reference transient (~9 GiB) next to ~20 GB of weights would
-page the weights on this 30 GB machine.
+RAM beyond the mmapped weights: a prefill run uses one engine, ~1.6 GiB at 64K. fused-decode uses two
+engines, ~4.5 GiB at 64K.
+
+128K is out of scope.

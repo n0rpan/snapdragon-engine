@@ -141,6 +141,26 @@ const SNAP_NO_MTP: u8 = 0;
 const SNAP_MTP_V2: u8 = 2;
 
 impl OxeEngine {
+    /// PREFILL-LONG: the prefill attention kernel choice of the model engine (default from
+    /// `OXE_PF_ATTN`); changes [`Engine::arith_id`] when it changes the path taken.
+    pub fn set_pf_attn(&mut self, mode: model::engine::PfAttn) {
+        self.eng.set_pf_attn(mode);
+    }
+
+    /// PREFILL-POLICY: what `auto` resolves to (default `OXE_PF_ATTN_AUTO_MIN_KV` /
+    /// `OXE_PF_ATTN_AUTO_KERNEL`); changes [`Engine::arith_id`] when it changes the path taken.
+    pub fn set_pf_auto(&mut self, auto: model::engine::AutoPolicy) {
+        self.eng.set_pf_auto(auto);
+    }
+
+    /// PREFILL-POLICY: one start-up line naming the resolved prefill attention path.
+    pub fn pf_attn_summary(&self) -> String {
+        let (p, a) = (self.eng.pf_attn_path(), self.eng.pf_auto());
+        let cut = p.cut_opt().map_or(String::new(), |c| format!(" beyond n_kv {c}"));
+        let min = a.min_kv.map_or("legacy (fa2 only above n_ctx 131072)".to_string(), |n| n.to_string());
+        format!("prefill attention {}{cut} (mode {}, auto min-kv {min}, auto kernel {})", p.name(), self.eng.pf_attn().name(), a.kernel.name())
+    }
+
     /// Load `model` (building the weight cache on first use) for decode on `cpus`.
     pub fn open(model: &Path, cpus: &[usize], n_ctx: usize) -> std::result::Result<OxeEngine, String> {
         Self::open_full(model, cpus, None, model::engine::UBATCH, n_ctx, 0)
@@ -450,7 +470,24 @@ impl Engine for OxeEngine {
         // fused kernels, padding): a superset of the effective mode, so a cache made under one
         // path is never read under another (lossless knobs only cost hits)
         // plus the kernel path (target, CPU features, libm): P2 review
-        format!("{} {}", crate::state_store::arith_env(), crate::state_store::kernel_path())
+        // v0.1.3 (lane A x B): plus the prefill attention path the engine actually takes
+        // (`OXE_PF_ATTN=auto` picks fa2 by itself above 131072): appended only for fa2, so a
+        // tiled engine keeps its v0.1.2 identity and a state made under one path is never resumed
+        // under the other
+        // APPEND-PREFILL: fa2x is another numerics class (and its fold / chunk too)
+        // PREFILL-POLICY: keyed on the RESOLVED path (auto included), plus the cutoff when it is
+        // not PFA_MIN_KV (`.k<cut>`): tiled and fa2 / fa2x at PFA_MIN_KV keep their identities
+        let path = self.eng.pf_attn_path();
+        let k = match path.cut_opt() {
+            Some(c) if c != model::engine::pfattn::PFA_MIN_KV => format!(".k{c}"),
+            _ => String::new(),
+        };
+        let pf = match self.eng.pf_attn_fa2x() {
+            Some(xp) => format!(" pf_attn=fa2x.f{}.c{}{k}", xp.fold, xp.ch),
+            None if path.fa2() => format!(" pf_attn=fa2{k}"),
+            None => String::new(),
+        };
+        format!("{} {}{pf}", crate::state_store::arith_env(), crate::state_store::kernel_path())
     }
     fn save_state(&mut self, w: &mut dyn std::io::Write) -> Result<()> {
         let e = |e: std::io::Error| EngineError(format!("save state: {e}"));

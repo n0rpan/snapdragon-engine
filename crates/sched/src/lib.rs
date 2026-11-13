@@ -12,6 +12,8 @@
 //! - `Barrier` is a centralised sense-reversing barrier on cache-line-padded atomics. The
 //!   last arriver bumps an episode counter, so barriers/token is measured, not assumed.
 
+pub mod cli;
+
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
@@ -250,21 +252,48 @@ impl Pool {
         let mut handles = Vec::new();
         for (i, &cpu) in cpus.iter().enumerate().skip(1) {
             let sh = shared.clone();
-            let tids = tids.clone();
-            let h = std::thread::Builder::new().name(format!("oxe-w{i}")).spawn(move || {
+            let tids2 = tids.clone();
+            let spawned = std::thread::Builder::new().name(format!("oxe-w{i}")).spawn(move || {
                 if let Err(e) = pin_current_thread(cpu) {
                     eprintln!("oxe-w{i}: pin to cpu {cpu} failed: {e}");
                 }
-                tids[i].store(gettid(), Release);
+                tids2[i].store(gettid(), Release);
                 worker_loop(&sh, i);
-            })?;
-            handles.push(h);
+            });
+            match spawned {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    // N9 (REVIEW-v0.1.1): stop and join the workers already started (they would spin / sleep for
+                    // the life of the process) and give the caller its mask back
+                    shutdown_workers(&shared, &mut handles);
+                    if let Some(m) = &caller_mask {
+                        let _ = set_thread_affinity(0, m);
+                    }
+                    return Err(e);
+                }
+            }
         }
         // wait until every worker has pinned itself
         while tids.iter().any(|t| t.load(Acquire) == 0) {
             std::thread::yield_now();
         }
         Ok(Pool { shared, handles, cpus: cpus.to_vec(), tids, caller_mask })
+    }
+
+    /// F-VAE1: run `f` on the creating thread with that thread's mask from before [`Pool::new`] (all its CPUs),
+    /// then pin it back to `cpus[0]`. Threads that `f` spawns (scoped loaders: weight copy / verify, an MTP head
+    /// load) inherit the full mask instead of the one-CPU mask of worker 0. Call from the thread that created the
+    /// pool, between jobs; without a saved mask `f` runs pinned as before.
+    pub fn unpinned<R>(&self, f: impl FnOnce() -> R) -> R {
+        assert_eq!(gettid(), self.tids[0].load(Relaxed), "Pool::unpinned: not the pool's creating thread");
+        let restored = self.caller_mask.as_ref().is_some_and(|m| set_thread_affinity(0, m).is_ok());
+        let r = f();
+        if restored {
+            if let Err(e) = pin_current_thread(self.cpus[0]) {
+                eprintln!("oxe-w0: re-pin to cpu {} failed: {e}", self.cpus[0]);
+            }
+        }
+        r
     }
 
     pub fn nthreads(&self) -> usize {
@@ -369,14 +398,19 @@ fn worker_loop(sh: &Shared, tid: usize) {
     }
 }
 
+/// Wake every worker with the shutdown flag set and join them.
+fn shutdown_workers(shared: &Shared, handles: &mut Vec<JoinHandle<()>>) {
+    shared.shutdown.store(true, SeqCst);
+    shared.epoch.fetch_add(1, SeqCst);
+    futex_wake_all(&shared.epoch);
+    for h in handles.drain(..) {
+        let _ = h.join();
+    }
+}
+
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, SeqCst);
-        self.shared.epoch.fetch_add(1, SeqCst);
-        futex_wake_all(&self.shared.epoch);
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+        shutdown_workers(&self.shared, &mut self.handles);
         // Give the creating thread (worker 0) its original mask back. By tid, so this is right
         // whichever thread drops the pool; a thread that has exited makes it a harmless ESRCH.
         if let Some(mask) = &self.caller_mask {
@@ -593,3 +627,7 @@ pub fn lpt_assign(costs: &[u64], bins: usize, out: &mut [u8], loads: &mut [u64])
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cli;
+#[cfg(test)]
+mod tests_affinity;

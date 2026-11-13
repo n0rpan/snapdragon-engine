@@ -35,7 +35,7 @@ it is safe to run without the inference lease. llama-server flags that the contr
 passes (`--threads`, `--jinja`, `-b/-ub`, `--spec-type`, `--reasoning-budget`, ...) are
 accepted and ignored (`IGNORED` in `src/main.rs`); unknown flags are an error.
 
-### Access (v0.1.1)
+### Access
 
 The port is for local clients. `oxe-server` sends no CORS headers, refuses (403) a request whose
 `Host` is not `127.0.0.1`, `localhost` or `[::1]` with the server's port (add names with
@@ -44,10 +44,34 @@ any request whose `Origin` is not loopback or that carries `Sec-Fetch-Site: cros
 stops web pages (including DNS rebinding) from using the engine. Against other local users, set
 a key: `--api-key-file PATH` or `OXE_API_KEY_FILE=PATH` (one key per line, file mode 0600); every
 route, `/health` included, then needs `Authorization: Bearer KEY` (or `X-Api-Key: KEY`), else 401.
-The lab controller creates a fresh key per launch. Sampling values out of range (`min_p` or
+The lab controller creates a fresh key per launch. A `--host` that is not loopback (a LAN address,
+`0.0.0.0`, `::` or a host name) without a key is refused at start (exit 2): the Host check stops
+DNS rebinding, it does not authenticate. Sampling values out of range (`min_p` or
 `top_p` outside 0..1, `top_k` beyond 32 bits, non-finite numbers, penalties outside their range,
 `n_probs` / `top_logprobs` above 100) are a 400. A streaming client that takes no data for
 `--stream-stall-timeout` seconds (30) is dropped and its generation cancelled.
+
+Long prefills (v0.1.3 LONG-APPEND): a streamed request sends its HTTP head at once and then, while
+it waits for the worker or prefills, one SSE comment every `--sse-keepalive` seconds (15; env
+`OXE_SSE_KEEPALIVE_SECS`; 0 = off): `: queued 12s`, then `: prefill 12288/28500 361s` (prompt
+tokens in the engine state / prompt length, seconds since the request). Comments stop at the first
+decoded token. SSE parsers ignore comment lines (WHATWG EventSource, `eventsource-parser` in the AI
+SDK, OpenCode's Effect parser, the OpenAI SDKs), so a client sees the same data frames; the bytes
+keep byte-level idle-read timeouts of clients and proxies (the lab controller's included) from
+firing during a prefill of many minutes (a 28.5K append at ~83K depth: > 600 s on CPU). They do
+not reset event-level timeouts: OpenCode 2.2.7's `chunkTimeout` (default 900 s) counts only data
+events, so set it (and `headerTimeout`, default 300 s) generously for local models. A non-streamed request sends nothing until it ends: a client
+needs a whole-request timeout above the longest prefill.
+
+Prefill attention (v0.1.3 PREFILL-POLICY): `--pf-attn auto|tiled|fa2|fa2x` (env `OXE_PF_ATTN`,
+default auto). `auto` resolves per engine: `--pf-attn-auto-min-kv N` (env `OXE_PF_ATTN_AUTO_MIN_KV`)
+runs `--pf-attn-auto-kernel fa2|fa2x` (env `OXE_PF_ATTN_AUTO_KERNEL`, default fa2) for prefill units
+whose padded n_kv exceeds N (clamped to 8192..131072) and the tiled kernel, bit for bit, below it.
+The default min-kv is `legacy` (a placeholder until the AP-1 crossover measurement): fa2 beyond 8192
+only when `--ctx-size` exceeds 131072, i.e. tiled everywhere else (the v0.1.3 lane-A behaviour).
+The start-up log names the resolved path (`oxe-server: prefill attention fa2x beyond n_kv 16384
+(...)`); the state identity keys on it (`pf_attn=fa2`, `pf_attn=fa2x.f8.c128`, plus `.k<N>` when the
+cutoff is not 8192), so a state is never resumed under another prefill numerics class.
 
 Endpoints (llama-server shapes, key order included):
 

@@ -3,7 +3,7 @@
 
 use crate::api::{self, ChatMeta};
 use crate::engine::Engine;
-use crate::generate::{GenError, GenParams, GenResult, Partial, Worker};
+use crate::generate::{GenError, GenParams, GenResult, Partial, Progress, Worker};
 use chat::{ChatTemplate, ParserConfig, ServerChatOptions, Session};
 use serde_json::{json, Value as Json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,9 @@ pub struct State<E: Engine> {
     /// S8: a stream whose client takes no frame for this long is dropped and its generation
     /// cancelled (`--stream-stall-timeout`, env `OXE_STREAM_STALL_SECS`, default 30 s)
     pub stream_stall: std::time::Duration,
+    /// LONG-APPEND (v0.1.3 #7): SSE comment interval while a streamed request waits for the worker
+    /// or prefills (`--sse-keepalive SECS`, env `OXE_SSE_KEEPALIVE_SECS`, default 15; 0 = off)
+    pub sse_keepalive: std::time::Duration,
     /// CACHE-PERFECT ECHO records (see `echo.rs`); config from `OXE_ECHO*` (the `--echo*` flags)
     pub echo: Mutex<crate::echo::EchoStore>,
     /// token ids that open an assistant turn (`<|im_start|>assistant`), None if the template has none
@@ -55,6 +58,10 @@ pub struct State<E: Engine> {
     pub persist: Mutex<Option<Arc<AtomicBool>>>,
     /// state-store writes finished (tests)
     pub persist_done: std::sync::atomic::AtomicU64,
+    /// v0.1.3: held by a post-reply state write through all its phases (the off-lock middle one
+    /// included). The cache endpoints take it first, so they see a store with no write in flight;
+    /// generation requests never take it. Writes queue behind each other in reply order.
+    pub persist_gate: Mutex<()>,
     /// cancel flag of the running generation (SIGTERM cancels it so the bounded shutdown write runs)
     pub running: Mutex<Option<Arc<AtomicBool>>>,
     /// cancel flag of the pending/running preload (P2b; any request raises it)
@@ -103,12 +110,14 @@ impl<E: Engine> State<E> {
             stream_stall: std::time::Duration::from_secs_f64(
                 std::env::var("OXE_STREAM_STALL_SECS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(30.0),
             ),
+            sse_keepalive: sse_keepalive_from_env(),
             echo: Mutex::new(crate::echo::EchoStore::new(crate::echo::EchoConfig::from_env())),
             asst_delim,
             im_end,
             state_cache,
             persist: Mutex::new(None),
             persist_done: Default::default(),
+            persist_gate: Mutex::new(()),
             running: Mutex::new(None),
             preload: Mutex::new(None),
             preload_status: Mutex::new(json!({"status": "idle"})),
@@ -205,7 +214,11 @@ impl<E: Engine> State<E> {
                 None => (Vec::new(), None),
             };
             let last_user = self.user_delim.as_ref().and_then(|d| tokens.windows(d.len()).rposition(|w| w == &d[..]));
-            return Rendered { tokens, asst: None, msg_starts, first_user, last_user };
+            let user_starts = match &self.user_delim {
+                Some(d) => tokens.windows(d.len()).enumerate().filter(|(_, w)| *w == &d[..]).map(|(i, _)| i).collect(),
+                None => Vec::new(),
+            };
+            return Rendered { tokens, asst: None, msg_starts, first_user, last_user, user_starts };
         };
         let mut cuts: Vec<usize> = starts.iter().chain(&ends).copied().collect();
         cuts.sort_unstable();
@@ -216,6 +229,7 @@ impl<E: Engine> State<E> {
         let msg_starts: Vec<usize> = starts.iter().filter_map(|&b| tok_at(b)).collect();
         let first_user = starts.iter().find(|&&b| is(b, "user")).and_then(|&b| tok_at(b));
         let last_user = starts.iter().rev().find(|&&b| is(b, "user")).and_then(|&b| tok_at(b));
+        let user_starts: Vec<usize> = starts.iter().filter(|&&b| is(b, "user")).filter_map(|&b| tok_at(b)).collect();
         let mut asst = Some(Vec::new());
         let n_starts = starts.len();
         for (k, &b) in starts.iter().enumerate().filter(|(_, &b)| is(b, "assistant")) {
@@ -233,7 +247,20 @@ impl<E: Engine> State<E> {
         if starts.len() != msg_starts.len() {
             asst = None;
         }
-        Rendered { tokens, asst, msg_starts, first_user, last_user }
+        Rendered { tokens, asst, msg_starts, first_user, last_user, user_starts }
+    }
+
+    /// v0.1.3 pre-think point of a fed chat prompt: thinking on (the generation prompt ends in an
+    /// open `<think>`), the position just before that `<think>`, when the prompt ends with exactly
+    /// the tokens of that tail. None otherwise (thinking off, another template).
+    fn pre_think(&self, prompt: &[Token], generation_prompt: &str) -> Option<usize> {
+        let at = generation_prompt.rfind("<think>")?;
+        let tail = &generation_prompt[at..];
+        if tail.contains("</think>") {
+            return None;
+        }
+        let t = self.tok.encode(tail, false, true);
+        (!t.is_empty() && t.len() < prompt.len() && prompt.ends_with(&t)).then(|| prompt.len() - t.len())
     }
 
     /// ECHO: the prompt to feed for a rendered chat prompt (see `echo.rs`).
@@ -270,6 +297,22 @@ pub async fn handle<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, quer
 /// [`handle`] with the conversation's session hint (`X-Oxe-Session`, forwarded by the
 /// controller). A hint only: echo records are found by their token chain, never by this id.
 pub async fn handle_session<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8], session: Option<String>) -> Reply {
+    handle_request(st, method, path, query, body, session, None).await
+}
+
+/// [`handle_session`] with the controller's turn label (`X-Oxe-Turn-Kind`: chat | compaction |
+/// post-compaction; v0.1.3). A label only places checkpoints (a compaction request's cut); a wrong
+/// one (an instruction quoted in a normal turn) costs one checkpoint slot, never a wrong state.
+pub async fn handle_request<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8], session: Option<String>, turn_kind: Option<String>) -> Reply {
+    handle_policy(st, method, path, query, body, session, turn_kind, false).await
+}
+
+/// [`handle_request`] with the controller's state policy (`X-Oxe-State-Policy: ephemeral`, LAN
+/// share: a request from another device). An ephemeral generation has RAM-only, request-scoped
+/// state (see [`GenParams::ephemeral`]): no echo splice or record, no session hint, no post-reply
+/// state write, no idle re-prefill, no prefix reuse; the local live session is held and restored.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_policy<E: Engine>(st: Arc<State<E>>, method: &str, path: &str, query: &str, body: &[u8], session: Option<String>, turn_kind: Option<String>, ephemeral: bool) -> Reply {
     // exact paths like llama-server (REVIEW S4: a trimmed `/v1/chat/completions/` ran as a chat
     // completion while the controller did not treat it as inference)
     let parse = || -> Result<Json, Reply> {
@@ -337,6 +380,7 @@ pub async fn handle_session<E: Engine>(st: Arc<State<E>>, method: &str, path: &s
         ("GET", "/state-cache") => {
             let st2 = st.clone();
             let r = tokio::task::spawn_blocking(move || {
+                let _gate = st2.persist_gate.lock().unwrap_or_else(|p| p.into_inner());
                 let w = st2.worker.lock().unwrap_or_else(|p| p.into_inner());
                 w.states.as_ref().map(|s| {
                     let mut u = s.usage();
@@ -401,7 +445,8 @@ pub async fn handle_session<E: Engine>(st: Arc<State<E>>, method: &str, path: &s
             let clear = path.ends_with("/clear");
             let st2 = st.clone();
             let r = tokio::task::spawn_blocking(move || -> Result<Json, (u16, String)> {
-                // refused while a request runs (the worker is busy)
+                // after the state write in flight (if any), then refused while a request runs
+                let _gate = st2.persist_gate.lock().unwrap_or_else(|p| p.into_inner());
                 let mut w = st2.worker.try_lock().map_err(|_| (409, "a request is running".to_string()))?;
                 let w = &mut *w;
                 if w.states.is_none() {
@@ -540,14 +585,19 @@ pub async fn handle_session<E: Engine>(st: Arc<State<E>>, method: &str, path: &s
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            completion(st, b).await
+            // as chat: an ephemeral (LAN share) request keeps no session and writes no state
+            completion(st, b, if ephemeral { None } else { session }, ephemeral).await
         }
         ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
             let b = match parse() {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            chat_completion(st, b, session).await
+            if ephemeral {
+                chat_completion(st, b, None, None, true).await
+            } else {
+                chat_completion(st, b, session, turn_kind, false).await
+            }
         }
         _ => Reply::Json(404, json!({"error": {"message": "File Not Found", "type": "not_found_error", "code": 404}})),
     }
@@ -562,6 +612,8 @@ struct Rendered {
     msg_starts: Vec<usize>,
     first_user: Option<usize>,
     last_user: Option<usize>,
+    /// every user-message start
+    user_starts: Vec<usize>,
 }
 
 struct PreparedChat {
@@ -702,14 +754,33 @@ fn spawn_persist<E: Engine>(st: &Arc<State<E>>, session: Option<String>, req_no:
     *st.persist.lock().unwrap() = Some(flag.clone());
     let st2 = st.clone();
     tokio::task::spawn_blocking(move || {
-        {
+        let _gate = st2.persist_gate.lock().unwrap_or_else(|p| p.into_inner());
+        let t0 = std::time::Instant::now();
+        // v0.1.3 (item 6): phase 1 copies the head snapshot and the new blocks under the lock ...
+        let staged = {
             let mut w = st2.worker.lock().unwrap_or_else(|p| p.into_inner());
-            if !flag.load(Ordering::Relaxed) && st2.reqs.load(Ordering::SeqCst) == req_no {
-                let t0 = std::time::Instant::now();
-                let n = w.persist_states(session.as_deref(), Some(&flag));
-                if n > 0 {
-                    eprintln!("oxe-server: state cache: {n} files written in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+            if flag.load(Ordering::Relaxed) || st2.reqs.load(Ordering::SeqCst) != req_no {
+                None
+            } else {
+                let s = w.stage_persist(session.as_deref());
+                if s.is_none() {
+                    // nothing to stage (or more than the stage holds): the on-lock writer, as before
+                    let n = w.persist_states(session.as_deref(), Some(&flag));
+                    if n > 0 {
+                        eprintln!("oxe-server: state cache: {n} files written in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+                    }
                 }
+                s
+            }
+        };
+        if let Some(s) = staged {
+            // ... phase 2 writes them without it (a request that arrives now runs at once; the
+            // write completes behind it), phase 3 commits the manifest under the lock again
+            let written = s.write();
+            let mut w = st2.worker.lock().unwrap_or_else(|p| p.into_inner());
+            let r = w.commit_staged(s, written, session.as_deref(), Some(&flag));
+            if r.head.is_some() {
+                eprintln!("oxe-server: state cache: {} files written in {:.0} ms (head off the worker lock)", r.files(), t0.elapsed().as_secs_f64() * 1e3);
             }
         }
         st2.persist_done.fetch_add(1, Ordering::SeqCst);
@@ -744,6 +815,57 @@ pub(crate) fn send_frame(tx: &mpsc::Sender<String>, frame: String, stall: std::t
 /// client is gone or has taken nothing for `stall`.
 async fn send_final(tx: &mpsc::Sender<String>, frame: String, stall: std::time::Duration) -> bool {
     matches!(tokio::time::timeout(stall, tx.send(frame)).await, Ok(Ok(())))
+}
+
+/// LONG-APPEND default SSE keepalive interval (seconds).
+pub const SSE_KEEPALIVE_SECS: f64 = 15.0;
+
+/// `OXE_SSE_KEEPALIVE_SECS` (0 = off; unset or unparsable: [`SSE_KEEPALIVE_SECS`]).
+pub fn sse_keepalive_from_env() -> std::time::Duration {
+    let s = std::env::var("OXE_SSE_KEEPALIVE_SECS").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(SSE_KEEPALIVE_SECS);
+    std::time::Duration::from_secs_f64(s)
+}
+
+/// LONG-APPEND (v0.1.3 #7): the SSE comment the keepalive sends ("queued" before the worker takes
+/// the request, then the prefill position).
+pub fn keepalive_comment(pr: &Progress, elapsed: std::time::Duration) -> String {
+    let (done, total) = (pr.done.load(Ordering::Relaxed), pr.total.load(Ordering::Relaxed));
+    if total == 0 {
+        format!(": queued {:.0}s\n\n", elapsed.as_secs_f64())
+    } else {
+        format!(": prefill {done}/{total} {:.0}s\n\n", elapsed.as_secs_f64())
+    }
+}
+
+/// LONG-APPEND (v0.1.3 #7): a streamed request sends nothing while it waits for the worker or
+/// prefills, which at depth can take many minutes (28.5K tokens at ~83K: > 600 s). Every `every`
+/// this sends one SSE comment line (`: prefill <done>/<total> <s>s`): SSE parsers ignore comments
+/// (WHATWG EventSource, eventsource-parser, Effect's Sse parser in OpenCode, the OpenAI SDKs), so
+/// clients see no change, but byte-level idle-read timeouts (sockets, proxies, the lab controller)
+/// are reset and the controller can show progress. Event-level timeouts are NOT reset (OpenCode
+/// 2.2.7's `chunkTimeout`, default 900 s, counts only `data:` events): those clients need a
+/// generous setting (the lab's OpenCode overlay sets 3600 s). Stops at the first decoded token (`decoding`), when the response
+/// ends (a weak sender: it never keeps the stream open) or when the client is gone; never blocks
+/// the generation (a full channel just skips a tick).
+fn spawn_keepalive(tx: &mpsc::Sender<String>, pr: Arc<Progress>, every: std::time::Duration) {
+    if every.is_zero() {
+        return;
+    }
+    let weak = tx.downgrade();
+    let t0 = std::time::Instant::now();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        loop {
+            tick.tick().await;
+            if pr.decoding.load(Ordering::Relaxed) {
+                return;
+            }
+            let Some(tx) = weak.upgrade() else { return };
+            if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(keepalive_comment(&pr, t0.elapsed())) {
+                return;
+            }
+        }
+    });
 }
 
 /// Streams: cancel when the client's end of the SSE channel is dropped (the client went
@@ -784,8 +906,8 @@ fn unsupported_constraint(b: &Json) -> Option<String> {
     None
 }
 
-async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
-    st.preempt_idle();
+async fn completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<String>, ephemeral: bool) -> Reply {
+    let req_no = st.preempt_idle();
     if let Some(m) = unsupported_constraint(&b) {
         return bad(m);
     }
@@ -793,6 +915,8 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
         Ok(g) => g,
         Err(e) => return bad(e),
     };
+    gp.ephemeral = ephemeral;
+    gp.session = session.clone();
     let prompt_json = b.get("prompt").cloned().unwrap_or(Json::String(String::new()));
     let prompt = match st.tokenize_prompt(&prompt_json, true) {
         Ok(p) => p,
@@ -814,24 +938,41 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     let model = st.cfg.model_name.clone();
     if !stream {
         return match run_blocking(st.clone(), prompt, gp.clone(), |_| true).await {
-            Ok(r) => Reply::Json(200, api::completion_final(&model, &prompt_text, &r, false, &gp, return_tokens, post)),
+            Ok(r) => {
+                // CACHE-PERFECT P2 after the reply, as chat (the write runs off the request path)
+                if !ephemeral {
+                    spawn_persist(&st, session.clone(), req_no);
+                }
+                Reply::Json(200, api::completion_final(&model, &prompt_text, &r, false, &gp, return_tokens, post))
+            }
             Err(e) => gen_error_reply(e),
         };
     }
     let (tx, rx) = mpsc::channel::<String>(256);
     cancel_on_close(&mut gp, &tx);
+    let pr = Arc::new(Progress::default());
+    gp.progress = Some(pr.clone());
+    spawn_keepalive(&tx, pr.clone(), st.sse_keepalive);
     let n_prompt = prompt.len();
     let tx2 = tx.clone();
     let st2 = st.clone();
+    let st3 = st.clone();
+    let session3 = session.clone();
     let stall = st.stream_stall;
     tokio::spawn(async move {
         let res = run_blocking(st2, prompt, gp.clone(), move |p: Partial| {
+            pr.decoding.store(true, Ordering::Relaxed);
             let j = api::completion_partial(&p.text, p.n_decoded, n_prompt, p.probs.as_ref(), post);
             send_frame(&tx2, api::sse(&j), stall)
         })
         .await;
         let frame = match res {
-            Ok(r) => api::sse(&api::completion_final(&model, &prompt_text, &r, true, &gp, return_tokens, post)),
+            Ok(r) => {
+                if !ephemeral {
+                    spawn_persist(&st3, session3, req_no);
+                }
+                api::sse(&api::completion_final(&model, &prompt_text, &r, true, &gp, return_tokens, post))
+            }
             Err(GenError::Cancelled) => return,
             Err(e) => api::sse(&gen_error_json(e)),
         };
@@ -840,7 +981,7 @@ async fn completion<E: Engine>(st: Arc<State<E>>, b: Json) -> Reply {
     Reply::Stream(rx)
 }
 
-async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<String>) -> Reply {
+async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<String>, turn_kind: Option<String>, ephemeral: bool) -> Reply {
     let req_no = st.preempt_idle();
     if let Some(m) = unsupported_constraint(&b) {
         return bad(m);
@@ -855,8 +996,10 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
     };
     gp.special = false;
     let rendered = st.render(&pc);
-    // ECHO: earlier assistant turns as their exact generated ids (cache keeps every token)
-    let (prompt, echo) = st.splice(&rendered, &pc.inputs);
+    // ECHO: earlier assistant turns as their exact generated ids (cache keeps every token); an
+    // ephemeral request never looks at this machine's echo records (its prompt is the plain render)
+    let (prompt, echo) = if ephemeral { (rendered.tokens.clone(), Default::default()) } else { st.splice(&rendered, &pc.inputs) };
+    gp.ephemeral = ephemeral;
     let echo_json = (echo.blocks > 0).then(|| echo.to_json());
     gp.echo = echo_json.clone();
     if let Err(e) = st.check_tokens(&prompt) {
@@ -867,6 +1010,9 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
     }
     gp.first_user = rendered.first_user.map(|c| echo.map_pos(c));
     gp.msg_starts = rendered.msg_starts.iter().map(|&c| echo.map_pos(c)).collect();
+    gp.user_starts = rendered.user_starts.iter().map(|&c| echo.map_pos(c)).collect();
+    gp.pre_think = st.pre_think(&prompt, &pc.applied.generation_prompt);
+    gp.turn_kind = turn_kind.filter(|k| matches!(k.as_str(), "chat" | "compaction" | "post-compaction"));
     drop(rendered);
     gp.query_start = b.get("messages").and_then(Json::as_array).and_then(|m| m.last()).and_then(|m| m.get("role")).and_then(Json::as_str) == Some("user");
     gp.session = session.clone();
@@ -903,9 +1049,11 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
         if let Err(e) = sess.feed(&r.text, true) {
             return Reply::Json(500, api::error_json(500, &e));
         }
-        st.echo_record(&prompt_kept, sess.msg(), &r, session.as_deref());
-        spawn_persist(&st, session.clone(), req_no);
-        if api::finish_reason(r.stop, !sess.msg().tool_calls.is_empty()) == "stop" {
+        if !ephemeral {
+            st.echo_record(&prompt_kept, sess.msg(), &r, session.as_deref());
+            spawn_persist(&st, session.clone(), req_no);
+        }
+        if !ephemeral && api::finish_reason(r.stop, !sess.msg().tool_calls.is_empty()) == "stop" {
             spawn_idle_reprefill(&st, &b, sess.msg().to_json(), req_no);
         }
         let mut resp = api::chat_response(&meta, sess.msg(), &r, want_probs, false);
@@ -914,6 +1062,9 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
     }
     let (tx, rx) = mpsc::channel::<String>(256);
     cancel_on_close(&mut gp, &tx);
+    let pr = Arc::new(Progress::default());
+    gp.progress = Some(pr.clone());
+    spawn_keepalive(&tx, pr.clone(), st.sse_keepalive);
     let mut sess0 = Session::new(pcfg, gen_prompt, Box::new(chat::random_string));
     // OXE_SERVER_LEGACY=1 (A/B diagnostic only): full re-parse every token
     sess0.incremental = std::env::var_os("OXE_SERVER_LEGACY").is_none();
@@ -925,6 +1076,7 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
         let m2 = meta.clone();
         let s2 = sess.clone();
         let res = run_blocking(st2, prompt, gp, move |p: Partial| {
+            pr.decoding.store(true, Ordering::Relaxed);
             let mut frames = Vec::new();
             if p.n_decoded == 1 {
                 frames.push(api::chat_chunk(&m2, json!({"role": "assistant", "content": null}), None));
@@ -976,12 +1128,12 @@ async fn chat_completion<E: Engine>(st: Arc<State<E>>, b: Json, session: Option<
             }
         }
         frames.push(api::chat_chunk(&meta, json!({}), Some(api::finish_reason(r.stop, has_calls))));
-        {
+        if !ephemeral {
             let msg = sess.lock().unwrap().msg().clone();
             st.echo_record(&prompt_kept, &msg, &r, session.as_deref());
+            spawn_persist(&st, session.clone(), req_no);
         }
-        spawn_persist(&st, session.clone(), req_no);
-        if api::finish_reason(r.stop, has_calls) == "stop" {
+        if !ephemeral && api::finish_reason(r.stop, has_calls) == "stop" {
             let reply = sess.lock().unwrap().msg().to_json();
             spawn_idle_reprefill(&st, &b, reply, req_no);
         }

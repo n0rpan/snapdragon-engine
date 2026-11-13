@@ -95,7 +95,7 @@ static inline const char * oxn_strerror(int e) {
         case OXN_E_K1_ARGS:         return "K1_ARGS: synthetic matvec bounds rejected";
         case OXN_E_K1_KERNEL:       return "K1_KERNEL: synthetic matvec worker failed";
         default:                    return (uint32_t) e >= 0x80000400u && (uint32_t) e < 0x80000600u
-                                           ? "AEE/FastRPC framework error (see AEEStdErr.h)" : "unknown";
+                                           ? "remote framework error (raw code retained)" : "unknown";
     }
 }
 

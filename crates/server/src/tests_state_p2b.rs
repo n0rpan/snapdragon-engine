@@ -105,8 +105,8 @@ fn m2_shutdown_write_is_incremental_bounded_and_floored() {
     assert_eq!(r.head, Some(n), "{r:?}");
     let new_blocks = w.states.as_ref().unwrap().stats.blocks_written - written0;
     assert!(new_blocks as usize <= 1024 / BLOCK + 1, "only the tail since the last progress write: {new_blocks} blocks");
-    // the RAM checkpoints are saved too (deepest first, inside the deadline): v0.1.2 thinking restart
-    assert!(r.snaps >= 1, "{r:?}");
+    // v0.1.3 store-depth: the RAM points no post-reply write put on disk go too (deepest first)
+    assert!(r.snaps >= 1, "the prompt-end point is written at shutdown: {r:?}");
     assert!(r.line().contains(&format!("head at {n} tokens")), "{}", r.line());
     // nothing changed: the next shutdown write is a lookup
     let r2 = w.persist(None, PersistMode::Shutdown(t), None);
@@ -534,6 +534,38 @@ fn restore_plan_prefers_the_deepest_exact_state_and_uses_cost_only_at_equal_dept
     assert!(w.plan_restore(&q, 1200).is_empty());
     assert_eq!(w.plan_restore(&q, 1150), vec![State, Session], "deeper than RAM: restored, whatever it costs");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Audit v0.1.2 S9: a disk state whose tokens are not a prefix of the request is never restored,
+/// even under the same session hint and at a greater depth: after a restart, a prompt that
+/// diverges from the stored 1300-token conversation at 700 resumes at most at the divergence and
+/// the engine runs on exactly the request's tokens.
+#[test]
+fn a_disk_state_that_is_not_a_prefix_of_the_request_is_never_restored() {
+    for hint in [Some("q"), None] {
+        let dir = tmp(&format!("p2b-nonprefix-{}", hint.is_some()));
+        let prompt = toks(1300, 12);
+        {
+            let mut w = worker(&dir);
+            w.persist_every = 0;
+            w.engine.prefill(&prompt).unwrap();
+            w.cache.appended(&prompt);
+            w.last_first_user = Some(BLOCK - 10);
+            assert_eq!(w.persist(Some("q"), PersistMode::Reply, None).head, Some(1300));
+        }
+        let diverge = 700;
+        let mut q = prompt[..diverge].to_vec();
+        q.extend((0..700).map(|k| 260 + (k % 30) as u32)); // never in the stored tail (1..=250)
+        let mut w = worker(&dir);
+        let r = gen(&mut w, &q, &GenParams { n_predict: 3, first_user: Some(BLOCK - 10), session: hint.map(Into::into), ..Default::default() });
+        assert!(r.timings.cache_n <= diverge, "hint {hint:?}: resumed {} past the divergence at {diverge}", r.timings.cache_n);
+        for c in &w.engine.calls {
+            let depth = match c.0 { "snap" => c.1, "load" => c.2, _ => 0 };
+            assert!(depth <= diverge, "hint {hint:?}: {c:?} restored a state past the divergence");
+        }
+        assert!(w.engine.tokens.starts_with(&q), "hint {hint:?}: the engine state is the request's own prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Mirror of the v0.1.2 small-lifecycle failure (Codex, 575b520): a thinking turn and its

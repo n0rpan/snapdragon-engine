@@ -5,7 +5,7 @@ name: checks
 # every lane push); start them there by hand with "Run workflow".
 on:
   push:
-    branches: [main, claude/v012-candidate]  # other claude/* branches: gh workflow run --ref <branch>
+    branches: [main, claude/v013-candidate]  # other claude/* branches: gh workflow run --ref <branch>
   pull_request:
   workflow_dispatch:
 

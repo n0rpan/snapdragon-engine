@@ -51,11 +51,14 @@ pub struct EchoConfig {
     /// opener + generated tokens kept in total; the oldest records go first
     pub max_tokens: usize,
     pub ttl: Duration,
+    /// v0.1.3: a session's echo file is rewritten with only its live records once it is at least
+    /// this large and at least twice their size (`--echo-compact-bytes`, 0 = never)
+    pub compact_bytes: u64,
 }
 
 impl Default for EchoConfig {
     fn default() -> Self {
-        EchoConfig { enabled: true, max_tokens: 4 << 20, ttl: Duration::from_secs(7 * 24 * 3600) }
+        EchoConfig { enabled: true, max_tokens: 4 << 20, ttl: Duration::from_secs(7 * 24 * 3600), compact_bytes: 4 << 20 }
     }
 }
 
@@ -72,6 +75,9 @@ impl EchoConfig {
         }
         if let Some(s) = std::env::var("OXE_ECHO_TTL_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
             c.ttl = Duration::from_secs(s);
+        }
+        if let Some(b) = std::env::var("OXE_ECHO_COMPACT_BYTES").ok().and_then(|v| v.parse::<u64>().ok()) {
+            c.compact_bytes = b;
         }
         c
     }
@@ -205,9 +211,60 @@ fn first_diff(a: &[Token], b: &[Token]) -> usize {
     a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()))
 }
 
+/// Tool arguments as a JSON value for the equality check. A text whose numbers may not survive a
+/// parse exactly (an integer beyond 64 bits, a decimal with more than 15 significant digits: both
+/// can compare equal to a different number) stays text (v0.1.3, review-carried): then only the
+/// same text matches, a re-serialised one is a miss, never a false hit.
 fn parse_args(s: &str) -> Json {
-    serde_json::from_str(s).unwrap_or_else(|_| Json::String(s.to_string()))
+    match serde_json::from_str::<Json>(s) {
+        Ok(v) if numbers_exact(s) => v,
+        _ => Json::String(s.to_string()),
+    }
 }
+
+/// Is every number literal of the JSON text `s` exact after a parse (a u64 or i64, or a decimal of
+/// at most 15 significant digits)? Strings are skipped.
+fn numbers_exact(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let st = i;
+                i += 1;
+                while i < b.len() && matches!(b[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                    i += 1;
+                }
+                let lit = &s[st..i];
+                // a decimal of at most 15 significant digits maps to one f64 no other such decimal
+                // maps to (DBL_DIG); more digits (or an integer past 64 bits) can collide
+                let ok = lit.parse::<u64>().is_ok() || lit.parse::<i64>().is_ok() || sig_digits(lit) <= 15;
+                if !ok {
+                    return false;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
+/// Significant digits of a JSON number literal's mantissa (leading and trailing zeros dropped).
+fn sig_digits(lit: &str) -> usize {
+    let m = lit.split(['e', 'E']).next().unwrap_or("");
+    let d: String = m.chars().filter(|c| c.is_ascii_digit()).collect();
+    d.trim_start_matches('0').trim_end_matches('0').len()
+}
+
+/// Reasoning field names clients use besides `reasoning_content` (v0.1.3, review-carried).
+const REASONING_ALIASES: &[&str] = &["reasoning", "thinking", "reasoning_text"];
 
 /// Text of a message's content as the template sees it (string, or the text parts joined).
 fn content_text(m: &Json) -> String {
@@ -255,6 +312,15 @@ fn same_turn(r: &Record, m: &Json, sent: Option<&str>) -> Result<(), &'static st
     if let Some(rc) = rc {
         if rc.trim() != r.reasoning {
             return Err(MISS_REASONING);
+        }
+    }
+    // the same reasoning under another name: a string must equal the record, anything else (an
+    // object, a list) cannot be compared and is a miss; absent or null may be restored
+    for k in REASONING_ALIASES {
+        match m.get(*k) {
+            None | Some(Json::Null) => {}
+            Some(Json::String(x)) if x.trim() == r.reasoning => {}
+            Some(_) => return Err(MISS_REASONING),
         }
     }
     Ok(())
@@ -319,11 +385,15 @@ pub struct EchoStore {
     next_id: u64,
     /// M3: records on disk (`<state dir>/<model>/echo/<group hash>.jsonl`), None = RAM only
     dir: Option<std::path::PathBuf>,
+    /// v0.1.3 compaction: the file size of a group at which its file is checked again
+    next_check: HashMap<String, u64>,
+    /// files rewritten by compaction (diagnostics, tests)
+    pub compactions: u64,
 }
 
 impl EchoStore {
     pub fn new(cfg: EchoConfig) -> EchoStore {
-        EchoStore { cfg, identity: String::new(), by_key: HashMap::new(), groups: HashMap::new(), clock: 0, n_tokens: 0, next_id: 0, dir: None }
+        EchoStore { cfg, identity: String::new(), by_key: HashMap::new(), groups: HashMap::new(), clock: 0, n_tokens: 0, next_id: 0, dir: None, next_check: HashMap::new(), compactions: 0 }
     }
 
     /// Set the identity mixed into every key (drops records made under another identity).
@@ -399,8 +469,67 @@ impl EchoStore {
         let kept = self.insert(key, rec);
         if let (true, Some(line)) = (kept, line) {
             self.append(&group, &line);
+            self.maybe_compact(&group);
         }
         kept
+    }
+
+    /// v0.1.3 (lane B item 4): the echo files are append-only, so a regenerate loop, replaced
+    /// records and expired ones grow them. Once a group's file is at least `compact_bytes` and at
+    /// least twice its live records, it is rewritten with exactly the live records, oldest first
+    /// (the order `attach` reads them back in), atomically (`.pending`, fsync, rename, directory
+    /// fsync). Records in RAM are unchanged, so a splice after a restart feeds exactly the ids it
+    /// fed before. Returns whether the file was rewritten.
+    pub fn maybe_compact(&mut self, group: &str) -> bool {
+        let lim = self.cfg.compact_bytes;
+        let Some(p) = self.group_file(group) else { return false };
+        if lim == 0 {
+            return false;
+        }
+        let Ok(md) = std::fs::symlink_metadata(&p) else { return false };
+        if !md.is_file() || md.len() < self.next_check.get(group).copied().unwrap_or(0).max(lim) {
+            return false;
+        }
+        let mut recs: Vec<(u64, String)> = Vec::new();
+        for (k, v) in &self.by_key {
+            for r in v.iter().filter(|r| r.group == group) {
+                recs.push((r.id, record_line(&self.identity, k, r)));
+            }
+        }
+        recs.sort_by_key(|r| r.0);
+        let body: String = recs.into_iter().map(|r| r.1).collect();
+        let live = body.len() as u64;
+        // check again only once the file has grown to twice the live records
+        self.next_check.insert(group.to_string(), live.saturating_mul(2));
+        if live.saturating_mul(2) > md.len() {
+            return false;
+        }
+        let mut pending = p.clone().into_os_string();
+        pending.push(".pending");
+        let pending = std::path::PathBuf::from(pending);
+        let r = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&pending)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&pending, &p)?;
+            if let Some(d) = p.parent().and_then(|d| std::fs::File::open(d).ok()) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                self.compactions += 1;
+                true
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&pending);
+                eprintln!("oxe-server: echo records: compaction failed: {e}");
+                false
+            }
+        }
     }
 
     /// M3: keep records on disk under `dir` (0700, files 0600) and read back the ones of this
@@ -557,6 +686,7 @@ impl EchoStore {
         if let Some(p) = self.group_file(group) {
             let _ = std::fs::remove_file(p);
         }
+        self.next_check.remove(group);
         for v in self.by_key.values_mut() {
             v.retain(|r| r.group != group);
         }

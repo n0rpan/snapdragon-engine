@@ -211,6 +211,17 @@ impl Cache {
     /// # Safety
     /// Control thread only.
     pub unsafe fn lookup_protect(&self, io: &IoQueue, l: usize, e: usize, stamp: u64, protect_from: u64, class: ReqClass) -> (Entry, bool) {
+        self.lookup_protect_keep(io, l, e, stamp, protect_from, class, None)
+    }
+
+    /// As [`Cache::lookup_protect`]; on a miss the residents named in `keep` (expert bitset of layer `l`) are never
+    /// chosen as the victim either (F123: hot residents protected for a whole batched op). The caller keeps
+    /// `keep`'s residents + the protected waves below the pool size.
+    ///
+    /// # Safety
+    /// Control thread only.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn lookup_protect_keep(&self, io: &IoQueue, l: usize, e: usize, stamp: u64, protect_from: u64, class: ReqClass, keep: Option<&[u64; N_EXPERT / 64]>) -> (Entry, bool) {
         let p = &mut self.pools()[l];
         let st = &mut *self.stats.get();
         let pf = &mut (&mut *self.prefetched.get())[l];
@@ -289,8 +300,9 @@ impl Cache {
             }
             return (Entry { ptr: p.base.add(s * p.slot), state: &p.state[s] }, false);
         }
+        let kept = |p: &Pool, h: usize| keep.is_some_and(|k| p.owner[h] >= 0 && (k[p.owner[h] as usize / 64] >> (p.owner[h] as usize % 64)) & 1 == 1);
         let evictable = |p: &Pool, h: usize| {
-            !((p.stamp[h] != u64::MAX && p.stamp[h] >= protect_from && p.stamp[h] <= stamp) || p.state[h].load(Acquire) == PENDING)
+            !((p.stamp[h] != u64::MAX && p.stamp[h] >= protect_from && p.stamp[h] <= stamp) || p.state[h].load(Acquire) == PENDING || kept(p, h))
         };
         // miss: LFU (empty slot first, else fewest counts, then least recently used) or CLOCK
         let lfu_victim = if lfu {
@@ -366,6 +378,14 @@ impl Cache {
             });
         }
         (Entry { ptr, state: &p.state[v] }, true)
+    }
+
+    /// F123: the LFU demand count of (layer l, expert e) (0 under CLOCK, which keeps no counts). No side effects.
+    ///
+    /// # Safety
+    /// Control thread only.
+    pub unsafe fn lfu_count(&self, l: usize, e: usize) -> u32 {
+        self.pools()[l].cnt[e]
     }
 
     /// PREFILL IO: is (layer l, expert e) in the pool (READY or read in flight)? No side effects.
